@@ -1,0 +1,23 @@
+services:
+  malleus:
+    image: malleus:latest
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    devices:
+      - /dev/kfd
+      - ${MALLEUS_RENDER_NODE:-/dev/dri/renderD128}
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-992}"
+    volumes:
+      - ${MALLEUS_MODELS:-/srv/models/malleus}:/models:ro
+    environment:
+      MALLEUS_MODEL: /models/qwen36-35b-a3b-mls4.malleus
+      MALLEUS_API_KEY: ${MALLEUS_API_KEY:-}
+    ports:
+      - "8090:8090"
+    networks: [internal]
+networks:
+  internal:
+    internal: true

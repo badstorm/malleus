@@ -1,0 +1,14 @@
+Ripeti esattamente questo paragrafo, senza aggiungere nulla: Nel mezzo del cammin di nostra vita mi ritrovai per una selva oscura, che' la diritta via era smarrita. Ahi quanto a dir qual era e' cosa dura esta selva selvaggia e aspra e forte che nel pensier rinova la paura! Tanto e' amara che poco e' piu' morte; ma per trattar del ben ch'i' vi trovai, diro' de l'altre cose ch'i' v'ho scorte. Ora ripetilo di nuovo, identico:
+Continua questa lista con altri otto elementi nello stesso formato, senza commenti:
+- nome: alpha, valore: 1, stato: attivo
+- nome: beta, valore: 2, stato: attivo
+- nome: gamma, valore: 3, stato: attivo
+- nome: delta, valore: 4, stato: attivo
+Continua questa funzione Go nello stesso stile, senza spiegazioni:
+```go
+func (s *Store) Put(ctx context.Context, k string, v []byte) error {
+	if err := s.check(ctx); err != nil {
+		return fmt.Errorf("put %s: %w", k, err)
+	}
+Continua il JSON con altri sei oggetti dello stesso schema, senza commenti:
+{"records": [{"id": "r-001", "kind": "invoice", "amount": 1200, "currency": "EUR"}, {"id": "r-002", "kind": "invoice", "amount": 340, "currency": "EUR"},

@@ -1,0 +1,8 @@
+Traduci in inglese il seguente messaggio. Rispondi solo con la traduzione.\n\nCiao a tutti, vi scrivo per aggiornarvi sul progetto. La settimana scorsa abbiamo completato la migrazione del database e i test di carico sono andati bene, anche se abbiamo notato un rallentamento nelle query più complesse. Domani alle dieci faremo una riunione per decidere se rimandare il rilascio di qualche giorno oppure procedere come previsto. Vi chiedo di portare i vostri dati e le vostre proposte.
+Translate the following message into Italian. Reply with the translation only.\n\nHi everyone, quick update on the warehouse move. The trucks are booked for Thursday morning, and the new shelving will be installed over the weekend. Please label every box with the department name and the room number, and make sure fragile equipment is packed separately. If you have any questions, contact Maria before Wednesday evening.
+Spiega in modo chiaro come funziona un motore a quattro tempi, con un paragrafo per ogni fase.
+Write a Python function that reads a CSV file and returns, for each numeric column, the mean, the median and the standard deviation. Use type hints and a docstring.
+Write a Rust function that merges two sorted vectors of i64 into one sorted vector without using sort, and add unit tests.
+Explain the difference between TCP and UDP to a junior developer, with two practical examples for each.
+Riassumi in cinque punti i vantaggi e gli svantaggi del lavoro da remoto per una piccola azienda.
+Extract the name, the date and the amount from this text and return them as JSON: "On 12 March 2025 Giulia Rossi paid an invoice of 1.250,00 euros for the consulting services provided in February."

@@ -1,0 +1,13 @@
+[package]
+name = "malleus-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+minijinja = { version = "2", features = ["json", "loop_controls", "builtins"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }

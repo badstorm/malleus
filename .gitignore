@@ -1,0 +1,13 @@
+/target
+*.hsaco
+/bench/out/
+__pycache__/
+
+# rocprofv3 profiles collected by hand (never source)
+*_kernel_trace.csv
+*_agent_info.csv
+# `MALLEUS_DUMP_DIR` dumps and profiles: artifacts of a session, never source
+/lingdump/
+/dump/
+*.f32
+/.rocprofv3/

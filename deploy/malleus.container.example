@@ -1,0 +1,91 @@
+# Podman quadlet for Malleus: copy to /etc/containers/systemd/malleus.container (mode 600, it holds the API key),
+# adjust the values marked below, then `systemctl daemon-reload && systemctl start malleus`.
+[Unit]
+Description=Malleus inference server
+After=network-online.target
+
+[Container]
+Image=localhost/malleus:latest
+ContainerName=malleus
+# A network with Internal=true keeps the container without egress; only the API port is published.
+Network=internal.network
+PublishPort=8090:8090
+
+AddDevice=/dev/kfd
+# Render node of the gfx1150/gfx1151 GPU (ls -l /dev/dri/by-path) and the gid of its group (getent group render).
+AddDevice=/dev/dri/renderD128
+# This machine's render node belongs to the nogroup group: keep-groups passes the process's supplementary groups.
+# On a host where the node belongs to the render group, replace this with GroupAdd=<render gid>.
+PodmanArgs=--group-add=keep-groups
+Ulimit=memlock=-1:-1
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+
+# Folder with the .malleus files; fast storage shortens the load (20 GB: ~40 s from NVMe, minutes from HDD).
+Volume=/srv/models/malleus:/models:ro
+
+# One MLS4 copy: `-mls4` in the name says so, and its prefill reads the same 4-bit weights (`-mls4-mls8` would be
+# twice the file and read the prompt at 8 bits). See AGENTS.md, "Model files".
+# Ornith-1.5-35B-A3B: 20.2 GB on disk, 26.2 GiB live on the device with a 262144 context and ~35 tok/s of decode
+# with MTP. This is the default: it leaves the host its RAM.
+Environment=MALLEUS_MODEL=/models/ornith-15-35b-a3b-mls4.malleus
+# Model name returned by /v1/models.
+Environment=MALLEUS_MODEL_NAME=Ornith-1.5-35b-a3b
+# Ornith-1.5-122B does not fit on a host that also runs other containers: resident it needs 72.6 GiB and drove a
+# 93.4 GiB host into global OOM (issue #75). The alternative is keeping the routed experts in the file on NVMe
+# (MALLEUS_EXPERT_CACHE): 24 GiB of per-layer pools keep 44.6 GiB live with a 262144 context, but the prefill streams
+# all 59.8 GB of experts per chunk (~76 s per chunk) and decode falls to 1.5-3 tok/s from 13.7 resident. Measured
+# 2026-11-15 (issues #75, #81). Uncomment the four lines, plus MALLEUS_MTP=0 and a
+# prefill chunk of 8192, to try it.
+#Environment=MALLEUS_EXPERT_CACHE=24
+#Environment=MALLEUS_PREFILL_CHUNK=8192
+#Environment=MALLEUS_MTP=0
+#Environment=MALLEUS_MODEL=/models/ornith-15-122b-mls4.malleus
+#Environment=MALLEUS_MODEL_NAME=Ornith-1.5-122b
+# Prompt tokens per forward. 8192 instead of 2048: at 2048 the MoE gets ~64 rows per expert and the grouped
+# GEMM re-reads each expert's weights once per tile, so a bigger chunk is the only lever that lowers the weight
+# traffic per token (measured: MoE 0.300 ms/token against 0.392, +8 % of prefill on long prompts, +2.8 GB of GTT
+# live). The working set follows the chunk: 5,3 GiB instead of 2,8 (issue #92).
+Environment=MALLEUS_PREFILL_CHUNK=8192
+# Context length in tokens. Ornith-1.5 native window: max_position_embeddings = 262144 (no YaRN).
+# The pre-flight prints weights, per-session state and working set and refuses if they do not fit. Beyond the native
+# window MALLEUS_ROPE_YARN enables YaRN; do not set it just to raise MALLEUS_CTX.
+Environment=MALLEUS_CTX=262144
+# On an LXC whose MemAvailable is smaller than the device's GTT the pre-flight can refuse a model that does fit in
+# GTT (it sees the container's RAM, not the GTT limit). Set this only after checking the "live on the device" line.
+Environment=MALLEUS_MEM_IGNORE=1
+# Dense W4A4 on the projections: +8% prefill on Flash-Next, not kept on Qwen3.6.
+#Environment=MALLEUS_DENSE_W4A4=1
+Environment=MALLEUS_PORT=8090
+# API key clients send as Bearer token. With it set, GET / is the wordmark only until the request carries the key
+# (browsers do not send one on a plain visit); without it the page lists the endpoints and the model.
+Environment=MALLEUS_API_KEY=change-me
+# Optional: reasoning on by default (true/false) and the cap on generated tokens.
+#Environment=MALLEUS_DEFAULT_THINKING=true
+#Environment=MALLEUS_MAX_TOKENS=8192
+# Optional: none skips the MLS8 prefill copy (less memory, slower and less accurate prefill).
+#Environment=MALLEUS_PREFILL_WEIGHTS=none
+# Optional: restrict the draft head to a token list (one id per line, most frequent first). The Latin-script
+# list of Qwen3.6 is 169K of 248K tokens: +9% on structured prompts, +2-6% on generic ones. The list is tied to the
+# tokenizer it was generated from: regenerate it for a new model with
+# `malleus draft-vocab --model /models/<model>.malleus --out /models/draft-vocab-latin.txt`.
+#Environment=MALLEUS_DRAFT_VOCAB_FILE=/models/draft-vocab-latin.txt
+# Optional: the vision tower's attention is quadratic in the patches, so an image is reduced to this many 16 px
+# patches before it (2048 is ~15 s; a 12 Mpx photo would otherwise need hours). Raise it only knowing that cost.
+#Environment=MALLEUS_VISION_MAX_PATCHES=2048
+# Optional: a request that runs longer than this many seconds ends the process, and the unit restarts it. HIP cannot
+# cancel a kernel, so the alternative is a worker busy forever with the service still answering /v1/models. 600 s,
+# the default, kills the long requests of a slow model (122B: ~730 s of prefill for 262144 tokens plus ~600 s of
+# decode), so keep it above the worst legitimate request.
+Environment=MALLEUS_REQUEST_TIMEOUT=3600
+
+HealthCmd=/opt/malleus/bin/malleus health
+HealthStartPeriod=10m
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=15m
+
+[Install]
+WantedBy=multi-user.target default.target

@@ -1,0 +1,21 @@
+[package]
+name = "malleus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+malleus-hip.workspace = true
+malleus-gguf.workspace = true
+malleus-model.workspace = true
+malleus-chat.workspace = true
+malleus-convert.workspace = true
+malleus-sched.workspace = true
+malleus-api.workspace = true
+tokio.workspace = true
+half.workspace = true
+axum.workspace = true

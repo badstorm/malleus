@@ -1,0 +1,1704 @@
+#![forbid(unsafe_code)]
+
+use anyhow::{Context, Result, ensure};
+use clap::{Parser, Subcommand};
+use malleus_gguf::gguf::Gguf;
+use malleus_gguf::safetensors::SafeTensors;
+use malleus_model::kernels::{Kernels, select_device};
+use malleus_model::qwen35::{Config, LoadOptions, Model};
+use malleus_model::vision::{VisionConfig, VisionModel};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+/// `malleus --version`: the license and where the source is. Apache-2.0 asks a redistribution to carry the
+/// attribution notices of `NOTICE`, so pointing at them is the part of the notice that travels with the binary.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nCopyright 2026 DuckPage di Olimpi e Rusu S.n.c. and the Malleus contributors.\n",
+    "License Apache-2.0 <https://www.apache.org/licenses/LICENSE-2.0>.\n",
+    "Attribution notices: NOTICE. Third-party components: THIRD-PARTY-NOTICES.md.\n",
+    "There is NO WARRANTY, to the extent permitted by law.\n",
+    "Source: https://github.com/duckpage/malleus"
+);
+
+#[derive(Parser)]
+#[command(name = "malleus", version, long_version = LONG_VERSION, about = "Malleus inference engine")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// List HIP devices
+    Devices,
+    /// Per-position perplexity, top-1 agreement and KL against scripts/eval_ref.py
+    Eval {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        set: PathBuf,
+        #[arg(long)]
+        blobs: PathBuf,
+        /// Tokens per forward call (prefill chunk)
+        #[arg(long, default_value_t = 256)]
+        chunk: usize,
+    },
+    /// Compare the engine against golden references produced by scripts/golden.py
+    Golden {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        golden: PathBuf,
+        #[arg(long)]
+        blobs: PathBuf,
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        #[arg(long)]
+        greedy: bool,
+        #[arg(long)]
+        only: Option<String>,
+        /// Feed the prompts one token at a time (the decode weights and kernels) instead of one prefill
+        #[arg(long)]
+        decode: bool,
+    },
+    /// Convert a safetensors bf16 model directory to an Malleus model file (.malleus)
+    Convert {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Also store an MLS8 copy of the weights for the prefill (`<name>.prefill`): twice the file, ~35 GB more
+        /// on the device for a 35B MoE, in exchange for reading the prompt at 8 bits instead of 4 (measured: eval
+        /// top-1 93.87 -> 97.02 %). Off by default: a single MLS4 copy is the faster file.
+        #[arg(long)]
+        prefill_int8: bool,
+        /// Deprecated: the single copy is the default now, this flag does nothing.
+        #[arg(long, hide = true)]
+        no_prefill_int8: bool,
+        /// With `--prefill-int8`, leave the routed experts without their MLS8 copy: their prefill reads MLS4
+        /// nibbles with int8 activations (W4A8), halving the bytes of the widest prefill block while the dense
+        /// linears keep their W8A8 path.
+        #[arg(long)]
+        no_prefill_int8_experts: bool,
+        /// Comma-separated layer indices whose FFN stays MLS8 in decode
+        #[arg(long, value_delimiter = ',')]
+        keep_int8_layers: Vec<usize>,
+        /// Directory with GPTQ-calibrated MLS4 tensors written by scripts/calibrate.py
+        #[arg(long)]
+        mls4_from: Option<PathBuf>,
+        /// MoE layers whose gate/up are stored at 3 bit: `family` (the range its model document chose), `off`,
+        /// or an inclusive `A-B`
+        #[arg(long, default_value = "family")]
+        expert_mls3: String,
+        /// Also store the hyper-connection mixing as MLS4 for decode, keeping the MLS8 copy for prefill
+        #[arg(long)]
+        hc_mls4: bool,
+    },
+    /// Rewrite a model file with a single weight copy: drop the MLS8 prefill copies, keep every other tensor
+    /// byte-for-byte. For a file converted before `--prefill-int8` became opt-in (no bf16 source needed).
+    Slim {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Keep the prefill copy of the tensors whose name contains one of these (comma-separated), e.g.
+        /// `hyper_connection`: the prefill of that family has no 4-bit form yet and would lose quality
+        #[arg(long, value_delimiter = ',')]
+        keep: Vec<String>,
+    },
+    /// Start the OpenAI / Anthropic compatible API server
+    Serve {
+        #[arg(long, env = "MALLEUS_MODEL")]
+        model: PathBuf,
+        #[arg(long, env = "MALLEUS_HOST", default_value = "0.0.0.0")]
+        host: String,
+        #[arg(long, env = "MALLEUS_PORT", default_value_t = 8090)]
+        port: u16,
+        #[arg(long, env = "MALLEUS_API_KEY")]
+        api_key: Option<String>,
+        #[arg(long, env = "MALLEUS_CTX", default_value_t = 32768)]
+        ctx: usize,
+        #[arg(long, env = "MALLEUS_MODEL_NAME")]
+        model_name: Option<String>,
+        /// Reasoning default when the request does not say (Qwen default: on)
+        #[arg(long, env = "MALLEUS_DEFAULT_THINKING", default_value_t = true, action = clap::ArgAction::Set)]
+        default_thinking: bool,
+        #[arg(long, env = "MALLEUS_MAX_TOKENS", default_value_t = 8192)]
+        max_tokens: usize,
+    },
+    /// Inspect a converted DFlash speculative draft: geometry, context layers, block and verify width
+    DraftInfo {
+        #[arg(long)]
+        model: PathBuf,
+    },
+    /// Write the Latin-script token ids (one per line) for MALLEUS_DRAFT_VOCAB_FILE
+    DraftVocab {
+        #[arg(long, env = "MALLEUS_MODEL")]
+        model: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Exit 0 if the local server answers /health (for container health checks)
+    Health {
+        #[arg(long, env = "MALLEUS_PORT", default_value_t = 8090)]
+        port: u16,
+    },
+    /// Measure prefill and decode speed on synthetic tokens
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "512")]
+        prompt: Vec<usize>,
+        #[arg(long, default_value_t = 32)]
+        decode: usize,
+        #[arg(long, default_value_t = 512)]
+        chunk: usize,
+        /// Also time steps of this many tokens (speculative verify cost)
+        #[arg(long)]
+        verify: Option<usize>,
+        /// Grow one session to these context depths and time `chunk` prefill tokens and `decode` tokens at each
+        #[arg(long, value_delimiter = ',')]
+        depth: Vec<usize>,
+    },
+    /// Compare the WMMA prefill GEMM against the reference MLS4 GEMM on random data
+    KernelTest,
+    /// Check that a speculative verify is exact: the logits of 2..=6 tokens verified in one step against the same
+    /// tokens fed one at a time, bit for bit. Exits non-zero when a row differs.
+    SpecExact {
+        #[arg(long)]
+        model: PathBuf,
+        /// A golden file (golden/<model>/golden.json): its token ids are the text
+        #[arg(long)]
+        golden: PathBuf,
+        /// Which prompt of the golden file
+        #[arg(long, default_value = "long-4500")]
+        only: String,
+        /// Tokens fed one at a time before the verify step (comma list: several depths)
+        #[arg(long, value_delimiter = ',', default_value = "64")]
+        prefix: Vec<usize>,
+        /// Only this verify width (default: every width from 2)
+        #[arg(long)]
+        width: Option<usize>,
+        /// Tokens generated twice after the first prefix, serially and through the speculative loop (drafts,
+        /// verify, rollback), comparing every committed row (0: skip)
+        #[arg(long, default_value_t = 96)]
+        replay: usize,
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+    },
+    /// Measure GPU memory bandwidth (read and copy)
+    BenchBw {
+        #[arg(long, default_value_t = 2.0)]
+        gb: f64,
+    },
+    /// Generate a reply to a single user prompt (greedy)
+    Run {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, short)]
+        prompt: String,
+        #[arg(long, default_value_t = 256)]
+        max_tokens: usize,
+        #[arg(long)]
+        think: bool,
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        /// Speculative decoding with this many MTP drafts per step (0: off)
+        #[arg(long, default_value_t = 0)]
+        spec: usize,
+        /// Debug: read whitespace-separated token ids from a file instead of encoding the prompt text
+        #[arg(long)]
+        prompt_ids: Option<PathBuf>,
+        /// Diagnostics (#96): write the logits of the last prefill position as raw f32, to measure how sensitive the
+        /// model is to removing a block of context.
+        #[arg(long)]
+        dump_logits: Option<PathBuf>,
+    },
+}
+
+/// A file is a converted Malleus model; a directory is an upstream safetensors model.
+fn is_converted(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Opens a converted model and checks that it is an Malleus file of a supported family.
+/// Prints what the draft declares and proves the weights load: the checkpoint is 738 MB, so this is the cheap way to
+/// check a conversion before the forward exists (issue #48).
+fn draft_info(path: &Path) -> Result<()> {
+    let g = Gguf::open(path)?;
+    let arch = g.malleus_arch()?;
+    anyhow::ensure!(arch == "dflash", "`{arch}` is not a DFlash draft");
+    let cfg = g.meta_str("openmalleus.hf_config")?;
+    malleus_model::dflash::ensure_is_draft(cfg)?;
+    let k = malleus_model::kernels::Kernels::load(&malleus_model::kernels::select_device()?)?;
+    let draft = malleus_model::dflash::DflashDraft::load(cfg, &g, &k)?;
+    for line in draft.describe() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn open_converted(path: &Path) -> Result<Gguf> {
+    let g = Gguf::open(path)?;
+    let arch = g.malleus_arch()?;
+    anyhow::ensure!(
+        matches!(arch, "qwen35" | "qwen4exp" | "ling3"),
+        "unsupported model family `{arch}`"
+    );
+    Ok(g)
+}
+
+/// What the run is about to ask the machine for, before it asks (see `malleus_model::memplan`).
+///
+/// The weights are exact (the file size, an upper bound when only the decode copies are loaded) and the
+/// per-session state is exact (it mirrors `Model::new_session`); the working set of a chunk is a reserve
+/// the caller sizes with `MALLEUS_MEM_RESERVE_GIB`. `load_model` prints what the run then measured.
+///
+/// `chunk` is the largest forward call the run makes (`None`: the scheduler's prefill chunk).
+fn preflight(path: &Path, ctx: usize, chunk: Option<usize>) -> Result<()> {
+    let prefill_int8 = std::env::var("MALLEUS_PREFILL_WEIGHTS").map_or(true, |v| v != "none");
+    let mut tables = 0;
+    let (cfg, weights) = if is_converted(path) {
+        let g = open_converted(path)?;
+        let cfg = Config::from_json(
+            g.meta_str("openmalleus.hf_config")?,
+            g.meta_str("openmalleus.generation_config").ok(),
+        )?;
+        let weights = malleus_model::memplan::weights_on_device(&g, prefill_int8);
+        tables = malleus_model::memplan::tables_on_disk(&g);
+        eprintln!(
+            "memory: {:.1} GiB of the {:.1} GiB file go on the device (the n-gram table stays on disk)",
+            weights as f64 / (1u64 << 30) as f64,
+            std::fs::metadata(path)?.len() as f64 / (1u64 << 30) as f64
+        );
+        (cfg, weights)
+    } else {
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(path)? {
+            let e = e?;
+            if e.file_type()?.is_file() {
+                bytes += e.metadata()?.len();
+            }
+        }
+        (Config::from_hf(path)?, bytes)
+    };
+    let mtp = std::env::var("MALLEUS_MTP").map_or(true, |v| v != "0");
+    let usage = malleus_model::memplan::Usage {
+        weights,
+        session: malleus_model::memplan::session_bytes(&cfg, ctx, mtp),
+        sessions: malleus_model::memplan::sessions(),
+        reserve: malleus_model::memplan::reserve_bytes(
+            &cfg,
+            chunk
+                .unwrap_or_else(|| malleus_model::memplan::prefill_chunk(&cfg))
+                .min(ctx),
+            std::env::var("MALLEUS_MOE_Y_HALF").is_ok_and(|v| v != "0"),
+        ),
+        host: malleus_model::memplan::host_reserve_bytes(tables),
+    };
+    malleus_model::memplan::check(
+        &path.display().to_string(),
+        ctx,
+        &usage,
+        malleus_model::memplan::MemInfo::read(),
+    )
+}
+
+fn load_model(path: &Path) -> Result<Model> {
+    let arch = select_device()?;
+    let k = Kernels::load(&arch)?;
+    let t0 = Instant::now();
+    let progress = |i: usize, n: usize| {
+        if i.is_multiple_of(8) || i == n {
+            eprint!("\rloading layers {i}/{n}");
+        }
+    };
+    let prefill_int8 = std::env::var("MALLEUS_PREFILL_WEIGHTS").map_or(true, |v| v != "none");
+    let with_vision = std::env::var("MALLEUS_VISION").map(|v| v != "0").unwrap_or(true);
+    let load_vision = |m: &mut Model, src: &dyn malleus_gguf::TensorSource, cfg_json: &str| -> Result<()> {
+        if let Some(vc) = VisionConfig::from_json(cfg_json)?
+            && with_vision
+            && src.info("model.visual.patch_embed.proj.weight").is_some()
+        {
+            let v = VisionModel::load(vc, src, "model.visual.")?;
+            m.weight_bytes += v.weight_bytes;
+            m.vision = Some(v);
+        }
+        Ok(())
+    };
+    let m = if is_converted(path) {
+        let g = open_converted(path)?;
+        let cfg_json = g.meta_str("openmalleus.hf_config")?;
+        let cfg = Config::from_json(cfg_json, g.meta_str("openmalleus.generation_config").ok())?;
+        let opts = LoadOptions {
+            hadamard_seed: g.meta_u64("openmalleus.hadamard_seed")?,
+            prefill_int8,
+            prefill_families: std::env::var("MALLEUS_PREFILL_INT8_FAMILIES")
+                .map(|v| v.split(',').filter(|x| !x.is_empty()).map(String::from).collect())
+                .unwrap_or_default(),
+            mtp: std::env::var("MALLEUS_MTP").map_or(true, |v| v != "0"),
+            ..Default::default()
+        };
+        let mut m = Model::load(cfg, &g, &opts, k, &progress)?;
+        load_vision(&mut m, &g, cfg_json)?;
+        m
+    } else {
+        let st = SafeTensors::open_dir(path)?;
+        let mut m = Model::load(Config::from_hf(path)?, &st, &LoadOptions::default(), k, &progress)?;
+        load_vision(&mut m, &st, &std::fs::read_to_string(path.join("config.json"))?)?;
+        m
+    };
+    eprintln!(
+        "\nloaded {:.1} GB on {arch} in {:.0}s",
+        m.weight_bytes as f64 / 1e9,
+        t0.elapsed().as_secs_f64()
+    );
+    let (free, total) = malleus_hip::mem_get_info().unwrap_or((0, 0));
+    eprintln!(
+        "memory: {:.1} GB live on the device (peak {:.1}), GTT {:.1} GB free of {:.1}",
+        malleus_hip::device_bytes_live() as f64 / 1e9,
+        malleus_hip::device_bytes_peak() as f64 / 1e9,
+        free as f64 / 1e9,
+        total as f64 / 1e9
+    );
+    // What the file actually allows, not what the flags would prefer: a single-copy file has no MLS8 weights to
+    // read, so the prefill runs on the MLS4 nibbles with int8 activations (W4A8).
+    eprintln!(
+        "dense prefill GEMMs: {}",
+        if malleus_model::qwen35::dense_w4a4() {
+            "W4A4 (int4 WMMA on the MLS4 weights)"
+        } else if m.prefill_copies {
+            "W8A8 (fused MLS8 copies)"
+        } else {
+            "W4A8 (MLS4 weights, no MLS8 copies)"
+        }
+    );
+    Ok(m)
+}
+
+fn draft_vocab(model: &Path, out: &Path) -> Result<()> {
+    let chat = load_chat(model)?;
+    let ids = chat.latin_vocab_ids();
+    let mut text = String::with_capacity(ids.len() * 8);
+    for id in &ids {
+        text.push_str(&id.to_string());
+        text.push('\n');
+    }
+    std::fs::write(out, text)?;
+    eprintln!("{} Latin-script tokens -> {}", ids.len(), out.display());
+    Ok(())
+}
+
+fn load_chat(path: &Path) -> Result<malleus_chat::Chat> {
+    if is_converted(path) {
+        let g = open_converted(path)?;
+        malleus_chat::Chat::from_parts(
+            g.meta_str("tokenizer.huggingface.json")?.as_bytes(),
+            g.meta_str("tokenizer.chat_template")?.to_string(),
+        )
+    } else {
+        malleus_chat::Chat::load(path)
+    }
+}
+
+fn log_softmax(x: &[f32]) -> Vec<f64> {
+    let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let lse = x.iter().map(|&v| (v as f64 - m).exp()).sum::<f64>().ln() + m;
+    x.iter().map(|&v| v as f64 - lse).collect()
+}
+
+/// The speculative verify against the serial step, bit for bit (`malleus spec-exact`).
+///
+/// A verify of `w` tokens has to give every one of them the logits it gets when the tokens are fed one at a
+/// time: the drafts only propose, so the committed text must not depend on how many rows a step checked. The
+/// verifies run first, so that with `MALLEUS_DUMP_DIR` set the last one-token step dumped is the reference of
+/// row 0 (the reference then stops there, and only row 0 is compared).
+fn spec_exact(
+    model: &Path,
+    golden: &Path,
+    only: &str,
+    prefixes: &[usize],
+    width: Option<usize>,
+    replay: usize,
+    ctx: usize,
+) -> Result<()> {
+    use malleus_model::qwen35::GEMV_MAX_T;
+    let g: serde_json::Value = serde_json::from_reader(std::fs::File::open(golden)?)?;
+    let entry = g["text"]
+        .as_array()
+        .context("text")?
+        .iter()
+        .find(|e| e["id"].as_str() == Some(only))
+        .with_context(|| format!("no prompt `{only}` in the golden file"))?;
+    let ids: Vec<u32> = entry["input_ids"]
+        .as_array()
+        .context("ids")?
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let widths: Vec<usize> = match width {
+        Some(w) => vec![w],
+        None => (2..=GEMV_MAX_T).collect(),
+    };
+    ensure!(
+        widths.iter().all(|w| (2..=GEMV_MAX_T).contains(w)),
+        "verify width out of 2..={GEMV_MAX_T}"
+    );
+    let maxw = widths.iter().copied().max().unwrap_or(2);
+    let m = load_model(model)?;
+    ensure!(m.has_mtp(), "the model has no MTP head: it never verifies");
+    let vocab = m.cfg.vocab;
+    // Debug, for the state a verify leaves behind: MALLEUS_SPEC_STATE=serial|verify with MALLEUS_DUMP_DIR feeds
+    // the prefix, then `width` tokens one at a time or in one verify, then one more token alone, whose per-layer
+    // dumps (`X<layer>_*_t1`) are what two runs with the two values are compared on.
+    if let Ok(mode) = std::env::var("MALLEUS_SPEC_STATE") {
+        let (p, w) = (prefixes[0], maxw);
+        ensure!(p + w < ids.len(), "prefix {p} out of the prompt");
+        let mut sess = m.new_session(ctx)?;
+        for &id in &ids[..p] {
+            m.forward(&mut sess, &[id], None, 1)?;
+        }
+        if mode == "verify" {
+            m.forward_verify(&mut sess, &ids[p..p + w])?;
+        } else {
+            for &id in &ids[p..p + w] {
+                m.forward(&mut sess, &[id], None, 1)?;
+            }
+        }
+        m.forward(&mut sess, &[ids[p + w]], None, 1)?;
+        return Ok(());
+    }
+    let ref_rows = if std::env::var_os("MALLEUS_DUMP_DIR").is_some() {
+        1
+    } else {
+        maxw
+    };
+    let mut bad = 0usize;
+    for &prefix in prefixes {
+        ensure!(
+            prefix >= 1 && prefix + maxw <= ids.len(),
+            "prefix {prefix} out of the prompt"
+        );
+        let mut ver = Vec::new();
+        for &w in &widths {
+            let mut sess = m.new_session(ctx)?;
+            for &id in &ids[..prefix] {
+                m.forward(&mut sess, &[id], None, 1)?;
+            }
+            ver.push(m.forward_verify(&mut sess, &ids[prefix..prefix + w])?);
+        }
+        let mut sess = m.new_session(ctx)?;
+        let mut reference = Vec::with_capacity(ref_rows * vocab);
+        for (i, &id) in ids[..prefix + ref_rows].iter().enumerate() {
+            let l = m.forward(&mut sess, &[id], None, 1)?;
+            if i >= prefix {
+                reference.extend(l);
+            }
+        }
+        for (&w, v) in widths.iter().zip(&ver) {
+            for r in 0..w.min(ref_rows) {
+                let (a, b) = (&reference[r * vocab..(r + 1) * vocab], &v[r * vocab..(r + 1) * vocab]);
+                let diff = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                let max = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                let same_top = argmax(a) == argmax(b);
+                bad += usize::from(diff > 0);
+                println!(
+                    "prefix {prefix:5} width {w} row {r}: {}{}",
+                    if diff == 0 {
+                        "identical".to_string()
+                    } else {
+                        format!("{diff} of {vocab} logits differ, max |d| {max:.3e}")
+                    },
+                    if same_top { "" } else { "  ARGMAX DIFFERS" }
+                );
+            }
+        }
+    }
+    ensure!(bad == 0, "{bad} verify rows differ from the serial step");
+    println!("every verify row is identical to the serial step");
+    if replay > 0 && std::env::var_os("MALLEUS_DUMP_DIR").is_none() {
+        spec_replay(&m, &ids[..prefixes[0]], replay, ctx)?;
+    }
+    Ok(())
+}
+
+/// Generates `n` tokens after `prompt` twice, one token at a time and through the scheduler's speculative loop
+/// (MTP drafts, verify, rollback of the rejected tail), and compares every committed row bit for bit: a single
+/// verify can be exact and the state it leaves behind still be wrong.
+fn spec_replay(m: &Model, prompt: &[u32], n: usize, ctx: usize) -> Result<()> {
+    let vocab = m.cfg.vocab;
+    let mut sess = m.new_session(ctx)?;
+    let mut l = Vec::new();
+    for &id in prompt {
+        l = m.forward(&mut sess, &[id], None, 1)?;
+    }
+    // Serial: `rows[i]` is what token `toks[i]` produced, and `toks[i + 1]` its argmax.
+    let mut toks = vec![argmax(&l) as u32];
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let l = m.forward(&mut sess, &[toks[i]], None, 1)?;
+        toks.push(argmax(&l) as u32);
+        rows.push(l);
+    }
+    let mut sess = m.new_session(ctx)?;
+    for &id in prompt {
+        m.forward(&mut sess, &[id], None, 1)?;
+    }
+    let max = std::env::var("MALLEUS_SPEC_DRAFTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5usize)
+        .min(malleus_model::qwen35::GEMV_MAX_T - 1);
+    let pmin: f32 = std::env::var("MALLEUS_DRAFT_PMIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(malleus_sched::DEFAULT_DRAFT_PMIN);
+    let (mut i, mut pend, mut rounds, mut rejected) = (0usize, vec![toks[0]], 0usize, 0usize);
+    while i < n {
+        let ds = malleus_sched::draft_tokens(m, &mut sess, &pend, max.min(n - i), pmin, None)?;
+        let step: Vec<u32> = std::iter::once(toks[i]).chain(ds.iter().copied()).collect();
+        let v = if step.len() > 1 {
+            m.forward_verify(&mut sess, &step)?
+        } else {
+            m.forward(&mut sess, &step, None, 1)?
+        };
+        rounds += 1;
+        let mut acc = 0;
+        loop {
+            let (row, want) = (&v[acc * vocab..(acc + 1) * vocab], &rows[i + acc]);
+            let diff = row.iter().zip(want).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            if diff > 0 {
+                let max_d = row.iter().zip(want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                anyhow::bail!(
+                    "replay: token {} (round {rounds}, row {acc} of a {}-row verify, {rejected} drafts rejected \
+                     so far): {diff} of {vocab} logits differ from the serial step, max |d| {max_d:.3e}",
+                    i + acc,
+                    step.len()
+                );
+            }
+            if acc == ds.len() || i + acc + 1 >= n || ds[acc] != toks[i + acc + 1] {
+                break;
+            }
+            acc += 1;
+        }
+        rejected += ds.len() - acc;
+        m.rollback(&mut sess, ds.len() - acc)?;
+        pend = ds[..acc].to_vec();
+        pend.push(toks[i + acc + 1]);
+        i += acc + 1;
+    }
+    println!("replay: {n} tokens in {rounds} rounds ({rejected} drafts rejected), every committed row identical");
+    Ok(())
+}
+
+fn argmax(x: &[f32]) -> usize {
+    x.iter()
+        .enumerate()
+        .fold((0, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b })
+        .0
+}
+
+fn read_f32(p: &Path) -> Result<Vec<f32>> {
+    let b = std::fs::read(p).with_context(|| p.display().to_string())?;
+    Ok(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
+}
+
+fn eval(model: &Path, set: &Path, blobs: &Path, chunk: usize) -> Result<()> {
+    let e: serde_json::Value = serde_json::from_reader(std::fs::File::open(set)?)?;
+    let k = e["topk"].as_u64().context("topk")? as usize;
+    let topk = std::fs::read(blobs.join("eval").join("topk.bin"))?;
+    let m = load_model(model)?;
+    let vocab = m.cfg.vocab;
+    let u = |v: &serde_json::Value| -> Vec<u64> { v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect() };
+    let (mut pos, mut tot) = (0usize, [0f64; 5]);
+    for d in e["docs"].as_array().context("docs")? {
+        let ids: Vec<u32> = u(&d["input_ids"]).into_iter().map(|x| x as u32).collect();
+        let ref_arg = u(&d["argmax"]);
+        let ref_nll: Vec<f64> = d["nll"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
+        let mut sess = m.new_session(ids.len() + 1)?;
+        let mut acc = [0f64; 5];
+        for (ci, c) in ids.chunks(chunk).enumerate() {
+            let logits = m.forward(&mut sess, c, None, c.len())?;
+            for (j, row) in logits.chunks_exact(vocab).enumerate() {
+                let i = ci * chunk + j;
+                let lp = log_softmax(row);
+                let rec = &topk[(pos + i) * k * 8..(pos + i + 1) * k * 8];
+                let (ri, rv) = rec.split_at(k * 4);
+                let (mut kl, mut pr, mut po) = (0f64, 0f64, 0f64);
+                for (a, b) in ri.as_chunks::<4>().0.iter().zip(rv.as_chunks::<4>().0) {
+                    let (id, lr) = (i32::from_le_bytes(*a) as usize, f32::from_le_bytes(*b) as f64);
+                    kl += lr.exp() * (lr - lp[id]);
+                    pr += lr.exp();
+                    po += lp[id].exp();
+                }
+                let (rr, ro) = ((1.0 - pr).max(1e-12), (1.0 - po).max(1e-12));
+                kl += rr * (rr.ln() - ro.ln());
+                acc[0] += kl;
+                acc[1] += (argmax(row) == ref_arg[i] as usize) as u8 as f64;
+                if i + 1 < ids.len() {
+                    acc[2] += -lp[ids[i + 1] as usize];
+                    acc[3] += ref_nll[i];
+                    acc[4] += 1.0;
+                }
+            }
+        }
+        let n = ids.len() as f64;
+        println!(
+            "{:14} ppl {:8.3} (ref {:8.3}, {:+.2}%)  top1 {:6.2}%  KL {:.5}",
+            d["id"].as_str().unwrap_or("?"),
+            (acc[2] / acc[4]).exp(),
+            (acc[3] / acc[4]).exp(),
+            ((acc[2] - acc[3]) / acc[4]).exp_m1() * 100.0,
+            acc[1] / n * 100.0,
+            acc[0] / n
+        );
+        tot[0] += acc[0];
+        tot[1] += acc[1];
+        tot[2] += acc[2];
+        tot[3] += acc[3];
+        tot[4] += acc[4];
+        pos += ids.len();
+    }
+    let n = pos as f64;
+    println!(
+        "TOTAL          ppl {:8.3} (ref {:8.3}, {:+.2}%)  top1 {:6.2}%  KL {:.5}",
+        (tot[2] / tot[4]).exp(),
+        (tot[3] / tot[4]).exp(),
+        ((tot[2] - tot[3]) / tot[4]).exp_m1() * 100.0,
+        tot[1] / n * 100.0,
+        tot[0] / n
+    );
+    Ok(())
+}
+
+fn golden(
+    model: &Path,
+    golden: &Path,
+    blobs: &Path,
+    ctx: usize,
+    greedy: bool,
+    only: Option<&str>,
+    decode: bool,
+) -> Result<()> {
+    let g: serde_json::Value = serde_json::from_reader(std::fs::File::open(golden)?)?;
+    let m = load_model(model)?;
+    let vocab = m.cfg.vocab;
+    let mut worst_kl: f64 = 0.0;
+    let (mut top1_ok, mut top1_n, mut pos_ok, mut pos_n) = (0, 0, 0usize, 0usize);
+    for e in g["text"].as_array().context("text")? {
+        let id = e["id"].as_str().unwrap_or("?");
+        if only.is_some_and(|o| !o.split(',').any(|x| x == id)) {
+            continue;
+        }
+        let ids: Vec<u32> = e["input_ids"]
+            .as_array()
+            .context("ids")?
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let ref_argmax: Vec<usize> = e["argmax"]
+            .as_array()
+            .context("argmax")?
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let mut sess = m.new_session(ctx)?;
+        let t0 = Instant::now();
+        let logits = if decode {
+            let mut l = Vec::with_capacity(ids.len() * vocab);
+            for &id in &ids {
+                l.extend(m.forward(&mut sess, &[id], None, 1)?);
+            }
+            l
+        } else {
+            m.forward(&mut sess, &ids, None, ids.len())?
+        };
+        let dt = t0.elapsed().as_secs_f64();
+        let ours: Vec<usize> = logits.chunks_exact(vocab).map(argmax).collect();
+        let agree = ours.iter().zip(&ref_argmax).filter(|(a, b)| a == b).count();
+        pos_ok += agree;
+        pos_n += ids.len();
+        let last = &logits[(ids.len() - 1) * vocab..];
+        let rl = read_f32(&blobs.join("text").join(id).join("logits_last.f32"))?;
+        let (lp_ref, lp_our) = (log_softmax(&rl), log_softmax(last));
+        let kl: f64 = lp_ref.iter().zip(&lp_our).map(|(r, o)| r.exp() * (r - o)).sum();
+        worst_kl = worst_kl.max(kl);
+        let t1 = argmax(last) == argmax(&rl);
+        top1_ok += t1 as usize;
+        top1_n += 1;
+        print!(
+            "{id:14} T={:4} prefill {:6.2}s ({:5.1} tok/s)  pos-argmax {agree}/{}  last top1 {}  KL {kl:.5}",
+            ids.len(),
+            dt,
+            ids.len() as f64 / dt,
+            ids.len(),
+            if t1 { "ok" } else { "MISMATCH" }
+        );
+        if greedy && let Some(refg) = e["greedy"].as_array() {
+            let mut refg: Vec<u32> = refg.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+            if let Some(i) = refg.iter().position(|t| m.cfg.eos.contains(t)) {
+                refg.truncate(i + 1);
+            }
+            let mut next = argmax(last) as u32;
+            let mut out = vec![];
+            let t0 = Instant::now();
+            for _ in 0..refg.len() {
+                out.push(next);
+                if m.cfg.eos.contains(&next) {
+                    break;
+                }
+                let l = m.forward(&mut sess, &[next], None, 1)?;
+                next = argmax(&l) as u32;
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            let same = out.iter().zip(&refg).take_while(|(a, b)| a == b).count();
+            print!(
+                "  greedy {same}/{} identical, decode {:.2} tok/s",
+                refg.len(),
+                out.len() as f64 / dt
+            );
+        }
+        println!();
+    }
+    if let Some(imgs) = g["images"].as_array() {
+        let img_dir = golden.parent().context("golden dir")?.join("images");
+        for e in imgs {
+            let id = e["id"].as_str().unwrap_or("?");
+            if only.is_some_and(|o| !o.split(',').any(|x| x == id)) {
+                continue;
+            }
+            golden_image(&m, e, &img_dir, &blobs.join("images").join(id), ctx, greedy)?;
+        }
+    }
+    println!(
+        "SUMMARY: last-token top1 {top1_ok}/{top1_n}, all-position argmax {pos_ok}/{pos_n} ({:.2}%), worst KL {worst_kl:.5}",
+        100.0 * pos_ok as f64 / pos_n.max(1) as f64
+    );
+    Ok(())
+}
+
+fn rel_err(a: &[f32], b: &[f32]) -> f64 {
+    let num: f64 = a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+    let den: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum();
+    (num / den.max(1e-30)).sqrt()
+}
+
+fn golden_image(m: &Model, e: &serde_json::Value, img_dir: &Path, blob: &Path, ctx: usize, greedy: bool) -> Result<()> {
+    use malleus_model::image_pre::{PreConfig, decode, preprocess_rgb};
+    let id = e["id"].as_str().unwrap_or("?");
+    let v = m.vision.as_ref().context("model has no vision tower")?;
+    let bytes = std::fs::read(img_dir.join(format!("{id}.png")))?;
+    let (rgb, h, w) = decode(&bytes, &PreConfig::default())?;
+    let pc = PreConfig {
+        max_pixels: 16777216,
+        ..Default::default()
+    };
+    let pre = preprocess_rgb(&rgb, h, w, &pc)?;
+    let grid: Vec<usize> = e["grid_thw"]
+        .as_array()
+        .context("grid")?
+        .iter()
+        .map(|x| x.as_u64().unwrap() as usize)
+        .collect();
+    let ref_px = read_f32(&blob.join("pixel_values.f32"))?;
+    let px_ok = [pre.grid_t, pre.grid_h, pre.grid_w] == grid[..];
+    let px_err = if px_ok && ref_px.len() == pre.pixels.len() {
+        pre.pixels
+            .iter()
+            .zip(&ref_px)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+    } else {
+        f32::NAN
+    };
+    let t0 = Instant::now();
+    let (vit, merged) = v.encode(&m.k, &pre)?;
+    let enc_s = t0.elapsed().as_secs_f64();
+    let vit = vit.download::<f32>(vit.len() / 4)?;
+    let mg = merged.download::<f32>(merged.len() / 4)?;
+    let vit_err = rel_err(&vit, &read_f32(&blob.join("vit_out.f32"))?);
+    let mg_err = rel_err(&mg, &read_f32(&blob.join("merger_out.f32"))?);
+    let ids: Vec<u32> = e["input_ids"]
+        .as_array()
+        .context("ids")?
+        .iter()
+        .map(|x| x.as_u64().unwrap() as u32)
+        .collect();
+    let image_token = 248056u32;
+    let start = ids.iter().position(|&t| t == image_token).context("no image token")?;
+    let mm = v.cfg.merge;
+    let (pos, _) = malleus_model::mrope::positions(&ids, image_token, &[(pre.grid_h / mm, pre.grid_w / mm)], 0)?;
+    let mut sess = m.new_session(ctx)?;
+    let logits = m.forward_mm(&mut sess, &ids, Some(&pos), 1, &[(start, &merged)])?;
+    let rl = read_f32(&blob.join("logits_last.f32"))?;
+    let (lp_ref, lp_our) = (log_softmax(&rl), log_softmax(&logits));
+    let kl: f64 = lp_ref.iter().zip(&lp_our).map(|(r, o)| r.exp() * (r - o)).sum();
+    print!(
+        "img {id:14} grid {:?} px max|d| {px_err:.4} vit rel {vit_err:.4} merger rel {mg_err:.4} encode {enc_s:.2}s top1 {} KL {kl:.5}",
+        grid,
+        if argmax(&logits) == argmax(&rl) {
+            "ok"
+        } else {
+            "MISMATCH"
+        }
+    );
+    if greedy && let Some(refg) = e["greedy"].as_array() {
+        let mut refg: Vec<u32> = refg.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        if let Some(i) = refg.iter().position(|t| m.cfg.eos.contains(t)) {
+            refg.truncate(i + 1);
+        }
+        let mut next = argmax(&logits) as u32;
+        let mut out = vec![];
+        for _ in 0..refg.len() {
+            out.push(next);
+            if m.cfg.eos.contains(&next) {
+                break;
+            }
+            let p = [[sess.next_pos as i32; 3]];
+            let l = m.forward(&mut sess, &[next], Some(&p), 1)?;
+            next = argmax(&l) as u32;
+        }
+        let same = out.iter().zip(&refg).take_while(|(a, b)| a == b).count();
+        print!("  greedy {same}/{}", refg.len());
+    }
+    println!();
+    Ok(())
+}
+
+fn run(
+    model: &Path,
+    prompt: &str,
+    max_tokens: usize,
+    think: bool,
+    ctx: usize,
+    max_drafts: usize,
+    prompt_ids: Option<&Path>,
+    dump_logits: Option<&Path>,
+) -> Result<()> {
+    preflight(model, ctx, None)?;
+    let spec = max_drafts > 0;
+    let pmin: f32 = std::env::var("MALLEUS_DRAFT_PMIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(malleus_sched::DEFAULT_DRAFT_PMIN);
+    let chat = load_chat(model)?;
+    let m = load_model(model)?;
+    if let Some(path) = prompt_ids {
+        let ids: Vec<u32> = std::fs::read_to_string(path)?
+            .split_whitespace()
+            .map(|x| x.parse::<u32>())
+            .collect::<std::result::Result<_, _>>()?;
+        let mut sess = m.new_session(ctx)?;
+        let chunk = std::env::var("MALLEUS_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32768)
+            .max(64);
+        let t0 = Instant::now();
+        let mut last = Vec::new();
+        for part in ids.chunks(chunk) {
+            last = m.forward(&mut sess, part, None, 1)?;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        if let Some(path) = dump_logits
+            && !last.is_empty()
+        {
+            let mut bytes = Vec::with_capacity(last.len() * 4);
+            for v in &last {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(path, &bytes)?;
+            eprintln!("logit dell'ultima posizione in {}", path.display());
+        }
+        if let Some(path) = std::env::var_os("MALLEUS_ATTN_MASS") {
+            m.dump_attn_mass(std::path::Path::new(&path))?;
+            eprintln!("attention masses written to {}", std::path::Path::new(&path).display());
+        }
+        println!(
+            "prompt {} tok, TTFT {:.2}s ({:.1} tok/s)",
+            ids.len(),
+            dt,
+            ids.len() as f64 / dt
+        );
+        if max_tokens > 1 && !last.is_empty() {
+            let mut next = argmax(&last) as u32;
+            let gpu_argmax = std::env::var("MALLEUS_ARGMAX_GPU").map_or(true, |v| v != "0");
+            let mut out = Vec::with_capacity(max_tokens);
+            for _ in 0..max_tokens {
+                out.push(next);
+                if m.cfg.eos.contains(&next) {
+                    break;
+                }
+                next = if gpu_argmax {
+                    m.forward_argmax(&mut sess, &[next])?
+                } else {
+                    argmax(&m.forward(&mut sess, &[next], None, 1)?) as u32
+                };
+            }
+            println!("ids: {out:?}");
+        }
+        return Ok(());
+    }
+    let prompts: Vec<String> = match prompt.strip_prefix('@') {
+        Some(f) => std::fs::read_to_string(f)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.replace("\\n", "\n"))
+            .collect(),
+        None => vec![prompt.to_string()],
+    };
+    let mut sess = m.new_session(ctx)?;
+    let (mut steps, mut accepted, mut tot_n, mut tot_s) = (0usize, 0usize, 0usize, 0f64);
+    let (mut t_draft, mut t_verify, mut vsteps) = (0f64, 0f64, 0usize);
+    for prompt in &prompts {
+        m.reset_session(&mut sess)?;
+        let msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
+        let opts = malleus_chat::RenderOptions {
+            enable_thinking: Some(think),
+            ..Default::default()
+        };
+        let ids = chat.encode(&chat.render(&msgs, &opts)?)?;
+        let t0 = Instant::now();
+        let l = m.forward(&mut sess, &ids, None, 1)?;
+        let ttft = t0.elapsed().as_secs_f64();
+        if let Some(path) = dump_logits {
+            let mut bytes = Vec::with_capacity(l.len() * 4);
+            for v in &l {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(path, &bytes)?;
+        }
+        let mut next = argmax(&l) as u32;
+        let mut dec = malleus_chat::StreamDecoder::new();
+        let t1 = Instant::now();
+        let mut n = 0;
+        use std::io::Write;
+        let mut pend = vec![next];
+        // Tokens in the session plus the pending one (prompt lookup drafts).
+        let mut hist = ids.clone();
+        let lookup = std::env::var("MALLEUS_LOOKUP").map_or(true, |v| v != "0");
+        let v = m.cfg.vocab;
+        let (s0, a0) = (steps, accepted);
+        while n < max_tokens && !m.cfg.eos.contains(&next) {
+            print!("{}", dec.push(&chat, next)?);
+            std::io::stdout().flush()?;
+            n += 1;
+            if !spec {
+                next = if std::env::var("MALLEUS_ARGMAX_GPU").map_or(true, |v| v != "0") {
+                    m.forward_argmax(&mut sess, &[next])?
+                } else {
+                    argmax(&m.forward(&mut sess, &[next], None, 1)?) as u32
+                };
+                continue;
+            }
+            let ta = Instant::now();
+            hist.push(next);
+            // `run` has the prompt as one string, so there is no tool-result text to draft from.
+            const NO_SOURCES: &[Vec<u32>] = &[];
+            let ds = malleus_sched::draft_tokens(
+                &m,
+                &mut sess,
+                &pend,
+                max_drafts,
+                pmin,
+                lookup.then_some((&hist[..], NO_SOURCES)),
+            )?;
+            hist.pop();
+            let nd = ds.len();
+            let tb = Instant::now();
+            let toks: Vec<u32> = std::iter::once(next).chain(ds.iter().copied()).collect();
+            let l = m.forward_verify(&mut sess, &toks)?;
+            t_draft += (tb - ta).as_secs_f64();
+            t_verify += tb.elapsed().as_secs_f64();
+            steps += nd;
+            vsteps += 1;
+            let mut acc = 0;
+            while acc < nd && argmax(&l[acc * v..(acc + 1) * v]) as u32 == ds[acc] {
+                acc += 1;
+            }
+            accepted += acc;
+            m.rollback(&mut sess, nd - acc)?;
+            let y = argmax(&l[acc * v..(acc + 1) * v]) as u32;
+            let mut stop = false;
+            for &d in &ds[..acc] {
+                if n >= max_tokens || m.cfg.eos.contains(&d) {
+                    stop = true;
+                    break;
+                }
+                print!("{}", dec.push(&chat, d)?);
+                n += 1;
+            }
+            if stop {
+                break;
+            }
+            hist.push(next);
+            hist.extend_from_slice(&ds[..acc]);
+            pend = ds[..acc].to_vec();
+            pend.push(y);
+            next = y;
+        }
+        println!();
+        let dt = t1.elapsed().as_secs_f64();
+        tot_n += n;
+        tot_s += dt;
+        eprintln!(
+            "prompt {} tok, TTFT {:.2}s ({:.1} tok/s), decode {n} tok at {:.2} tok/s{}",
+            ids.len(),
+            ttft,
+            ids.len() as f64 / ttft,
+            n as f64 / dt,
+            if spec {
+                format!(", MTP {}/{} drafts accepted", accepted - a0, steps - s0)
+            } else {
+                String::new()
+            }
+        );
+    }
+    if prompts.len() > 1 || spec {
+        eprintln!(
+            "total: {tot_n} tok at {:.2} tok/s{}",
+            tot_n as f64 / tot_s,
+            if spec {
+                format!(
+                    ", MTP {accepted}/{steps} accepted ({:.1}%)",
+                    100.0 * accepted as f64 / steps.max(1) as f64
+                )
+            } else {
+                String::new()
+            }
+        );
+        if spec {
+            let k = 1e3 / vsteps.max(1) as f64;
+            eprintln!(
+                "per step: draft {:.1} ms, verify {:.1} ms, {:.2} tokens",
+                t_draft * k,
+                t_verify * k,
+                tot_n as f64 / vsteps.max(1) as f64
+            );
+        }
+    }
+    if malleus_model::expert_cache::enabled() {
+        let (hits, misses, bytes) = malleus_model::expert_cache::stats();
+        let total = hits + misses;
+        eprintln!(
+            "expert cache: {:.2}% of the pairs hit ({} / {total}), {misses} experts read, {:.2} GB from disk",
+            if total > 0 {
+                100.0 * hits as f64 / total as f64
+            } else {
+                0.0
+            },
+            hits,
+            bytes as f64 / 1e9
+        );
+    }
+    Ok(())
+}
+
+fn bench_bw(gb: f64) -> Result<()> {
+    use malleus_hip::{Arg, DeviceBuffer, Event, Stream};
+    let arch = select_device()?;
+    let k = Kernels::load(&arch)?;
+    let bytes = (gb * 1e9) as usize / 16 * 16;
+    let n = (bytes / 16) as u64;
+    let a = DeviceBuffer::zeroed(bytes)?;
+    let b = DeviceBuffer::zeroed(bytes)?;
+    let out = DeviceBuffer::zeroed(16)?;
+    let s = Stream::null();
+    for grid in [256u32, 1024, 4096] {
+        let mut best = (0.0f64, 0.0f64);
+        for _ in 0..5 {
+            let (e0, e1) = (Event::new()?, Event::new()?);
+            e0.record(&s)?;
+            k.get("bw_read").launch(
+                (grid, 1, 1),
+                (256, 1, 1),
+                0,
+                &s,
+                &[(&a).into(), Arg::U64(n), (&out).into()],
+            )?;
+            e1.record(&s)?;
+            best.0 = best.0.max(bytes as f64 / (e1.elapsed_ms(&e0)? as f64 * 1e6));
+            e0.record(&s)?;
+            k.get("bw_copy").launch(
+                (grid, 1, 1),
+                (256, 1, 1),
+                0,
+                &s,
+                &[(&b).into(), (&a).into(), Arg::U64(n)],
+            )?;
+            e1.record(&s)?;
+            best.1 = best.1.max(2.0 * bytes as f64 / (e1.elapsed_ms(&e0)? as f64 * 1e6));
+        }
+        println!(
+            "{arch} grid {grid:5}: read {:6.1} GB/s, copy (r+w) {:6.1} GB/s",
+            best.0, best.1
+        );
+    }
+    Ok(())
+}
+
+fn serve(
+    model: PathBuf,
+    host: String,
+    port: u16,
+    api_key: Option<String>,
+    ctx: usize,
+    model_name: Option<String>,
+    default_thinking: bool,
+    max_tokens: usize,
+) -> Result<()> {
+    preflight(&model, ctx, None)?;
+    let chat = load_chat(&model)?;
+    let name = model_name.unwrap_or_else(|| {
+        model
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("malleus")
+            .to_string()
+    });
+    let mp = model.clone();
+    let engine = malleus_sched::Engine::start(ctx, move || load_model(&mp))?;
+    let eos = {
+        let mut e = vec![];
+        for t in ["<|im_end|>", "<|endoftext|>"] {
+            e.extend(chat.token_id(t));
+        }
+        e
+    };
+    let cfg = malleus_api::Config {
+        model_name: name.clone(),
+        api_key,
+        default_thinking,
+        max_tokens_default: max_tokens,
+    };
+    let app = malleus_api::router(engine, chat, cfg, eos);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+        eprintln!("serving {name} on {host}:{port} (ctx {ctx})");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
+        Ok(())
+    })
+}
+
+fn health(port: u16) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    s.write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+    let mut buf = String::new();
+    s.read_to_string(&mut buf)?;
+    anyhow::ensure!(
+        buf.starts_with("HTTP/1.1 200") || buf.starts_with("HTTP/1.0 200"),
+        "unhealthy: {}",
+        buf.lines().next().unwrap_or("")
+    );
+    Ok(())
+}
+
+fn bench(model: &Path, prompts: &[usize], decode: usize, chunk: usize, verify: Option<usize>) -> Result<()> {
+    let ctx = prompts.iter().copied().max().unwrap_or(512) + decode * (1 + verify.unwrap_or(1)) + 1;
+    preflight(model, ctx, Some(chunk))?;
+    let m = load_model(model)?;
+    let max = prompts.iter().copied().max().unwrap_or(512) + decode * (1 + verify.unwrap_or(1)) + 1;
+    let mut sess = m.new_session(max)?;
+    let gpu_argmax = std::env::var("MALLEUS_ARGMAX_GPU").map_or(true, |v| v != "0");
+    for &n in prompts {
+        m.reset_session(&mut sess)?;
+        let ids: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+        let t0 = Instant::now();
+        let mut l = vec![];
+        for c in ids.chunks(chunk) {
+            l = m.forward(&mut sess, c, None, 1)?;
+        }
+        let pp = t0.elapsed().as_secs_f64();
+        let mut next = argmax(&l) as u32;
+        let t1 = Instant::now();
+        for _ in 0..decode {
+            next = if gpu_argmax {
+                m.forward_argmax(&mut sess, &[next])?
+            } else {
+                argmax(&m.forward(&mut sess, &[next], None, 1)?) as u32
+            };
+        }
+        let tg = t1.elapsed().as_secs_f64();
+        println!(
+            "pp{n}: {:.1} tok/s ({pp:.2}s)   tg{decode}: {:.2} tok/s",
+            n as f64 / pp,
+            decode as f64 / tg
+        );
+        if let Some(v) = verify {
+            let toks = vec![next; v];
+            let t2 = Instant::now();
+            for _ in 0..decode {
+                m.forward(&mut sess, &toks, None, v)?;
+            }
+            let ms = t2.elapsed().as_secs_f64() * 1e3 / decode as f64;
+            println!(
+                "  verify {v} tokens: {ms:.1} ms/step (decode {:.1} ms/token)",
+                tg * 1e3 / decode as f64
+            );
+        }
+    }
+    Ok(())
+}
+
+fn bench_depth(model: &Path, depths: &[usize], decode: usize, chunk: usize) -> Result<()> {
+    let m = load_model(model)?;
+    let max = depths.iter().copied().max().unwrap_or(0) + depths.len() * (chunk + decode) + 1;
+    let mut sess = m.new_session(max)?;
+    let gpu_argmax = std::env::var("MALLEUS_ARGMAX_GPU").map_or(true, |v| v != "0");
+    let (start, mut len) = (Instant::now(), 0usize);
+    let tok = |i: usize| 1000 + (i as u32 * 7919) % 50000;
+    // The first depth is the reference: what is asked here is how little the two rates degrade as the context
+    // grows, not what they are in absolute terms, so the ratio goes next to the number.
+    let mut ref_pp = 0f64;
+    let mut ref_tg = 0f64;
+    println!(
+        "| depth | pp{chunk} tok/s | pp vs {base} | tg{decode} tok/s | tg vs {base} | fill tok/s | elapsed s |\n|---|---|---|---|---|---|---|",
+        base = depths.first().copied().unwrap_or(0)
+    );
+    for &d in depths {
+        let (t0, from) = (Instant::now(), len);
+        while len < d {
+            let ids: Vec<u32> = (len..d.min(len + chunk)).map(tok).collect();
+            m.forward(&mut sess, &ids, None, 1)?;
+            len += ids.len();
+        }
+        let fill = (len - from) as f64 / t0.elapsed().as_secs_f64().max(1e-9);
+        let ids: Vec<u32> = (len..len + chunk).map(tok).collect();
+        let t1 = Instant::now();
+        let l = m.forward(&mut sess, &ids, None, 1)?;
+        let pp = chunk as f64 / t1.elapsed().as_secs_f64();
+        len += chunk;
+        let mut next = argmax(&l) as u32;
+        let t2 = Instant::now();
+        for _ in 0..decode {
+            next = if gpu_argmax {
+                m.forward_argmax(&mut sess, &[next])?
+            } else {
+                argmax(&m.forward(&mut sess, &[next], None, 1)?) as u32
+            };
+        }
+        let tg = decode as f64 / t2.elapsed().as_secs_f64();
+        len += decode;
+        if ref_pp == 0.0 {
+            ref_pp = pp;
+            ref_tg = tg;
+        }
+        println!(
+            "| {d} | {pp:.1} | {:.0} % | {tg:.2} | {:.0} % | {fill:.1} | {:.0} |",
+            pp / ref_pp * 100.0,
+            tg / ref_tg * 100.0,
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+fn kernel_test() -> Result<()> {
+    use malleus_hip::{Arg, DeviceBuffer, Stream};
+    let arch = select_device()?;
+    let k = Kernels::load(&arch)?;
+    let s = Stream::null();
+    let mut seed = 12345u64;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+    };
+    let signs = DeviceBuffer::from_slice(&malleus_gguf::quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED))?;
+    let (n, kd) = (256usize, 1024usize);
+    let q: Vec<u8> = (0..n * kd / 2).map(|_| ((rnd() + 1.0) * 127.9) as u8).collect();
+    let sc: Vec<u16> = (0..n * kd / 128)
+        .map(|_| half::f16::from_f32(0.01 + 0.01 * rnd().abs()).to_bits())
+        .collect();
+    let (qd, scd) = (DeviceBuffer::from_slice(&q)?, DeviceBuffer::from_slice(&sc)?);
+    for t in [5usize, 24, 50, 130, 700] {
+        let x: Vec<f32> = (0..t * kd).map(|_| rnd() * 3.0).collect();
+        let xd = DeviceBuffer::from_slice(&x)?;
+        let xr = DeviceBuffer::alloc(t * kd * 4)?;
+        let xh = DeviceBuffer::alloc(t * kd * 2)?;
+        let (o1, o2) = (DeviceBuffer::zeroed(t * n * 4)?, DeviceBuffer::zeroed(t * n * 4)?);
+        let chunks = (t * kd / 128) as u32;
+        k.get("hadamard128").launch(
+            (chunks, 1, 1),
+            (128, 1, 1),
+            0,
+            &s,
+            &[(&xr).into(), (&xd).into(), (&signs).into(), kd.into()],
+        )?;
+        k.get("gemm_mls4").launch(
+            (n.div_ceil(16) as u32, t.div_ceil(8) as u32, 1),
+            (256, 1, 1),
+            0,
+            &s,
+            &[
+                (&o1).into(),
+                (&xr).into(),
+                (&qd).into(),
+                (&scd).into(),
+                t.into(),
+                n.into(),
+                kd.into(),
+                0i32.into(),
+            ],
+        )?;
+        k.get("hadamard128_h").launch(
+            (chunks, 1, 1),
+            (128, 1, 1),
+            0,
+            &s,
+            &[(&xh).into(), (&xd).into(), (&signs).into(), kd.into()],
+        )?;
+        for (name, bm) in [("gemm_wmma_m32", 32usize), ("gemm_wmma_m64", 64), ("gemm_wmma", 128)] {
+            o2.memset(0, &s)?;
+            let args: [Arg; 9] = [
+                (&o2).into(),
+                (&xh).into(),
+                (&qd).into(),
+                (&scd).into(),
+                t.into(),
+                n.into(),
+                kd.into(),
+                0i32.into(),
+                0i32.into(),
+            ];
+            k.get(name).launch(
+                (n.div_ceil(128) as u32, t.div_ceil(bm) as u32, 1),
+                (256, 1, 1),
+                0,
+                &s,
+                &args,
+            )?;
+            s.synchronize()?;
+            let (a, b) = (o1.download::<f32>(t * n)?, o2.download::<f32>(t * n)?);
+            println!("T={t:4} {name:14} rel err {:.2e}", rel_err(&b, &a));
+        }
+        let xq = DeviceBuffer::alloc(t * kd)?;
+        let xsc = DeviceBuffer::alloc(t * kd / 128 * 4)?;
+        k.get("rot_quant_i8").launch(
+            (chunks, 1, 1),
+            (128, 1, 1),
+            0,
+            &s,
+            &[(&xq).into(), (&xsc).into(), (&xd).into(), (&signs).into(), kd.into()],
+        )?;
+        // The same MLS4 weights with int4 activations: gemm_a8_impl shares one body with gemm_w4a8, so both
+        // operand widths are checked against the same reference. W4A4 quantizes the activations to 4 bits, so its
+        // error is expected to sit about an order above W4A8 rather than near it.
+        let xq4 = DeviceBuffer::alloc(t * kd / 2)?;
+        let xsc4 = DeviceBuffer::alloc(t * kd / 128 * 4)?;
+        k.get("rot_quant_i4").launch(
+            (chunks, 1, 1),
+            (128, 1, 1),
+            0,
+            &s,
+            &[(&xq4).into(), (&xsc4).into(), (&xd).into(), (&signs).into(), kd.into()],
+        )?;
+        for (name, x, xs, bm) in [
+            ("gemm_w4a8_m32", &xq, &xsc, 32usize),
+            ("gemm_w4a8_m64", &xq, &xsc, 64),
+            ("gemm_w4a8", &xq, &xsc, 128),
+            ("gemm_w4a4_m32", &xq4, &xsc4, 32),
+            ("gemm_w4a4_m64", &xq4, &xsc4, 64),
+            ("gemm_w4a4", &xq4, &xsc4, 128),
+        ] {
+            o2.memset(0, &s)?;
+            let args: [Arg; 9] = [
+                (&o2).into(),
+                x.into(),
+                xs.into(),
+                (&qd).into(),
+                (&scd).into(),
+                t.into(),
+                n.into(),
+                kd.into(),
+                0i32.into(),
+            ];
+            k.get(name).launch(
+                ((n.div_ceil(128) * t.div_ceil(bm)) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                &s,
+                &args,
+            )?;
+            s.synchronize()?;
+            let (a, b) = (o1.download::<f32>(t * n)?, o2.download::<f32>(t * n)?);
+            println!("T={t:4} {name:16} rel err {:.2e}", rel_err(&b, &a));
+        }
+        // The grouped MoE GEMMs on one expert that holds every row: offs [0, t], one tile per BM rows. Both operand
+        // widths share moe_a4_impl, so this covers the W4A8 path and the W4A4 one; the GLU epilogue is the same code
+        // with a different tail.
+        let offs = DeviceBuffer::from_slice(&[0i32, t as i32])?;
+        for (name, x, xs, bm) in [
+            ("moe_w4a8_m32", &xq, &xsc, 32usize),
+            ("moe_w4a8", &xq, &xsc, 64),
+            ("moe_w4a8_m128", &xq, &xsc, 128),
+            ("moe_w4a4_m32", &xq4, &xsc4, 32),
+            ("moe_w4a4", &xq4, &xsc4, 64),
+            ("moe_w4a4_m128", &xq4, &xsc4, 128),
+        ] {
+            let nt = t.div_ceil(bm);
+            let tv: Vec<i32> = (0..nt).flat_map(|i| [0i32, (i * bm) as i32]).collect();
+            let (tiles, ntl) = (DeviceBuffer::from_slice(&tv)?, DeviceBuffer::from_slice(&[nt as i32])?);
+            o2.memset(0, &s)?;
+            let args: [Arg; 10] = [
+                (&o2).into(),
+                x.into(),
+                xs.into(),
+                (&qd).into(),
+                (&scd).into(),
+                (&offs).into(),
+                (&tiles).into(),
+                (&ntl).into(),
+                n.into(),
+                kd.into(),
+            ];
+            k.get(name)
+                .launch(((nt * n.div_ceil(128)) as u32, 1, 1), (256, 1, 1), 0, &s, &args)?;
+            s.synchronize()?;
+            let (a, b) = (o1.download::<f32>(t * n)?, o2.download::<f32>(t * n)?);
+            println!("T={t:4} {name:16} rel err {:.2e}", rel_err(&b, &a));
+        }
+    }
+    // The one-wave rotation + quantizer must produce the same bytes as the 128-thread shared-memory one, which is
+    // the reference the converter's host rotation agrees with: same arithmetic, same order, so the bytes are equal
+    // rather than close.
+    {
+        let (rows, kw) = (8usize, 1024usize);
+        let x: Vec<f32> = (0..rows * kw).map(|_| rnd() * 3.0).collect();
+        let xd = DeviceBuffer::from_slice(&x)?;
+        let chunks = (rows * kw / 128) as u32;
+        for (old, new, i4) in [
+            ("rot_quant_i8", "rot_quant_i8_w", false),
+            ("rot_quant_i4", "rot_quant_i4_w", true),
+        ] {
+            let nb = if i4 { rows * kw / 2 } else { rows * kw };
+            let (qa, qb) = (DeviceBuffer::zeroed(nb)?, DeviceBuffer::zeroed(nb)?);
+            let (sa, sb) = (
+                DeviceBuffer::zeroed(chunks as usize * 4)?,
+                DeviceBuffer::zeroed(chunks as usize * 4)?,
+            );
+            for (name, q, sc, block) in [(old, &qa, &sa, 128u32), (new, &qb, &sb, 32)] {
+                k.get(name).launch(
+                    (chunks, 1, 1),
+                    (block, 1, 1),
+                    0,
+                    &s,
+                    &[q.into(), sc.into(), (&xd).into(), (&signs).into(), kw.into()],
+                )?;
+            }
+            s.synchronize()?;
+            let (a, b) = (qa.download::<u8>(nb)?, qb.download::<u8>(nb)?);
+            let (fa, fb) = (
+                sa.download::<f32>(chunks as usize)?,
+                sb.download::<f32>(chunks as usize)?,
+            );
+            let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+            let sdiff = fa.iter().zip(&fb).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            println!("{new:16} vs {old:12} bytes diff {diff} / {nb}, scale diff {sdiff} / {chunks}");
+            assert_eq!((diff, sdiff), (0, 0), "{new} must match {old} byte for byte");
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Devices => {
+            for d in malleus_hip::devices()? {
+                println!("{} {} {}", d.index, d.arch, d.name);
+            }
+            let (f, t) = malleus_hip::mem_info()?;
+            println!("memory: {:.1} GB free / {:.1} GB", f as f64 / 1e9, t as f64 / 1e9);
+        }
+        Cmd::BenchBw { gb } => bench_bw(gb)?,
+        Cmd::KernelTest => kernel_test()?,
+        Cmd::Bench {
+            model,
+            decode,
+            chunk,
+            depth,
+            ..
+        } if !depth.is_empty() => bench_depth(&model, &depth, decode, chunk)?,
+        Cmd::Bench {
+            model,
+            prompt,
+            decode,
+            chunk,
+            verify,
+            ..
+        } => bench(&model, &prompt, decode, chunk, verify)?,
+        Cmd::Serve {
+            model,
+            host,
+            port,
+            api_key,
+            ctx,
+            model_name,
+            default_thinking,
+            max_tokens,
+        } => serve(
+            model,
+            host,
+            port,
+            api_key,
+            ctx,
+            model_name,
+            default_thinking,
+            max_tokens,
+        )?,
+        Cmd::DraftInfo { model } => draft_info(&model)?,
+        Cmd::DraftVocab { model, out } => draft_vocab(&model, &out)?,
+        Cmd::Health { port } => health(port)?,
+        Cmd::Convert {
+            model,
+            out,
+            prefill_int8,
+            no_prefill_int8,
+            no_prefill_int8_experts,
+            keep_int8_layers,
+            mls4_from,
+            expert_mls3,
+            hc_mls4,
+        } => {
+            let mls3_layers = match expert_mls3.as_str() {
+                "family" => malleus_convert::Mls3Layers::Family,
+                "off" => malleus_convert::Mls3Layers::Off,
+                s => {
+                    let (a, b) = s.split_once('-').ok_or_else(|| {
+                        anyhow::anyhow!("--expert-mls3 `{s}`: expected `family`, `off` or an inclusive `A-B`")
+                    })?;
+                    malleus_convert::Mls3Layers::Range(a.trim().parse()?, b.trim().parse()?)
+                }
+            };
+            if no_prefill_int8 {
+                eprintln!("note: --no-prefill-int8 is the default now, the flag does nothing");
+            }
+            let opts = malleus_convert::Options {
+                prefill_int8,
+                no_prefill_int8_experts,
+                keep_int8_layers,
+                mls4_from,
+                mls3_layers,
+                hc_mls4,
+            };
+            if out.extension().and_then(|e| e.to_str()) != Some(malleus_gguf::gguf::EXTENSION) {
+                eprintln!(
+                    "note: Malleus model files use the .{} extension",
+                    malleus_gguf::gguf::EXTENSION
+                );
+            }
+            let t0 = Instant::now();
+            malleus_convert::convert(&model, &out, &opts, &|m| eprintln!("{m}"))?;
+            eprintln!("converted in {:.0}s", t0.elapsed().as_secs_f64());
+        }
+        Cmd::Slim {
+            model,
+            out,
+            keep: keep_families,
+        } => {
+            if out.extension().and_then(|e| e.to_str()) != Some(malleus_gguf::gguf::EXTENSION) {
+                eprintln!(
+                    "note: Malleus model files use the .{} extension",
+                    malleus_gguf::gguf::EXTENSION
+                );
+            }
+            let g = open_converted(&model)?;
+            // The prefill copy is a pair: the int8 weights and their row scales. Both go, or the loader would see
+            // half a copy and ignore it.
+            let keep = |n: &str| {
+                let prefill = n.ends_with(".prefill") || n.ends_with(".prefill.scales");
+                !prefill || keep_families.iter().any(|f| n.contains(f.as_str()))
+            };
+            let dropped: u64 = g
+                .tensors()
+                .iter()
+                .filter(|t| !keep(&t.name))
+                .map(|t| t.size as u64)
+                .sum();
+            anyhow::ensure!(
+                dropped > 0,
+                "nothing to drop from {}: already a single-copy file, or --keep covers every copy",
+                model.display()
+            );
+            let t0 = Instant::now();
+            let (kept, removed) = malleus_gguf::gguf::rewrite_keeping(&g, &g.metadata, &out, &keep)?;
+            let size = std::fs::metadata(&out)?.len();
+            eprintln!(
+                "single copy: {kept} tensors kept, {removed} dropped ({:.2} GB), {:.2} GB written in {:.0}s",
+                dropped as f64 / 1e9,
+                size as f64 / 1e9,
+                t0.elapsed().as_secs_f64()
+            );
+            if out
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.contains("mls8"))
+            {
+                eprintln!(
+                    "warning: {} says mls8 but carries a single MLS4 copy: name it `<model>-mls4.malleus`",
+                    out.display()
+                );
+            }
+        }
+        Cmd::Run {
+            model,
+            prompt,
+            max_tokens,
+            think,
+            ctx,
+            spec,
+            prompt_ids,
+            dump_logits,
+        } => run(
+            &model,
+            &prompt,
+            max_tokens,
+            think,
+            ctx,
+            spec,
+            prompt_ids.as_deref(),
+            dump_logits.as_deref(),
+        )?,
+        Cmd::Eval {
+            model,
+            set,
+            blobs,
+            chunk,
+        } => eval(&model, &set, &blobs, chunk)?,
+        Cmd::Golden {
+            model,
+            golden: g,
+            blobs,
+            ctx,
+            greedy,
+            only,
+            decode,
+        } => golden(&model, &g, &blobs, ctx, greedy, only.as_deref(), decode)?,
+        Cmd::SpecExact {
+            model,
+            golden: g,
+            only,
+            prefix,
+            width,
+            replay,
+            ctx,
+        } => spec_exact(&model, &g, &only, &prefix, width, replay, ctx)?,
+    }
+    Ok(())
+}

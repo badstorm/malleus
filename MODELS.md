@@ -1,0 +1,188 @@
+# Models
+
+What Malleus carries, what each file costs on the device, and what the engine measures on it. One section per
+model with the numbers, the date and the machine; the commands that produce them are at the end.
+
+All numbers are single runs on the development machine unless stated otherwise:
+
+| | |
+|---|---|
+| GPU | gfx1150, Radeon 890M (16 CU), 93.4 GiB of GTT reported by the driver, ~80 GB/s of measured read bandwidth |
+| Host | LXC, 32 GB of RAM visible (the GPU reads the model from GTT, not from the host) |
+| Stack | ROCm 7.14.1; `llama.cpp` build 12407 (`e574a17b0`) from `ghcr.io/ggml-org/llama.cpp:full-rocm` for the comparisons |
+| Noise | ~±8 % run to run on a single run; a difference under that is not a difference |
+
+## Carried models
+
+`on disk` is the size of the `.malleus` file; `prefill copies` says whether the file also carries the MLS8 weights
+for prompt processing (twice the file, better prompts) or only the 4-bit ones.
+
+| Model | File | On disk | Prefill copies | Notes |
+|---|---|---|---|---|
+| Qwen3.8-27B (dense, text + images) | `qwen38-27b-mls4.malleus` | 17.6 GB | no | The reference model for the quality gates (`golden/qwen38-27b`). |
+| Qwen3.6-35B-A3B (text + images) | `qwen36-35b-a3b-mls4.malleus` | 54.8 GB | **yes** (680 tensors) | Converted before `--prefill-int8` became opt-in: the name says `-mls4` but the file holds both copies. `malleus slim` rewrites it as 4-bit only. |
+| Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
+| Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #75). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #81). |
+| Qwen3.8-Flash-Next (text) | — | — | — | gfx1151 only; the model the hyper-connection kernels were written for. No numbers on gfx1150. |
+| Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
+
+## Qwen3.8-27B
+
+Tokens/s, same machine and conditions. Malleus 4-bit decode + 8-bit prefill against llama.cpp Q4_K_M with
+flash attention.
+
+| Engine | pp512 | pp1024 | pp2048 | pp8192 | tg128 |
+|---|---|---|---|---|---|
+| llama.cpp Q4_K_M | 191.7 | 215.2 | 213.9 | 200.0 | 4.74 |
+| **Malleus** | **209.3** | **220.3** | **214.6** | **203.1** | **5.02** |
+
+Measured memory bandwidth is ~80 GB/s (`malleus bench-bw`), so the 4-bit decode of a dense 27B model is bandwidth
+bound at ~5.8 tokens/s; MTP speculative decoding is what goes past that limit.
+
+## Ornith-1.5-35B-A3B — the long-context case (2026-11-15/16)
+
+A 35B-A3B hybrid MoE (40 layers, full attention every 4th, 256 experts / 8 active, native window 262 144), 20.2 GB
+of MLS4 weights against the 20.21 GiB `Q4_K_M` GGUF of the same checkpoint. This is the model the project exists
+for: **the prefill of a long prompt on one APU**.
+
+### Engine level: prefill and decode against the depth of the session
+
+`malleus bench --depth` against `llama-bench -d`: same synthetic tokens, prefill of 8192 tokens in one forward,
+64 tokens of decode, one session grown to each depth (`-fa on -ngl 99` for llama.cpp, chunk 8192 here, MTP off on
+both sides so this is kernel against kernel).
+
+| depth | pp Malleus | pp llama.cpp | ratio | tg Malleus | tg llama.cpp | ratio |
+|---|---|---|---|---|---|---|
+| 0 | **968.5** | 467.6 | 2.07x | 29.08 | 28.30 | 1.03x |
+| 8192 | **854.6** | 341.7 | 2.50x | 27.02 | 26.67 | 1.01x |
+| 16384 | **704.8** | 270.0 | 2.61x | 24.84 | 25.09 | 0.99x |
+| 32768 | **522.4** | 193.7 | 2.70x | 22.25 | 22.47 | 0.99x |
+| 65536 | **341.6** | 121.2 | 2.82x | 17.78 | 18.86 | 0.94x |
+| 98304 | **248.4** | 88.0 | 2.82x | 15.01 | 15.90 | 0.94x |
+| 131072 | **196.1** | 69.4 | **2.83x** | 13.08 | 13.98 | 0.94x |
+
+What is left of the shallow rate at each depth:
+
+| | 8k | 16k | 32k | 64k | 96k | 128k |
+|---|---|---|---|---|---|---|
+| prefill Malleus | 88 % | 73 % | 54 % | 35 % | 26 % | 20 % |
+| prefill llama.cpp | 73 % | 58 % | 41 % | 26 % | 19 % | 15 % |
+| decode Malleus | 93 % | 85 % | 77 % | 61 % | 52 % | 45 % |
+| decode llama.cpp | 94 % | 89 % | 79 % | 67 % | 56 % | 49 % |
+
+The gap is not a long-context trick: it is ~2.1x already in a fresh session and grows to 2.8x, i.e. the prefill path
+of this family is systematically faster here. Decode is at parity up to ~16K and ~6 % behind below that; at 4 bits a
+decode step reads all the weights and is bandwidth bound, so no engine wins there. In absolute terms the cost of the
+context is the same for both: the KV of this model is ~20 KB per token of context (10 full-attention layers, 2 KV
+heads, head_dim 256, fp16), i.e. ~2.6 GB at 131 072 — at that depth the read of the KV is as large as the weights
+themselves, and how much of that traffic becomes tokens is the whole difference above.
+
+### In service: HTTP, real text, same prompts
+
+`bench/api_bench.py` on both servers (`--prefill`, `--decode-ctx`), prefill with a fresh nonce (no prompt cache),
+decode over `bench/spec-prompts.txt` with thinking off.
+
+| prefill (tokens) | Malleus | llama.cpp | ratio |
+|---|---|---|---|
+| 411 | **748.1 tok/s** | 409.0 tok/s | 1.83x |
+| 5 940 | **1025.5 tok/s** | 465.2 tok/s | 2.20x |
+| 23 634 | **862.2 tok/s** | 349.6 tok/s | 2.47x |
+| 94 413 | **445.7 tok/s** | — | — |
+
+| decode (128 tokens) | Malleus | llama.cpp | ratio |
+|---|---|---|---|
+| ctx 0, greedy | **35.25 tok/s** | 28.95 tok/s | 1.22x |
+| ctx 0, sampling (T 0.7, top_p 0.8, top_k 20) | **34.14 tok/s** | 28.79 tok/s | 1.19x |
+| ctx ~24k, greedy | **29.02 tok/s** | 24.42 tok/s | 1.19x |
+| ctx ~24k, sampling | **28.23 tok/s** | 24.43 tok/s | 1.16x |
+| ctx ~94k, greedy | 19.66 tok/s | — | — |
+
+Here Malleus also wins the decode, but **because of MTP** (speculative decoding with the head in the file: one
+`nextn` layer, exactness checked by `malleus spec-exact`): without it the two engines are the same (29.08 against
+28.30). `llama.cpp` has no MTP for this architecture — it would need a separate draft model, and there is none
+matching this checkpoint.
+
+### Long-context recall and the cost of a long prompt
+
+`bench/needle.py`: a unique fact planted in the middle of an English corpus (Wikipedia articles, ~4.2 characters per
+token), the question in English, greedy decoding, a nonce in front so no engine serves it from the prompt cache. (The
+table below was measured with the earlier Italian wording of the marker and of the question: the shape of the test —
+one unique fact, one question, at a given depth — is identical.)
+
+| context | Malleus | llama.cpp |
+|---|---|---|
+| 6 815 tokens | recalled, 975.5 tok/s prefill, 7.4 s | recalled, 426.1 tok/s, 16.3 s |
+| 27 003 tokens | recalled, 821.2 tok/s prefill, 33.2 s | recalled, 313.4 tok/s, 86.6 s |
+| 109 366 tokens | recalled, 404.1 tok/s prefill, **271 s** | recalled, 143.3 tok/s, **764 s** |
+
+Both engines find the fact at the hardest position (the middle) up to 110K tokens; what changes is the wait: 4.5
+minutes against 12.7. At 131 072 tokens the same prompt takes 437 s to prefill here and ~1 600 s there.
+
+### Quality: how far the 4-bit file is from the bf16 checkpoint
+
+Reference: the bf16 checkpoint (`/srv/llm/models/bf16/ornith-ai/Ornith-1.5-35B-A3B`, transformers on the GPU).
+20 prompts from `scripts/golden.py`; the score is the first generated token against the bf16 distribution.
+
+| | Malleus (MLS4) | llama.cpp (Q4_K_M) |
+|---|---|---|
+| top-1 of the last prompt token (19 prompts both engines could run) | 13/19 | 14/19 |
+| KL, mean / median / max | 0.407 / 0.162 / 1.500 | 0.228 / 0.064 / 2.144 |
+| argmax over **every** position of the prompt | 50.65 % (351/693) | not measurable over HTTP |
+| greedy 52 tokens against bf16 (`en-explain`) | **11/52** | 6/52 |
+
+The two engines miss the top-1 on mostly different prompts (3 in common out of 8 misses, half of them where bf16
+itself is unsure, top-1 logprob between −0.5 and −0.9), so the two quants are equally far from the checkpoint: no
+quality is being traded for the prefill speed.
+
+The KL column is not the same number: Malleus computes it over the whole vocabulary, `bench/quality_api.py` only
+over the reference top-10 (the rest charged at the floor of what the engine returned), which is a lower bound by
+construction. Compare the top-1 and the greedy tokens, not the KL.
+
+## How these numbers are produced
+
+The reference tensors the quality gates compare against are published next to the model files, with the same layout
+as this repo plus the logits (`golden/<model>/text/<id>/logits_last.f32`, `images/<name>/*.f32`, `eval/topk.bin`):
+
+```sh
+hf download duckpage/malleus-golden --local-dir /srv/models/malleus-golden
+```
+
+What follows generated them in the first place, and is what to re-run when a model changes: it needs the bf16
+checkpoint and a GPU, so it happens once per model.
+
+```sh
+# engine level, prefill and decode at each depth (synthetic tokens)
+scripts/dev.sh /target/release/malleus bench --model /models/ornith-15-35b-a3b-mls4.malleus \
+  --depth 0,8192,16384,32768,65536,98304,131072 --chunk 8192 --decode 64
+
+# the same on llama.cpp
+PROMPTS=8192 GEN=64 LLAMA_ARGS="-d 0,8192,16384,32768,65536,98304,131072 -n 64" \
+  bench/baseline-llamacpp.sh /srv/containers/aitools/models/gguf Ornith-1.5-35B-Q4_K_M.gguf
+
+# in service: prefill and decode from the server's own timings
+python3 bench/api_bench.py http://localhost:8090 --api-key KEY \
+  --prefill 512,8192,32768,131072 --decode-ctx 0,32768,131072 --max-tokens 128
+
+# long-context recall (the filler is any long text; 520 000 characters ~ 110 000 tokens)
+python3 bench/needle.py http://localhost:8090 --api-key KEY --filler book.txt --chars 32000,131000,520000 --pos 0.5
+
+# quality against the bf16 checkpoint: engine level, then through the API for another engine
+scripts/golden.sh python3 scripts/golden.py --model /models/bf16/ornith-ai/Ornith-1.5-35B-A3B \
+  --out /golden/ornith-15-35b --blob-dir /golden/ornith-15-35b --skip-images --skip-greedy
+scripts/dev.sh /target/release/malleus golden --model /models/ornith-15-35b-a3b-mls4.malleus \
+  --golden /golden/ornith-15-35b/golden.json --blobs /golden/ornith-15-35b --greedy
+python3 bench/quality_api.py http://localhost:8091 --golden /golden/ornith-15-35b/golden.json \
+  --tokenizer /srv/llm/models/bf16/ornith-ai/Ornith-1.5-35B-A3B/tokenizer.json
+```
+
+`scripts/golden.py` writes both `golden.json` and the blobs; the greedy reference needs the GPU for ~200 s per 128
+tokens on this machine (bf16, transformers), so run it with `--skip-greedy` when only the last-token distribution
+is needed.
+
+## What is worth measuring next
+
+- **Ornith-1.5-122B with the experts on disk** (issue #81): where the engine differs structurally from llama.cpp
+  is running a model that does not fit; 1.5-3 tok/s of decode is the current state, not a limit to live with.
+- **QSA on Ornith** (issue #96): this checkpoint has no indexer, so the numbers above are all dense attention. With
+  a selection budget the KV traffic at 128-256K drops by two orders of magnitude.
+- **gfx1151**: the same curves on Strix Halo, where `MALLEUS_IDX_*` and the sparse gather default differently.

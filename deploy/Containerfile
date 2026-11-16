@@ -1,0 +1,66 @@
+ARG DEBIAN_IMAGE=docker.io/library/debian:trixie-slim
+
+FROM ${DEBIAN_IMAGE} AS dev
+ARG ROCM_VERSION=7.14.1
+ARG ROCM_INDEX=https://repo.amd.com/rocm/whl-multi-arch/
+ARG RUST_VERSION=1.99.1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git build-essential pkg-config python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /opt/rocm-venv \
+    && /opt/rocm-venv/bin/pip install --no-cache-dir --index-url ${ROCM_INDEX} \
+      "rocm[libraries,devel]==${ROCM_VERSION}" \
+      "rocm-sdk-device-gfx1150==${ROCM_VERSION}" "rocm-sdk-device-gfx1151==${ROCM_VERSION}" \
+    && /opt/rocm-venv/bin/rocm-sdk init \
+    && ln -s "$(/opt/rocm-venv/bin/rocm-sdk path --root)" /opt/rocm
+ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm \
+    PATH=/opt/rocm/bin:/root/.cargo/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+      --default-toolchain ${RUST_VERSION} -c rustfmt -c clippy
+WORKDIR /src
+
+FROM dev AS golden
+ARG ROCM_VERSION=7.14.1
+ARG ROCM_INDEX=https://repo.amd.com/rocm/whl-multi-arch/
+# python3-dev: without Python.h Triton cannot JIT its kernels, and the Ling-3.0-flash reference code needs them.
+# fla-core (MIT) provides the Kimi Delta Attention kernels the checkpoint's remote code imports.
+RUN apt-get update && apt-get install -y --no-install-recommends python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN /opt/rocm-venv/bin/pip install --no-cache-dir --index-url ${ROCM_INDEX} \
+      "torch==2.12.0+rocm${ROCM_VERSION}" "torchvision==0.27.0+rocm${ROCM_VERSION}" \
+      "amd-torch-device-gfx1150" "amd-torch-device-gfx1151" \
+    && /opt/rocm-venv/bin/pip install --no-cache-dir transformers accelerate safetensors pillow numpy \
+    && /opt/rocm-venv/bin/pip install --no-cache-dir --no-deps fla-core einops
+ENV PATH=/opt/rocm-venv/bin:${PATH}
+
+FROM dev AS build
+ARG MALLEUS_GPU_TARGETS="gfx1150;gfx1151"
+ENV MALLEUS_GPU_TARGETS=${MALLEUS_GPU_TARGETS} CARGO_TARGET_DIR=/target \
+    MALLEUS_RPATH=1
+COPY . /src
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    cargo build --release --locked -p malleus \
+    && mkdir -p /out/bin && cp /target/release/malleus /out/bin/ \
+    && sh deploy/collect-runtime-libs.sh /out/bin/malleus /out
+
+FROM ${DEBIAN_IMAGE} AS runtime
+ARG MALLEUS_GPU_TARGETS="gfx1150;gfx1151"
+ARG ROCM_VERSION=7.14.1
+ARG VERSION=0.1.0
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="malleus" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      io.malleus.rocm-version="${ROCM_VERSION}" \
+      io.malleus.gpu-targets="${MALLEUS_GPU_TARGETS}"
+COPY --from=build /out/bin/malleus /opt/malleus/bin/malleus
+COPY --from=build /out/lib/ /opt/malleus/lib/
+COPY --from=build /out/RUNTIME-LIBS.txt /opt/malleus/
+USER 65532:65532
+WORKDIR /
+EXPOSE 8090
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s CMD ["/opt/malleus/bin/malleus", "health"]
+ENTRYPOINT ["/opt/malleus/bin/malleus"]
+CMD ["serve"]

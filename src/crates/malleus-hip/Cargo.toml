@@ -1,0 +1,9 @@
+[package]
+name = "malleus-hip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "amdhip64"
+build = "build.rs"
+
+[dependencies]
