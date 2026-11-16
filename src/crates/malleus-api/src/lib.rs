@@ -50,6 +50,7 @@ pub fn router(engine: Engine, chat: Chat, cfg: Config, eos: Vec<u32>) -> Router 
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .layer(DefaultBodyLimit::max(64 << 20))
@@ -370,6 +371,11 @@ struct Prepared {
     max_tokens: usize,
     sampling: Sampling,
     stops: Vec<String>,
+    /// Per-token log-probabilities in the response (OpenAI `logprobs` / completions `logprobs: int`);
+    /// false keeps the engine path byte-identical to today.
+    logprobs: bool,
+    /// Number of top alternatives per token, capped at 20 like OpenAI; 0 = none.
+    top_logprobs: usize,
 }
 
 /// Token sequences of the message texts as the model will write them back. An agent reads a file through a
@@ -542,19 +548,8 @@ fn prepare(
     };
     let left = st.engine.ctx - ids.len();
     let max_tokens = (max_tokens.unwrap_or(st.cfg.max_tokens_default as u64) as usize).clamp(1, left);
-    let f = |k: &str, d: f64| body[k].as_f64().unwrap_or(d) as f32;
-    let sampling = Sampling {
-        temperature: f("temperature", if thinking { 0.6 } else { 0.7 }),
-        top_p: f("top_p", if thinking { 0.95 } else { 0.8 }),
-        top_k: body["top_k"].as_u64().unwrap_or(20) as usize,
-        min_p: f("min_p", 0.0),
-        seed: body["seed"].as_u64().unwrap_or_else(now),
-    };
-    let stops = match body.get("stop").or(body.get("stop_sequences")) {
-        Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-        _ => vec![],
-    };
+    let sampling = sampling_from(body, thinking);
+    let stops = stops_from(body);
     Ok(Prepared {
         ids,
         drafts,
@@ -565,7 +560,40 @@ fn prepare(
         max_tokens,
         sampling,
         stops,
+        logprobs: logprobs(body),
+        top_logprobs: top_logprobs(body),
     })
+}
+
+/// Sampling parameters the way an OpenAI-style body asks for them; `thinking` picks the temperature/top_p defaults.
+fn sampling_from(body: &Value, thinking: bool) -> Sampling {
+    let f = |k: &str, d: f64| body[k].as_f64().unwrap_or(d) as f32;
+    Sampling {
+        temperature: f("temperature", if thinking { 0.6 } else { 0.7 }),
+        top_p: f("top_p", if thinking { 0.95 } else { 0.8 }),
+        top_k: body["top_k"].as_u64().unwrap_or(20) as usize,
+        min_p: f("min_p", 0.0),
+        seed: body["seed"].as_u64().unwrap_or_else(now),
+    }
+}
+
+fn stops_from(body: &Value) -> Vec<String> {
+    match body.get("stop").or(body.get("stop_sequences")) {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        _ => vec![],
+    }
+}
+
+/// OpenAI `logprobs` (chat: a boolean; the raw /v1/completions path is parsed separately).
+fn logprobs(body: &Value) -> bool {
+    let top = top_logprobs(body);
+    body["logprobs"].as_bool().unwrap_or(false) || top > 0
+}
+
+/// Number of top alternatives requested, capped at 20 like OpenAI.
+fn top_logprobs(body: &Value) -> usize {
+    body["top_logprobs"].as_u64().unwrap_or(0).min(20) as usize
 }
 
 struct CancelGuard(Arc<AtomicBool>);
@@ -586,11 +614,32 @@ struct Gen {
     stopped_by_string: bool,
     prompt_tokens: usize,
     cached_tokens: usize,
+    /// Whether the request asked for per-token log-probabilities.
+    logprobs_on: bool,
+    /// The log-probability entries of the tokens consumed since the last piece was delivered, in order.
+    logprobs: Vec<Logprob>,
+}
+
+/// Log-probability data of one generated token (OpenAI `logprobs.content[i]` minus the text, resolved at serialization).
+struct Logprob {
+    id: u32,
+    logprob: f64,
+    /// `(id, logprob)` top alternatives, most likely first.
+    top: Vec<(u32, f64)>,
 }
 
 enum Piece {
-    Text(String),
-    Done(Finish),
+    Text {
+        text: String,
+        /// The log-probability entries of the tokens whose text this piece carries.
+        logprobs: Vec<Logprob>,
+    },
+    Done {
+        finish: Finish,
+        /// Any log-probability entries not yet delivered with a text piece (generation ended before their text
+        /// formed a complete piece, e.g. on a trailing byte-resolution).
+        logprobs: Vec<Logprob>,
+    },
 }
 
 impl Gen {
@@ -606,6 +655,8 @@ impl Gen {
                 max_tokens: p.max_tokens,
                 sampling: p.sampling.clone(),
                 stop_tokens: st.eos.clone(),
+                logprobs: p.logprobs,
+                top_logprobs: p.top_logprobs,
                 snapshot_at: st
                     .chat
                     .token_id("<|im_start|>")
@@ -624,6 +675,8 @@ impl Gen {
             stopped_by_string: false,
             prompt_tokens: p.ids.len(),
             cached_tokens: 0,
+            logprobs_on: p.logprobs,
+            logprobs: Vec::new(),
         })
     }
 
@@ -637,9 +690,18 @@ impl Gen {
                     self.prompt_tokens = prompt_tokens;
                     self.cached_tokens = cached_tokens;
                 }
-                Some(Event::Token(t)) => {
+                Some(Event::Token { id: t, top }) => {
                     if self.stopped_by_string {
                         continue;
+                    }
+                    if let Some(p) = top
+                        && self.logprobs_on
+                    {
+                        self.logprobs.push(Logprob {
+                            id: t,
+                            logprob: p.logprob as f64,
+                            top: p.top.iter().map(|&(i, l)| (i, l as f64)).collect(),
+                        });
                     }
                     let piece = self
                         .dec
@@ -659,14 +721,20 @@ impl Gen {
                         }
                     }
                     if self.text.len() > start {
-                        return Ok(Piece::Text(self.text[start..].to_string()));
+                        return Ok(Piece::Text {
+                            text: self.text[start..].to_string(),
+                            logprobs: std::mem::take(&mut self.logprobs),
+                        });
                     }
                 }
                 Some(Event::Done(mut f)) => {
                     if self.stopped_by_string {
                         f.reason = FinishReason::Stop;
                     }
-                    return Ok(Piece::Done(f));
+                    return Ok(Piece::Done {
+                        finish: f,
+                        logprobs: std::mem::take(&mut self.logprobs),
+                    });
                 }
                 Some(Event::Error(e)) => return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e)),
                 None => return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "engine stopped".into())),
@@ -808,6 +876,40 @@ fn timings(f: &Finish, cached: usize) -> Value {
     })
 }
 
+/// One OpenAI logprobs content entry — `{id, token, bytes, logprob, top_logprobs}` — for the token `id` and its
+/// top alternatives. The token texts come from a single-token decode; the `bytes` come from the raw BPE piece
+/// (byte-level fragments included), the same reconstruction `bench/quality_api.py` builds from the tokenizer, never
+/// from re-encoding the decoded text (a split multi-byte fragment would become U+FFFD).
+fn logprob_entry(chat: &Chat, id: u32, logprob: f64, top: &[(u32, f64)]) -> Value {
+    let token = chat.decode(&[id]).unwrap_or_default();
+    let bytes = chat.token_bytes(id).unwrap_or_default();
+    let top: Vec<Value> = top
+        .iter()
+        .map(|&(tid, l)| {
+            let t = chat.decode(&[tid]).unwrap_or_default();
+            let b = chat.token_bytes(tid).unwrap_or_default();
+            json!({ "id": tid, "token": t, "bytes": b, "logprob": l })
+        })
+        .collect();
+    json!({ "id": id, "token": token, "bytes": bytes, "logprob": logprob, "top_logprobs": top })
+}
+
+/// The `content` array of OpenAI logprobs for a list of entries.
+fn logprobs_value(chat: &Chat, entries: &[Logprob]) -> Value {
+    json!({ "content": entries
+        .iter()
+        .map(|e| logprob_entry(chat, e.id, e.logprob, &e.top))
+        .collect::<Vec<_>>() })
+}
+
+/// `choices[i].logprobs`: the content array when the request asked for logprobs, null otherwise.
+fn response_logprobs(chat: &Chat, on: bool, entries: &[Logprob]) -> Value {
+    if !on {
+        return Value::Null;
+    }
+    logprobs_value(chat, entries)
+}
+
 async fn chat_completions(
     State(st): State<Shared>,
     h: HeaderMap,
@@ -831,10 +933,14 @@ async fn chat_completions(
     let model = st.cfg.model_name.clone();
     let mut g = Gen::start(&st, &p)?;
     if body["stream"].as_bool() != Some(true) {
+        let mut logprobs: Vec<Logprob> = Vec::new();
         let f = loop {
             match g.next(&st.chat).await? {
-                Piece::Text(_) => {}
-                Piece::Done(f) => break f,
+                Piece::Text { logprobs: l, .. } => logprobs.extend(l),
+                Piece::Done { finish: f, logprobs: l } => {
+                    logprobs.extend(l);
+                    break f;
+                }
             }
         };
         let parsed = parse_output(&g.text, p.thinking, p.tools);
@@ -847,7 +953,9 @@ async fn chat_completions(
         }
         return Ok(Json(json!({
             "id": id, "object": "chat.completion", "created": now(), "model": model,
-            "choices": [{ "index": 0, "message": msg, "finish_reason": finish_openai(&f, !parsed.tool_calls.is_empty()) }],
+            "choices": [{ "index": 0, "message": msg,
+                "logprobs": response_logprobs(&st.chat, p.logprobs, &logprobs),
+                "finish_reason": finish_openai(&f, !parsed.tool_calls.is_empty()) }],
             "usage": usage_openai(&f, g.cached_tokens),
             "timings": timings(&f, g.cached_tokens),
         }))
@@ -855,6 +963,102 @@ async fn chat_completions(
     }
     let include_usage = body["stream_options"]["include_usage"].as_bool().unwrap_or(false);
     let stream = openai_stream(st.clone(), g, p, id, model, include_usage);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+}
+
+/// `/v1/completions`: raw text completion, classic OpenAI schema. `logprobs` is an int here — the number of top
+/// alternatives per token (0 = none), same as the classic API — and each generated token is reported with the same
+/// `{id, token, bytes, logprob, top_logprobs}` shape the chat endpoint uses, so a single tool scores both endpoints.
+async fn completions(State(st): State<Shared>, h: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {
+    check_auth(&st, &h)?;
+    let prompt = match &body["prompt"] {
+        Value::String(s) => s.clone(),
+        Value::Array(a) if a.len() == 1 && a[0].is_string() => a[0].as_str().unwrap().to_string(),
+        _ => return Err(bad("prompt must be a string (arrays of prompts are not supported)")),
+    };
+    let ids = st.chat.encode(&prompt).map_err(|e| bad(format!("{e:#}")))?;
+    if ids.len() >= st.engine.ctx {
+        return Err(bad(format!(
+            "prompt has {} tokens, context is {}",
+            ids.len(),
+            st.engine.ctx
+        )));
+    }
+    let top_logprobs = body["logprobs"].as_u64().unwrap_or(0).min(20) as usize;
+    let max_tokens = (body["max_tokens"].as_u64().unwrap_or(st.cfg.max_tokens_default as u64) as usize)
+        .clamp(1, st.engine.ctx - ids.len());
+    let p = Prepared {
+        ids,
+        drafts: vec![],
+        images: vec![],
+        image_token: None,
+        thinking: false,
+        tools: false,
+        max_tokens,
+        sampling: sampling_from(&body, false),
+        stops: stops_from(&body),
+        logprobs: top_logprobs > 0,
+        top_logprobs,
+    };
+    let id = format!("cmpl-{}-{}", now(), st.counter.fetch_add(1, Ordering::Relaxed));
+    let model = st.cfg.model_name.clone();
+    let mut g = Gen::start(&st, &p)?;
+    if body["stream"].as_bool() != Some(true) {
+        let mut logprobs: Vec<Logprob> = Vec::new();
+        let f = loop {
+            match g.next(&st.chat).await? {
+                Piece::Text { logprobs: l, .. } => logprobs.extend(l),
+                Piece::Done { finish: f, logprobs: l } => {
+                    logprobs.extend(l);
+                    break f;
+                }
+            }
+        };
+        return Ok(Json(json!({
+            "id": id, "object": "text_completion", "created": now(), "model": model,
+            "choices": [{ "index": 0, "text": g.text,
+                "logprobs": response_logprobs(&st.chat, p.logprobs, &logprobs),
+                "finish_reason": finish_openai(&f, false) }],
+            "usage": usage_openai(&f, g.cached_tokens),
+            "timings": timings(&f, g.cached_tokens),
+        }))
+        .into_response());
+    }
+    let stream = async_stream(move |tx| async move {
+        let send = |v: Value| tx.send(SseEvent::default().data(v.to_string())).is_ok();
+        loop {
+            let piece = match g.next(&st.chat).await {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = send(json!({ "error": { "message": e.1 } }));
+                    return;
+                }
+            };
+            let (text, lps, done) = match piece {
+                Piece::Text { text, logprobs } => (text, logprobs, None),
+                Piece::Done { finish, logprobs } => (String::new(), logprobs, Some(finish)),
+            };
+            let v = json!({ "id": id, "object": "text_completion", "created": now(), "model": model,
+                "choices": [{ "index": 0, "text": text, "logprobs": response_logprobs(&st.chat, p.logprobs, &lps),
+                    "finish_reason": Value::Null }] });
+            if !send(v) {
+                return;
+            }
+            if let Some(f) = done {
+                let mut last = json!({ "id": id, "object": "text_completion", "created": now(), "model": model,
+                    "choices": [{ "index": 0, "text": "", "logprobs": Value::Null,
+                        "finish_reason": finish_openai(&f, false) }] });
+                last["timings"] = timings(&f, g.cached_tokens);
+                let _ = send(last);
+                let _ = send(
+                    json!({ "id": id, "object": "text_completion", "created": now(), "model": model,
+                    "choices": [], "usage": usage_openai(&f, g.cached_tokens) }),
+                );
+                let _ = tx.send(SseEvent::default().data("[DONE]"));
+                return;
+            }
+        }
+    });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
 }
 
@@ -867,12 +1071,21 @@ fn openai_stream(
     include_usage: bool,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     async_stream(move |tx| async move {
-        let chunk = |delta: Value, finish: Value| {
+        let chunk = |delta: Value, logprobs: Value, finish: Value| {
             json!({ "id": id, "object": "chat.completion.chunk", "created": now(), "model": model,
-                    "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] })
+                    "choices": [{ "index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": finish }] })
         };
         let send = |v: Value| tx.send(SseEvent::default().data(v.to_string())).is_ok();
-        if !send(chunk(json!({ "role": "assistant", "content": "" }), Value::Null)) {
+        let empty_lp = if p.logprobs {
+            json!({ "content": [] })
+        } else {
+            Value::Null
+        };
+        if !send(chunk(
+            json!({ "role": "assistant", "content": "" }),
+            empty_lp.clone(),
+            Value::Null,
+        )) {
             return;
         }
         let mut sp = Splitter::new(p.thinking, p.tools);
@@ -884,18 +1097,34 @@ fn openai_stream(
                     return;
                 }
             };
-            let (deltas, done) = match piece {
-                Piece::Text(t) => (sp.push(&t, false), None),
-                Piece::Done(f) => (sp.push("", true), Some(f)),
+            let (deltas, done, lps) = match piece {
+                Piece::Text { text, logprobs } => (sp.push(&text, false), None, logprobs),
+                Piece::Done { finish, logprobs } => (sp.push("", true), Some(finish), logprobs),
             };
+            // The entries of the piece go with its first delta chunk; a piece that produced no delta (all text held
+            // back) still delivers them, so nothing is dropped.
+            let mut attached = false;
             for d in deltas {
                 let v = match d {
                     Delta::Reasoning(r) => json!({ "reasoning_content": r }),
                     Delta::Content(c) => json!({ "content": c }),
                 };
-                if !send(chunk(v, Value::Null)) {
+                let lp = if p.logprobs && !attached {
+                    attached = true;
+                    logprobs_value(&st.chat, &lps)
+                } else {
+                    Value::Null
+                };
+                if !send(chunk(v, lp, Value::Null)) {
                     return;
                 }
+            }
+            if p.logprobs
+                && !attached
+                && !lps.is_empty()
+                && !send(chunk(json!({}), logprobs_value(&st.chat, &lps), Value::Null))
+            {
+                return;
             }
             if let Some(f) = done {
                 let parsed = parse_output(&g.text, p.thinking, p.tools);
@@ -904,9 +1133,13 @@ fn openai_stream(
                     for (i, c) in calls.as_array_mut().unwrap().iter_mut().enumerate() {
                         c["index"] = json!(i);
                     }
-                    let _ = send(chunk(json!({ "tool_calls": calls }), Value::Null));
+                    let _ = send(chunk(json!({ "tool_calls": calls }), Value::Null, Value::Null));
                 }
-                let mut last = chunk(json!({}), json!(finish_openai(&f, !parsed.tool_calls.is_empty())));
+                let mut last = chunk(
+                    json!({}),
+                    Value::Null,
+                    json!(finish_openai(&f, !parsed.tool_calls.is_empty())),
+                );
                 last["timings"] = timings(&f, g.cached_tokens);
                 let _ = send(last);
                 if include_usage {
@@ -1004,8 +1237,8 @@ async fn anthropic_messages(
     if body["stream"].as_bool() != Some(true) {
         let f = loop {
             match g.next(&st.chat).await? {
-                Piece::Text(_) => {}
-                Piece::Done(f) => break f,
+                Piece::Text { .. } => {}
+                Piece::Done { finish: f, .. } => break f,
             }
         };
         let parsed = parse_output(&g.text, p.thinking, p.tools);
@@ -1050,8 +1283,8 @@ async fn anthropic_messages(
                 }
             };
             let (deltas, done) = match piece {
-                Piece::Text(t) => (sp.push(&t, false), None),
-                Piece::Done(f) => (sp.push("", true), Some(f)),
+                Piece::Text { text: t, .. } => (sp.push(&t, false), None),
+                Piece::Done { finish: f, .. } => (sp.push("", true), Some(f)),
             };
             for d in deltas {
                 let (kind, delta) = match d {

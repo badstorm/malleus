@@ -48,6 +48,11 @@ pub struct Request {
     pub max_tokens: usize,
     pub sampling: Sampling,
     pub stop_tokens: Vec<u32>,
+    /// Per-emitted-token temperature-1 log-probabilities in the `Token` events (OpenAI `logprobs`). Zero-cost when
+    /// false: the sampling path is untouched, only the events grow a field.
+    pub logprobs: bool,
+    /// How many top alternatives each `Token` event also carries; 0 = none (capped by the API layer, 20 like OpenAI).
+    pub top_logprobs: usize,
     /// Also keep the states after this many prompt tokens (the start of the last chat turn: the next request of
     /// the conversation shares it even when the previous answer comes back rewritten).
     pub snapshot_at: Option<usize>,
@@ -57,10 +62,69 @@ pub struct Request {
 
 #[derive(Debug)]
 pub enum Event {
-    Started { prompt_tokens: usize, cached_tokens: usize },
-    Token(u32),
+    Started {
+        prompt_tokens: usize,
+        cached_tokens: usize,
+    },
+    /// A generated token. `top` carries its log-probability data only when the request asked for logprobs;
+    /// otherwise it is None and emitting is exactly as cheap as a bare integer event.
+    Token {
+        id: u32,
+        top: Option<TokenProbs>,
+    },
     Done(Finish),
     Error(String),
+}
+
+/// Temperature-1 log-probabilities of one emitted token, from the logits row that produced it.
+#[derive(Debug, Clone)]
+pub struct TokenProbs {
+    pub id: u32,
+    /// The token's own log-probability (log-softmax over the whole vocabulary).
+    pub logprob: f32,
+    /// `(id, logprob)` of the alternatives, most likely first; up to the request's `top_logprobs`.
+    pub top: Vec<(u32, f32)>,
+}
+
+/// The top-N of a logits row plus the token's own probability, as temperature-1 log-probabilities (log-softmax over
+/// the full vocabulary). The top-N is kept as a partial queue the size of the request (an insert into a Vec of at
+/// most `top` entries, never a vocabulary sort); when `top` is 0 only the token's own log-probability is returned,
+/// for `logprobs: true` without `top_logprobs`.
+pub fn token_probs(logits: &[f32], id: u32, top: usize) -> TokenProbs {
+    let mut max = f32::NEG_INFINITY;
+    let mut best: Vec<(f32, u32)> = Vec::with_capacity(top.min(64));
+    for (i, &l) in logits.iter().enumerate() {
+        max = max.max(l);
+        if top == 0 {
+            continue;
+        }
+        // Position of the new entry in the descending-by-logit queue; equal logits order by id so the result is
+        // deterministic.
+        let pos = best.iter().position(|&(b, j)| l > b || (l == b && i < j as usize));
+        match pos {
+            Some(p) => {
+                best.insert(p, (l, i as u32));
+                if best.len() > top {
+                    best.pop();
+                }
+            }
+            None if best.len() < top => best.push((l, i as u32)),
+            None => {}
+        }
+    }
+    let mut norm = 0.0f64;
+    for &l in logits {
+        norm += ((l - max) as f64).exp();
+    }
+    let lse = max as f64 + norm.ln();
+    let top = best.into_iter().map(|(l, i)| (i, (l as f64 - lse) as f32)).collect();
+    TokenProbs {
+        id,
+        logprob: logits
+            .get(id as usize)
+            .map_or(f32::NEG_INFINITY, |&l| (l as f64 - lse) as f32),
+        top,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -618,21 +682,30 @@ impl Worker {
         let vocab = self.model.cfg.vocab;
         let mut tok = sample(&logits, &req.sampling, &mut || rng.next_f32());
         let mut pend = vec![tok];
-        // Emits a token; false when generation must stop.
-        let emit = |t: u32, n: &mut usize, reason: &mut FinishReason| -> bool {
+        // Emits a token with its log-probability data (None when logprobs were not asked); false when generation
+        // must stop.
+        let emit = |t: u32, top: Option<TokenProbs>, n: &mut usize, reason: &mut FinishReason| -> bool {
             *n += 1;
             if req.stop_tokens.contains(&t) {
                 *reason = FinishReason::Stop;
                 return false;
             }
-            if req.events.send(Event::Token(t)).is_err() || req.cancel.load(Ordering::Relaxed) {
+            if req.events.send(Event::Token { id: t, top }).is_err() || req.cancel.load(Ordering::Relaxed) {
                 *reason = FinishReason::Cancelled;
                 return false;
             }
             *n < max_tokens
         };
+        // The data of the token about to be emitted, captured from the row it was sampled from. In the raw path the
+        // row lives in `logits` until the next forward; after a verify step the next token's row is the slice saved
+        // before `l` goes out of scope, so `top` is carried from one iteration to the next.
+        let mut top = if req.logprobs {
+            Some(token_probs(&logits, tok, req.top_logprobs))
+        } else {
+            None
+        };
         while n < max_tokens {
-            if !emit(tok, &mut n, &mut reason) || self.sess.len + 1 > ctx {
+            if !emit(tok, top.take(), &mut n, &mut reason) || self.sess.len + 1 > ctx {
                 break;
             }
             let spec = self.drafts > 0 && self.sess.len + 2 <= ctx && self.model.mtp_pending(&self.sess) == pend.len();
@@ -641,6 +714,11 @@ impl Worker {
                 self.cached.push(tok);
                 tok = sample(&logits, &req.sampling, &mut || rng.next_f32());
                 pend = vec![tok];
+                top = if req.logprobs {
+                    Some(token_probs(&logits, tok, req.top_logprobs))
+                } else {
+                    None
+                };
                 continue;
             }
             let max = self.drafts.min(ctx - self.sess.len - 1);
@@ -675,9 +753,32 @@ impl Worker {
             }
             self.model.rollback(&mut self.sess, nd - acc)?;
             self.cached.extend_from_slice(&ds[..acc]);
-            if !ds[..acc].iter().all(|&d| emit(d, &mut n, &mut reason)) {
+            // One event per accepted draft, from the verify row that produced each of them: row `i` of the verify
+            // predicts `toks[i + 1]`, so draft `i` carries the log-probabilities of slice `i`. Iterated by index so
+            // the no-logprobs path stays a plain slice over `ds` with no extra copy.
+            let mut done = false;
+            for i in 0..acc {
+                let d = ds[i];
+                let t = if req.logprobs {
+                    Some(token_probs(&l[i * vocab..(i + 1) * vocab], d, req.top_logprobs))
+                } else {
+                    None
+                };
+                if !emit(d, t, &mut n, &mut reason) {
+                    done = true;
+                    break;
+                }
+            }
+            if done {
                 break;
             }
+            // The next token's data, from the row it was sampled off: slice `acc` is the fallback row when draft
+            // `acc` was rejected, the last verify row when all `n_drafts` were accepted.
+            top = if req.logprobs {
+                Some(token_probs(&l[acc * vocab..(acc + 1) * vocab], y, req.top_logprobs))
+            } else {
+                None
+            };
             pend = ds[..acc].to_vec();
             pend.push(y);
             tok = y;
@@ -879,6 +980,43 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sample(&l, &s, &mut || 0.99), 3);
+    }
+
+    #[test]
+    fn token_probs_are_the_full_softmax_in_log_space() {
+        // lse = ln(&Sigma; exp), and every reported probability is exp(logit - lse); the alternatives' probabilities
+        // (and the token's own, which may be outside the top-N) are all proper probabilities.
+        let l = vec![0.0, 1.0, 2.0, 3.0, -0.5];
+        let p = token_probs(&l, 3, 3);
+        assert_eq!(p.id, 3);
+        let lse = (l.iter().map(|&v| (v as f64).exp()).sum::<f64>()).ln();
+        let mut expect: Vec<(u32, f32)> = (0..l.len() as u32)
+            .map(|i| (i, (l[i as usize] as f64 - lse) as f32))
+            .collect();
+        expect.sort_by(|&(ia, la), &(ib, lb)| (lb as f64 - la as f64).total_cmp(&0.0).then(ia.cmp(&ib)));
+        assert_eq!(p.top, expect[0..3].to_vec(), "most likely first, top-N only");
+        let own = expect.iter().find(|(i, _)| *i == p.id).unwrap();
+        assert!((p.logprob - own.1).abs() < 1e-6, "own logprob follows the full softmax");
+        let sum: f64 = p.top.iter().map(|&(_, lp)| lp.exp() as f64).sum();
+        assert!(
+            sum <= 1.0 + 1e-6,
+            "the alternatives' probabilities sum, exp'd, stay below 1"
+        );
+        for (_, lp) in &p.top {
+            assert!(*lp <= 1e-6, "no probability above 1");
+        }
+        // The sampled token's own probability is reported even when it is not in the top-N.
+        let own4 = expect.iter().find(|(i, _)| *i == 4).unwrap();
+        let p4 = token_probs(&l, 4, 1);
+        assert!(
+            (p4.logprob - own4.1).abs() < 1e-6,
+            "id outside the top-N still gets its logprob"
+        );
+        assert_eq!(p4.top.len(), 1);
+        // No alternatives asked: only the token's own log-probability.
+        let p0 = token_probs(&l, 3, 0);
+        assert!(p0.top.is_empty());
+        assert!((p0.logprob - own.1).abs() < 1e-6);
     }
 
     #[test]
