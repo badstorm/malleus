@@ -10,10 +10,11 @@ use malleus_model::vision::{VisionConfig, VisionModel};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// `malleus --version`: the license and where the source is. Apache-2.0 asks a redistribution to carry the
-/// attribution notices of `NOTICE`, so pointing at them is the part of the notice that travels with the binary.
+/// `malleus --version`: the version the build was made from (the git tag, set by `build.rs`) and the license with
+/// where the source is. Apache-2.0 asks a redistribution to carry the attribution notices of `NOTICE`, so pointing at
+/// them is the part of the notice that travels with the binary.
 const LONG_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
+    env!("MALLEUS_BUILD_VERSION"),
     "\nCopyright 2026 DuckPage di Olimpi e Rusu S.n.c. and the Malleus contributors.\n",
     "License Apache-2.0 <https://www.apache.org/licenses/LICENSE-2.0>.\n",
     "Attribution notices: NOTICE. Third-party components: THIRD-PARTY-NOTICES.md.\n",

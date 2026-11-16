@@ -36,10 +36,14 @@ ENV PATH=/opt/rocm-venv/bin:${PATH}
 
 FROM dev AS build
 ARG MALLEUS_GPU_TARGETS="gfx1150;gfx1151"
+# The version the binary reports comes from the git tag the CI builds (passed as VERSION, the leading "v" stripped
+# below), not from Cargo.toml: a released image must say what it is even if the manifest was not bumped.
+ARG VERSION=dev
 ENV MALLEUS_GPU_TARGETS=${MALLEUS_GPU_TARGETS} CARGO_TARGET_DIR=/target \
     MALLEUS_RPATH=1
 COPY . /src
 RUN --mount=type=cache,target=/root/.cargo/registry \
+    MALLEUS_BUILD_VERSION="${VERSION#v}" \
     cargo build --release --locked -p malleus \
     && mkdir -p /out/bin && cp /target/release/malleus /out/bin/ \
     && sh deploy/collect-runtime-libs.sh /out/bin/malleus /out
@@ -47,7 +51,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 FROM ${DEBIAN_IMAGE} AS runtime
 ARG MALLEUS_GPU_TARGETS="gfx1150;gfx1151"
 ARG ROCM_VERSION=7.14.1
-ARG VERSION=0.1.0
+ARG VERSION=dev
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="malleus" \
       org.opencontainers.image.licenses="Apache-2.0" \
