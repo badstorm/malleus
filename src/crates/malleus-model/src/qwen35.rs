@@ -941,7 +941,7 @@ fn trace_routes(st: &Stream, ms: &MoeScratch, layer: usize, t: usize, slots: usi
 }
 
 /// `MALLEUS_HIDDEN_DUMP=<dir>`: for every attention layer, writes the layer input and the K of the chunk being
-/// processed. Diagnostics for #96: it is the material with which one tests whether a block's sensitivity can be
+/// processed. Diagnostics for #10: it is the material with which one tests whether a block's sensitivity can be
 /// learnt. It synchronizes at every layer, so a run with this variable set is very slow: not a path to leave on.
 static ENV_HIDDEN_DUMP: std::sync::LazyLock<Option<String>> =
     std::sync::LazyLock::new(|| std::env::var("MALLEUS_HIDDEN_DUMP").ok());
@@ -2336,7 +2336,7 @@ impl Model {
         )?;
         // Decode on the MLS8 prefill copies of the non-expert linears (quality over speed).
         up.decode_int8 = std::env::var("MALLEUS_DECODE_INT8").is_ok_and(|v| v == "1");
-        // `MALLEUS_EXPERT_CACHE=<GiB>` (issue #50): the routed experts stay on disk, one pool per MoE layer.
+        // `MALLEUS_EXPERT_CACHE=<GiB>` (issue #14): the routed experts stay on disk, one pool per MoE layer.
         // Models whose shared expert is stacked into the same matrix (Qwen's `shared_expert_gate`) are not
         // supported yet: their `experts + 1` rows are not all in the four tensors the cache reads, and guessing
         // wrong there would silently drop the shared expert.
@@ -2525,7 +2525,7 @@ impl Model {
         // path a checkpoint takes is a property of its experts, not of the prompt length.
         let moe_y_half = std::env::var("MALLEUS_MOE_Y_HALF").is_ok_and(|v| v != "0")
             && !layers.iter().any(|l| matches!(&l.ffn, Ffn::Moe(m) if m.pre.is_some()));
-        // Diagnostics of the attention concentration (#96): sized for 262144 tokens of context, one sampled row every
+        // Diagnostics of the attention concentration (#10): sized for 262144 tokens of context, one sampled row every
         // 4096, a tile of 32 keys. ~4 MB.
         let attn_mass = match std::env::var_os("MALLEUS_ATTN_MASS") {
             Some(_) => {
@@ -4250,7 +4250,7 @@ impl Model {
         self.forward_impl(sess, tokens, None, tokens.len(), &[], true, false)
     }
 
-    /// Writes to `path` the attention mass collected with `MALLEUS_ATTN_MASS` (#96): a header
+    /// Writes to `path` the attention mass collected with `MALLEUS_ATTN_MASS` (#10): a header
     /// `mstride tile_k mtiles` and then one `row tile max sum` line per non-empty tile. The exact mass is recovered
     /// afterwards: `lse = max + ln(sum)`, then `exp(lse - logsumexp(lse))`.
     pub fn dump_attn_mass(&self, path: &std::path::Path) -> Result<()> {
@@ -4963,7 +4963,7 @@ impl Model {
         let ids: Arg = match (cache, &staged) {
             (Some(c), None) => {
                 // The router chose on the device; the cache needs the choice on the host to know what to read.
-                // One synchronization per layer, which is the price of the design (see issue #50).
+                // One synchronization per layer, which is the price of the design (see issue #14).
                 st.synchronize()?;
                 let routed: Vec<i32> = ms.ids.download(p)?;
                 let mut out = crate::expert_cache::lock(&ms.slot_ids);
@@ -5127,7 +5127,7 @@ impl Model {
                 let max_tiles = p.div_ceil(bm) + e1;
                 let max_tiles = if split { p / bm } else { max_tiles };
                 // `MALLEUS_DEBUG_MOE=1`: how many tiles each of the two lists carries, and how many rows they cover.
-                // The copy synchronizes, so it is a diagnostic and not a path to leave on (issue #92).
+                // The copy synchronizes, so it is a diagnostic and not a path to leave on (issue #9).
                 if std::env::var_os("MALLEUS_DEBUG_MOE").is_some() {
                     st.synchronize()?;
                     let nt: Vec<i32> = ms.ntiles.download(2)?;
@@ -5849,7 +5849,7 @@ impl Model {
                             self.rope_invf.as_ref().map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
                         ],
                     )?;
-                    // Diagnostica `MALLEUS_HIDDEN_DUMP=<dir>` (#96): per layer, l'ingresso del layer (`sc.hn`) e il
+                    // Diagnostics `MALLEUS_HIDDEN_DUMP=<dir>` (#10): for every layer, the layer input (`sc.hn`) and the
                     // K del chunk appena scritto. Sono le due rappresentazioni da cui un indexer dovrebbe stimare
                     // quanto un blocco conta: servono a provare se la sensibilita' e' imparabile.
                     if let Some(dir) = ENV_HIDDEN_DUMP.as_deref() {

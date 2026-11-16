@@ -5,7 +5,7 @@
 #
 # The gather path kicks in at len + t >= 5 * indexer budget (10240 tokens for Qwen3.8-Flash-Next), and no golden
 # entry reaches it: the longest is 4500 tokens. The numerical gate for these kernels was a kernel-vs-CPU test
-# (removed from src/ and tracked in #15); this script is the end-to-end half. It compares the default one-query-per-
+# (removed from src/ and tracked in #4); this script is the end-to-end half. It compares the default one-query-per-
 # block kernel (`attention_gather_q1`) with the per-query kernel, which differ only in accumulation order.
 #
 # Read the text diff as a smoke test only. Greedy decoding is chaotic in the prefill logits: two provably
@@ -68,5 +68,5 @@ else:
         if tag != "equal":
             print(f"  {tag}: q1 {' '.join(a[i1:i2])!r} | per-query {' '.join(b[j1:j2])!r}")
     print("Atteso: le due strade accumulano in ordine diverso e il greedy amplifica. Se il testo resta")
-    print("plausibile non conclude nulla -- il gate numerico e' il test kernel-vs-CPU tracciato in #15.")
+    print("plausible but concludes nothing -- the numeric gate is the kernel-vs-CPU test tracked in #4.")
 PY2

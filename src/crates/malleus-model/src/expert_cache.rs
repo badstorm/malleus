@@ -1,4 +1,4 @@
-//! Routed experts on disk, the hot ones in a slot cache (issue #50).
+//! Routed experts on disk, the hot ones in a slot cache (issue #14).
 //!
 //! `MALLEUS_EXPERT_CACHE=<GiB>` keeps the routed experts of a MoE out of the device memory. Every MoE layer gets a
 //! pool of slots: an expert is a **contiguous** run of the four tensors the decode kernels read (`gate_up`, its

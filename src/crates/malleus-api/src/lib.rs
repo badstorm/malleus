@@ -522,7 +522,7 @@ fn prepare(
         .render(messages, &opts)
         .map_err(|e| bad(format!("chat template: {e:#}")))?;
     let ids = st.chat.encode(&prompt).map_err(|e| bad(format!("{e:#}")))?;
-    // Opt-in: the normalization is correct and wired (a 5-token lookup chain comes out of it, see #25) but at the
+    // Opt-in: the normalization is correct and wired (a 5-token lookup chain comes out of it) but at the
     // round depth this engine verifies today it buys nothing, and tokenizing the recent messages costs a few ms on
     // every request. MALLEUS_LOOKUP_NORM=1 turns it on for a measurement.
     let drafts = if std::env::var("MALLEUS_LOOKUP_NORM").is_ok_and(|v| v == "1") {

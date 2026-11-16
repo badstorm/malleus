@@ -286,7 +286,7 @@ impl Gguf {
 ///
 /// The copy is byte-for-byte: the tensors that stay are the same bytes, so a rewrite cannot change what the model
 /// computes, only what it carries. Used to drop the MLS8 prefill copies from a file converted before they became
-/// opt-in (#47) without re-reading the bf16 checkpoint, which also means the MLS4 calibration is preserved exactly.
+/// opt-in without re-reading the bf16 checkpoint, which also means the MLS4 calibration is preserved exactly.
 /// Returns `(kept, dropped)` tensor counts.
 pub fn rewrite_keeping(
     src: &dyn TensorSource,

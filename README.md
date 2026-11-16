@@ -26,7 +26,7 @@ closed engine.
 |---|---|
 | Models | Five families carried, with the file sizes on the device and the tokens/s measured: [MODELS.md](MODELS.md) |
 | Hardware | gfx1150 (development and production), gfx1151 (supported) |
-| API | OpenAI Chat Completions + Anthropic Messages, streaming, tool calls, image input, one port. No `logprobs` yet (#102) |
+| API | OpenAI Chat Completions + Anthropic Messages, streaming, tool calls, `logprobs`, image input, one port |
 | Speculative decoding | MTP head + chained drafts, verified in one pass |
 
 ### Where it stands
@@ -140,7 +140,7 @@ engine behaves as if the variable were unset. Defaults that depend on the model 
 | `MALLEUS_DENSE_W4A4` | `1`, `w4a8`, `acts`, `2`, `3` (default off) | `1`: int4 activations on the plain dense GEMMs. `w4a8`: also 4-bit weights for the projections whose input needs a transform (`o_proj`, `out_proj`). `acts`: int4 activations there too — faster, about −1.6 points of argmax. |
 | `MALLEUS_DENSE_W4A8_ACTS` | `0` (default on) | `0` keeps those projections on int8, for an A/B of the line above. |
 | `MALLEUS_MOE_W4A4` | `1` on gfx1151, `0` on gfx1150; also `glu` | Activation format of the routed experts in prefill: `1` int4, `glu` int4 on gate/up only, `0` int8. |
-| `MALLEUS_EXPERT_CACHE` | GiB (default off) | Keep the routed experts on disk and cache the hot ones in per-layer slot pools; decode reads slot indices, prefill streams the whole layer (bit-identical, much slower prefill). Issue #50. |
+| `MALLEUS_EXPERT_CACHE` | GiB (default off) | Keep the routed experts on disk and cache the hot ones in per-layer slot pools; decode reads slot indices, prefill streams the whole layer (bit-identical, much slower prefill). Issue #14. |
 | `MALLEUS_MOE_Y_HALF` | `1` (default off, f32) | Write the MoE intermediate `y` in fp16: half its bytes, measured +3,5 % of prefill. Ignored for checkpoints with int8 expert copies. |
 | `MALLEUS_MOE_BM128` | rows per expert, default `48` | From this average rows-per-expert the grouped MoE switches to 128-row tiles. |
 | `MALLEUS_MOE_SPLIT` | `0` (default on) | `0` drops the second, half-height tile list the MoE uses for the remainders of each expert. |

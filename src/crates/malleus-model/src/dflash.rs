@@ -1,4 +1,4 @@
-//! DFlash speculative draft (issue #48): a small transformer that proposes a **block** of tokens for a target model
+//! DFlash speculative draft (issue #12): a small transformer that proposes a **block** of tokens for a target model
 //! to verify in one pass, as an alternative to the MTP head that some checkpoints carry inside themselves.
 //!
 //! What it is, from the checkpoint (`Ornith-1.5-35B-A3B-DFlash`) and the only reference implementation that exists
@@ -287,7 +287,7 @@ impl DflashDraft {
         if c.proposals() > verify_width() {
             out.push(format!(
                 "  warning: {} proposals against a verify width of {} drafts: the block has to be {} positions (see \
-                 issue #48)",
+                 issue #12)",
                 c.proposals(),
                 verify_width(),
                 verify_width() + 1
@@ -305,7 +305,7 @@ fn weights_bytes(w: &Weights) -> usize {
     }
 }
 
-/// Drafts the target's verify path accepts in one pass: `GEMV_MAX_T - 1` (the kernel's register budget, and #10
+/// Drafts the target's verify path accepts in one pass: `GEMV_MAX_T - 1` (the kernel's register budget, and the
 /// measured that widening it is a loss). A block of `verify_width() + 1` positions fits it.
 fn verify_width() -> usize {
     crate::qwen35::GEMV_MAX_T - 1

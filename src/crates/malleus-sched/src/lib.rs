@@ -396,7 +396,7 @@ fn image_blocks(inserts: &[(usize, DeviceBuffer)], hidden: usize) -> Vec<(usize,
 ///
 /// The cost of not chunking is the reason this exists: `Model::forward` sizes its scratch on the token count, so
 /// one forward over a 30k-token agent prompt with a screenshot asks ~13 GiB of GTT (= system RAM on these APUs)
-/// in one go, and leaves it cached afterwards (issue #87).
+/// in one go, and leaves it cached afterwards (the vision prefill fix).
 fn image_pieces(len: usize, blocks: &[(usize, usize)], chunk: usize) -> Vec<(usize, usize)> {
     let chunk = chunk.max(1);
     let mut pieces = Vec::new();
