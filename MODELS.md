@@ -3,14 +3,23 @@
 What Malleus carries, what each file costs on the device, and what the engine measures on it. One section per
 model with the numbers, the date and the machine; the commands that produce them are at the end.
 
-All numbers are single runs on the development machine unless stated otherwise:
+All numbers are single runs on the gfx1150 development machine unless a table says otherwise. The engine runs on
+both Strix APUs; the two machines differ almost only in what the silicon offers (table below).
 
-| | |
-|---|---|
-| GPU | gfx1150, Radeon 890M (16 CU), 93.4 GiB of GTT reported by the driver, ~80 GB/s of measured read bandwidth |
-| Host | LXC, 32 GB of RAM visible (the GPU reads the model from GTT, not from the host) |
-| Stack | ROCm 7.14.1; `llama.cpp` build 12407 (`e574a17b0`) from `ghcr.io/ggml-org/llama.cpp:full-rocm` for the comparisons |
-| Noise | ~±8 % run to run on a single run; a difference under that is not a difference |
+| | gfx1150 (Strix Point, development) | gfx1151 (Strix Halo) |
+|---|---|---|
+| GPU | Radeon 890M, 16 CU | Radeon 8060S, **40 CU** |
+| Memory | 93.4 GiB of GTT reported by the driver (the GPU reads the model from GTT, not from the host) | **128 GB** shared |
+| Bandwidth | ~80 GB/s measured read (`malleus bench-bw`) | nominal ~256 GB/s; **231 GB/s measured read** (`malleus bench-bw`, `amd_iommu=off`) |
+| Host | LXC, 32 GB of RAM visible | LXC guest on a Proxmox host, `amd_iommu=off` |
+| Stack | ROCm 7.14.1; `llama.cpp` build 12407 (`e574a17b0`) from `ghcr.io/ggml-org/llama.cpp:full-rocm` for the comparisons | same |
+| Noise | ~±8 % run to run on a single run; a difference under that is not a difference | same |
+
+The per-architecture defaults switch with the machine: int4 experts and the one-query-per-block gather, the
+tiled indexer and the 12/12/8 select, and the 4-query selection groups are the gfx1151 defaults (`MALLEUS_MOE_W4A4`,
+`MALLEUS_GATHER_Q1`, `MALLEUS_IDX_SCORE_TILE`, `MALLEUS_IDX_SELECT`, `MALLEUS_IDX_GROUP`); gfx1150 falls back to the
+per-query kernels and the four-query union. The decode is bandwidth bound on both, so the 4-bit number per model
+below is the same: the richer difference is in the prefill, where 40 CU and 2.9x the bandwidth change the answer.
 
 ## Carried models
 
@@ -179,10 +188,36 @@ python3 bench/quality_api.py http://localhost:8091 --golden /golden/ornith-15-35
 tokens on this machine (bf16, transformers), so run it with `--skip-greedy` when only the last-token distribution
 is needed.
 
+## How the numbers are checked (the gates we run before a release)
+
+Every claim above that touches output quality or the speculative draft has a gate that fails when it regresses.
+They run on both architectures; the golden blobs are published next to the model files.
+
+| Gate | What it checks | Command |
+|---|---|---|
+| `golden` | Last-token distribution against the bf16 reference: KL, argmax and top-1 over every golden prompt. Short prompts only (the longest entry is 4 500 tokens, below the sparse-attention threshold). | `malleus golden --model <file> --golden <golden.json> --blobs <dir>` |
+| `golden-long` | An 11 000-token QSA prompt against a layer-by-layer bf16 reference: the sparse path, that the short golden never reaches. | `bench/golden-long.sh` (reference blob generated once with `scripts/ref_layerwise.py --long 11000 --attn eager`) |
+| `idx-recall` | Retrieval: a fact planted in a 16K/32K/256K token stream must survive the indexer selection in the question rows (checking the `idx_select` bitsets, per layer). | `bench/idx-recall.sh` (fixtures = token ids, no tokenizer round trip; 256K fixtures generated into the golden volume) |
+| `spec-exact` | The speculative verify is bit-identical to the serial step: every verified row, and every committed token at temperature 0, must match. Drafts may propose; they may not change the text. | `malleus spec-exact` |
+| `eval` | KL, top-1 and accuracy over **every** position of the prompt against the bf16 top-k blobs, chunked prefill. | `malleus eval --model <file> --set <set.json> --blobs <dir>` |
+| `kernel-test` | On-GPU numerical tests of the pipeline kernels with a seeded random input (Hadamard/MLS paths), independent of any model. | `malleus kernel-test` |
+| `attn_equiv` | End-to-end smoke: default vs alternate gather shape (one query per block / per query) on a prompt long enough to engage the gather; catches crashes, wrong-kernel picks and gross drift (read the text diff as a smoke test only — greedy is chaotic in prefill logits). | `bench/attn_equiv.sh [repetitions]` |
+| `quality_api` | Scores any OpenAI-compatible HTTP engine on the same golden prompts and reference, via `max_tokens: 1` + `top_logprobs` (the API-level counterpart of `golden`, for engines that only speak HTTP). | `bench/quality_api.py <url> --golden <golden.json> --tokenizer <tokenizer.json>` |
+| `needle` | Long-context recall over HTTP, on any engine: a unique fact at 1/3 or 2/3 of a long filler, question in English, fresh nonce so nothing serves it from the prompt cache. | `bench/needle.py <url> --api-key K --filler <text> --chars 32000,131000,520000 --pos 0.5` |
+
+Notes: `golden` and `eval` compare against the bf16 checkpoint, so they need it to be re-generated when a model
+changes; the blobs are fetched with `hf download duckpage/malleus-golden`. `quality_api` needs an engine that
+already supports `top_logprobs` — that is, not ours yet (see the logprobs API issue). A gate that is red on a
+claim that was never tested is not a regression: `golden-long` at 11K covers the gather threshold; recall beyond
+32K is covered by `idx-recall` up to 256K.
+
 ## What is worth measuring next
 
 - **Ornith-1.5-122B with the experts on disk** (issue #81): where the engine differs structurally from llama.cpp
   is running a model that does not fit; 1.5-3 tok/s of decode is the current state, not a limit to live with.
 - **QSA on Ornith** (issue #96): this checkpoint has no indexer, so the numbers above are all dense attention. With
   a selection budget the KV traffic at 128-256K drops by two orders of magnitude.
-- **gfx1151**: the same curves on Strix Halo, where `MALLEUS_IDX_*` and the sparse gather default differently.
+- **gfx1151**: the same curves on Strix Halo. The hardware spec is in the table at the top; the per-depth and
+  in-service numbers above are gfx1150, and qwen38-flash-next (the family the indexer kernels were written for)
+  is gfx1151-only — so a Strix Halo duplicate of the depth table is the open item, not the defaults (they switch
+  automatically, see the top table).
