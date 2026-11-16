@@ -574,6 +574,12 @@ fn sampling_from(body: &Value, thinking: bool) -> Sampling {
         top_k: body["top_k"].as_u64().unwrap_or(20) as usize,
         min_p: f("min_p", 0.0),
         seed: body["seed"].as_u64().unwrap_or_else(now),
+        // Repetition control. `repeat_penalty`/`repeat_last_n` are llama.cpp's names, the other two are OpenAI's;
+        // absent or at their defaults they change nothing.
+        repeat_penalty: f("repeat_penalty", 1.0),
+        repeat_last_n: body["repeat_last_n"].as_u64().unwrap_or(64) as usize,
+        frequency_penalty: f("frequency_penalty", 0.0),
+        presence_penalty: f("presence_penalty", 0.0),
     }
 }
 
