@@ -20,6 +20,14 @@ pub struct Sampling {
     pub top_k: usize,
     pub min_p: f32,
     pub seed: u64,
+    /// Repetition control, llama.cpp semantics: with `repeat_penalty` different from 1.0 a token that already appears
+    /// in the last `repeat_last_n` of the sequence has its logit divided by the penalty (or multiplied, when the logit
+    /// is negative). `frequency_penalty`/`presence_penalty` are the OpenAI ones, applied in logit space before the
+    /// temperature. All off by default: the sampling stays bit-identical to what it was before they existed.
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
 }
 
 impl Default for Sampling {
@@ -30,8 +38,58 @@ impl Default for Sampling {
             top_k: 0,
             min_p: 0.0,
             seed: 0,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
         }
     }
+}
+
+impl Sampling {
+    fn penalizes(&self) -> bool {
+        self.repeat_last_n > 0
+            && (self.repeat_penalty != 1.0 || self.frequency_penalty != 0.0 || self.presence_penalty != 0.0)
+    }
+}
+
+/// The logits row to sample from: `None` when no penalty is active, so the caller keeps using the row it has.
+///
+/// `history` is the sequence so far and `tail` the tokens accepted in a speculative round after it; the window is the
+/// last `repeat_last_n` of `history ++ tail`, which is what makes the serial step and the speculative loop see the
+/// same history (a draft that gets committed is a token like any other).
+fn penalized(logits: &[f32], s: &Sampling, history: &[u32], tail: &[u32]) -> Option<Vec<f32>> {
+    if !s.penalizes() {
+        return None;
+    }
+    let mut counts: Vec<(u32, u32)> = Vec::with_capacity(s.repeat_last_n.min(64));
+    for &id in history.iter().rev().chain(tail.iter().rev()).take(s.repeat_last_n) {
+        match counts.iter_mut().find(|(t, _)| *t == id) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((id, 1)),
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let mut row = logits.to_vec();
+    for (id, count) in counts {
+        let Some(v) = row.get_mut(id as usize) else {
+            continue;
+        };
+        let mut l = *v;
+        if s.repeat_penalty != 1.0 {
+            l = if l > 0.0 {
+                l / s.repeat_penalty
+            } else {
+                l * s.repeat_penalty
+            };
+        }
+        l -= s.presence_penalty;
+        l -= s.frequency_penalty * count as f32;
+        *v = l;
+    }
+    Some(row)
 }
 
 pub struct Request {
@@ -680,7 +738,10 @@ impl Worker {
         let mut n = 0;
         let mut reason = FinishReason::Length;
         let vocab = self.model.cfg.vocab;
-        let mut tok = sample(&logits, &req.sampling, &mut || rng.next_f32());
+        let mut tok = {
+            let pen = penalized(&logits, &req.sampling, &self.cached, &[]);
+            sample(pen.as_deref().unwrap_or(&logits), &req.sampling, &mut || rng.next_f32())
+        };
         let mut pend = vec![tok];
         // Emits a token with its log-probability data (None when logprobs were not asked); false when generation
         // must stop.
@@ -712,10 +773,12 @@ impl Worker {
             if !spec {
                 logits = self.model.forward(&mut self.sess, &[tok], None, 1)?;
                 self.cached.push(tok);
-                tok = sample(&logits, &req.sampling, &mut || rng.next_f32());
+                let pen = penalized(&logits, &req.sampling, &self.cached, &[]);
+                let row = pen.as_deref().unwrap_or(&logits);
+                tok = sample(row, &req.sampling, &mut || rng.next_f32());
                 pend = vec![tok];
                 top = if req.logprobs {
-                    Some(token_probs(&logits, tok, req.top_logprobs))
+                    Some(token_probs(row, tok, req.top_logprobs))
                 } else {
                     None
                 };
@@ -740,6 +803,10 @@ impl Worker {
             let mut y = 0;
             while acc <= nd {
                 let row = &l[acc * vocab..(acc + 1) * vocab];
+                // A draft accepted in this round is a token of the sequence like any other: the row that samples
+                // after it must see it, or the penalty would differ from the serial step.
+                let pen = penalized(row, &req.sampling, &self.cached, &ds[..acc]);
+                let row = pen.as_deref().unwrap_or(row);
                 if acc == nd {
                     y = sample(row, &req.sampling, &mut || rng.next_f32());
                     break;
@@ -962,6 +1029,52 @@ mod tests {
         assert_eq!(image_pieces(40, &[(4, 34)], 16), vec![(0, 4), (4, 34), (34, 40)]);
         // A block that already fits inside a piece does not cut it.
         assert_eq!(image_pieces(10, &[(2, 4)], 16), vec![(0, 10)]);
+    }
+
+    #[test]
+    fn repeat_penalty_pushes_a_repeated_token_down() {
+        // Token 3 keeps winning; after it has been generated it must lose to token 5.
+        let mut logits = vec![0.0f32; 8];
+        logits[3] = 4.0;
+        logits[5] = 3.0;
+        let greedy = Sampling::default();
+        assert_eq!(
+            sample(&logits, &greedy, &mut || 0.5),
+            3,
+            "without a penalty the argmax wins"
+        );
+        let s = Sampling {
+            repeat_penalty: 1.5,
+            repeat_last_n: 64,
+            ..Default::default()
+        };
+        let row = penalized(&logits, &s, &[3, 7, 3], &[]).expect("penalty active");
+        assert_eq!(sample(&row, &s, &mut || 0.5), 5, "4.0 / 1.5 = 2.67 < 3.0");
+        // Only the last `repeat_last_n` tokens count: with a window of 1 the window is the 7 only, the 3 is out and
+        // the argmax stays where it was.
+        let narrow = Sampling {
+            repeat_penalty: 1.5,
+            repeat_last_n: 1,
+            ..Default::default()
+        };
+        let row = penalized(&logits, &narrow, &[3, 7], &[]).expect("the window still holds the 7");
+        assert_eq!(sample(&row, &narrow, &mut || 0.5), 3, "the 3 is outside the window");
+        // Off by default and with the penalties off the row is not even copied.
+        assert!(penalized(&logits, &Sampling::default(), &[3], &[]).is_none());
+        // Frequency and presence are additive in logit space: three occurrences of 3 cost 3 * 0.5 and 0.2.
+        let s = Sampling {
+            frequency_penalty: 0.5,
+            presence_penalty: 0.2,
+            ..Default::default()
+        };
+        let row = penalized(&logits, &s, &[3, 3, 3], &[]).expect("penalty active");
+        assert!((row[3] - (4.0 - 1.5 - 0.2)).abs() < 1e-6, "got {}", row[3]);
+        // A draft accepted in a speculative round is part of the window like any other token.
+        let s = Sampling {
+            repeat_penalty: 1.5,
+            ..Default::default()
+        };
+        assert!(penalized(&logits, &s, &[7], &[3]).is_some());
     }
 
     #[test]
