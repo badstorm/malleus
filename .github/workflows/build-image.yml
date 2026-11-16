@@ -1,0 +1,73 @@
+---
+name: build-image
+# Builds and pushes the production `runtime` image to GHCR, only when a version
+# tag (v*) is pushed manually. The version is decided explicitly, with full
+# control: no build on every push, no cron, no manual dispatch.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/duckpage/malleus
+  MALLEUS_GPU_TARGETS: gfx1150;gfx1151
+  CACHE_TAG: buildcache
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      # serialize builds of the same image so the registry cache is always coherent
+      group: ${{ github.workflow }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # image tags from the git version tag: v0.1.0 plus 0.1.0 and 0.1 aliases
+          # the commit sha is kept on the image as the OCI revision label below
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Containerfile
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MALLEUS_GPU_TARGETS=${{ env.MALLEUS_GPU_TARGETS }}
+            # the version tag (v0.1.0) and commit sha, so the OCI labels on the
+            # image (org.opencontainers.image.version / .revision) are real and
+            # not the Containerfile defaults
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+          # registry cache: no storage limit, survives across builds; the cache
+          # appears in GHCR as an extra `buildcache` tag next to the images
+          cache-from: type=registry,ref=${{ env.IMAGE }}:${{ env.CACHE_TAG }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:${{ env.CACHE_TAG }},mode=max
