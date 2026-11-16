@@ -34,6 +34,38 @@ When you work on a topic, **never work directly on `main`**. Always follow these
   which part in the description **without** a closing keyword, and leave the issue open with a
   comment saying what is done and what is left (examples: #22, #23).
 
+### Labels
+
+One label says **where** the work is, one (optional) says **how it ends**. Never more than three, never none:
+an issue without a label is an issue nobody filters for.
+
+| label | where |
+|---|---|
+| `prefill` | prompt processing, long-context ingestion |
+| `decode` | token generation speed and its structure |
+| `context-long` | what happens as the context grows: quality, sparse selection, K/V traffic |
+| `kernels` | HIP kernels and their efficiency |
+| `quantization` | MLS4/MLS8, int4, calibration |
+| `speculative` | MTP, drafts, verify and rollback |
+| `api` | the HTTP surface, OpenAI and Anthropic compatibility |
+| `serving` | scheduling, batching, sessions |
+| `memory` | the memory plan, device and host budgets, expert cache |
+| `chore` | maintenance, housekeeping, the build |
+| `documentation` | the README, MODELS.md, AGENTS.md |
+
+How it ends, only when it is over:
+
+| label | meaning |
+|---|---|
+| `done` | closed because it is in production, not just merged |
+| `experiment` | an investigation whose result is history, not a plan |
+| `negative-result` | tried, measured, and it does not pay — the measurement stays |
+| `merge` | validation of a merge or of an integration |
+
+The GitHub defaults (`bug`, `enhancement`, `question`, `invalid`, `duplicate`, `wontfix`) keep their usual
+meaning and go **on top of** an area label, not instead of it. `good first issue` and `help wanted` are for
+work that is open to someone outside the project.
+
 ## Commits
 
 - **Commit on your topic branch — committing is expected, do not ask for permission.** You push that
