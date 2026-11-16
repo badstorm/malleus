@@ -211,7 +211,7 @@ enum Cmd {
         /// Debug: read whitespace-separated token ids from a file instead of encoding the prompt text
         #[arg(long)]
         prompt_ids: Option<PathBuf>,
-        /// Diagnostics (#96): write the logits of the last prefill position as raw f32, to measure how sensitive the
+        /// Diagnostics (#10): write the logits of the last prefill position as raw f32, to measure how sensitive the
         /// model is to removing a block of context.
         #[arg(long)]
         dump_logits: Option<PathBuf>,
@@ -225,7 +225,7 @@ fn is_converted(p: &Path) -> bool {
 
 /// Opens a converted model and checks that it is an Malleus file of a supported family.
 /// Prints what the draft declares and proves the weights load: the checkpoint is 738 MB, so this is the cheap way to
-/// check a conversion before the forward exists (issue #48).
+/// check a conversion before the forward exists (issue #12).
 fn draft_info(path: &Path) -> Result<()> {
     let g = Gguf::open(path)?;
     let arch = g.malleus_arch()?;

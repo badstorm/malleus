@@ -56,7 +56,7 @@ pub struct Options {
     /// Skip that copy for the routed experts only: prefill then reads their MLS4 nibbles with int8 activations
     /// (W4A8), halving the bytes of the widest block of the prefill and ~32 GB of device memory, while the dense
     /// linears keep their W8A8 path. Only worth it when those nibbles are GPTQ-calibrated: round-to-nearest loses
-    /// ~3.9 points of top-1 on the eval set (issue #20).
+    /// ~3.9 points of top-1 on the eval set.
     pub no_prefill_int8_experts: bool,
     /// Layers whose FFN stays MLS8 in decode too.
     pub keep_int8_layers: Vec<usize>,

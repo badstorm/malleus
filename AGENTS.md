@@ -32,7 +32,7 @@ When you work on a topic, **never work directly on `main`**. Always follow these
   whether the change actually landed.
 - **One pull request = one topic = one issue.** When the work covers only part of the issue, write
   which part in the description **without** a closing keyword, and leave the issue open with a
-  comment saying what is done and what is left (examples: #22, #23).
+  comment saying what is done and what is left.
 
 ### Labels
 

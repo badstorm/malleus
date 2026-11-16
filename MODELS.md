@@ -31,7 +31,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Qwen3.8-27B (dense, text + images) | `qwen38-27b-mls4.malleus` | 17.6 GB | no | The reference model for the quality gates (`golden/qwen38-27b`). |
 | Qwen3.6-35B-A3B (text + images) | `qwen36-35b-a3b-mls4.malleus` | 54.8 GB | **yes** (680 tensors) | Converted before `--prefill-int8` became opt-in: the name says `-mls4` but the file holds both copies. `malleus slim` rewrites it as 4-bit only. |
 | Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
-| Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #75). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #81). |
+| Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
 | Qwen3.8-Flash-Next (text) | — | — | — | gfx1151 only; the model the hyper-connection kernels were written for. No numbers on gfx1150. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
 
@@ -213,9 +213,9 @@ claim that was never tested is not a regression: `golden-long` at 11K covers the
 
 ## What is worth measuring next
 
-- **Ornith-1.5-122B with the experts on disk** (issue #81): where the engine differs structurally from llama.cpp
+- **Ornith-1.5-122B with the experts on disk** (issue #14): where the engine differs structurally from llama.cpp
   is running a model that does not fit; 1.5-3 tok/s of decode is the current state, not a limit to live with.
-- **QSA on Ornith** (issue #96): this checkpoint has no indexer, so the numbers above are all dense attention. With
+- **QSA on Ornith** (issue #10): this checkpoint has no indexer, so the numbers above are all dense attention. With
   a selection budget the KV traffic at 128-256K drops by two orders of magnitude.
 - **gfx1151**: the same curves on Strix Halo. The hardware spec is in the table at the top; the per-depth and
   in-service numbers above are gfx1150, and qwen38-flash-next (the family the indexer kernels were written for)

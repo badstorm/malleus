@@ -33,10 +33,10 @@ Environment=MALLEUS_MODEL=/models/ornith-15-35b-a3b-mls4.malleus
 # Model name returned by /v1/models.
 Environment=MALLEUS_MODEL_NAME=Ornith-1.5-35b-a3b
 # Ornith-1.5-122B does not fit on a host that also runs other containers: resident it needs 72.6 GiB and drove a
-# 93.4 GiB host into global OOM (issue #75). The alternative is keeping the routed experts in the file on NVMe
+# 93.4 GiB host into global OOM (issue #14). The alternative is keeping the routed experts in the file on NVMe
 # (MALLEUS_EXPERT_CACHE): 24 GiB of per-layer pools keep 44.6 GiB live with a 262144 context, but the prefill streams
 # all 59.8 GB of experts per chunk (~76 s per chunk) and decode falls to 1.5-3 tok/s from 13.7 resident. Measured
-# 2026-11-15 (issues #75, #81). Uncomment the four lines, plus MALLEUS_MTP=0 and a
+# 2026-11-15 (issue #14). Uncomment the four lines, plus MALLEUS_MTP=0 and a
 # prefill chunk of 8192, to try it.
 #Environment=MALLEUS_EXPERT_CACHE=24
 #Environment=MALLEUS_PREFILL_CHUNK=8192
@@ -46,7 +46,7 @@ Environment=MALLEUS_MODEL_NAME=Ornith-1.5-35b-a3b
 # Prompt tokens per forward. 8192 instead of 2048: at 2048 the MoE gets ~64 rows per expert and the grouped
 # GEMM re-reads each expert's weights once per tile, so a bigger chunk is the only lever that lowers the weight
 # traffic per token (measured: MoE 0.300 ms/token against 0.392, +8 % of prefill on long prompts, +2.8 GB of GTT
-# live). The working set follows the chunk: 5,3 GiB instead of 2,8 (issue #92).
+# live). The working set follows the chunk: 5,3 GiB instead of 2,8 (issue #9).
 Environment=MALLEUS_PREFILL_CHUNK=8192
 # Context length in tokens. Ornith-1.5 native window: max_position_embeddings = 262144 (no YaRN).
 # The pre-flight prints weights, per-session state and working set and refuses if they do not fit. Beyond the native

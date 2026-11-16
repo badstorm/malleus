@@ -808,7 +808,7 @@ def cmd_layers(args):
 
 
 def cmd_route(args):
-    """Routing trace of a text, position by position, for `scripts/expert_cache.py` (issue #50).
+    """Routing trace of a text, position by position, for `scripts/expert_cache.py` (issue #14).
 
     One forward pass streams every layer from the bf16 shards, so the cache measurement does not need the 62 GiB
     of the converted file on the device. The output is reordered by position (all layers of position 0, then all

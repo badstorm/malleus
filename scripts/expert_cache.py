@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""What expert streaming would cost, before writing the streaming code (issue #50).
+"""What expert streaming would cost, before writing the streaming code (issue #14).
 
 A MoE token touches `top_k` experts per layer, and every one of them that is not in the cache is read from the
 model file. The decode rate is therefore `min(compute, disk_bandwidth / bytes_from_disk_per_token)`: a byte count,
