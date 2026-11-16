@@ -217,3 +217,7 @@ into its stack cannot become a user of it.
 | Contributions | Apache-2.0, signed off (`git commit -s`, [DCO](DCO)) — [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Model weights | keep the license of their original model |
 | Redistributed in the image | ROCm runtime libraries, Debian base — licenses in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) |
+
+The software is provided **"as is"**, without warranty of any kind, express or implied, and without liability for any
+damages arising from its use — see the [Apache-2.0](LICENSE) *Disclaimer of Warranty* and *Limitation of Liability*
+(sections 7 and 8). The converted model weights keep the license of their original models and are not ours to warrant.
