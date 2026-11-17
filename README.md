@@ -82,6 +82,19 @@ time and starts with an empty prompt cache. The tokenizer and EOS ids follow the
 and the tuning variables are still server-wide in this first version. Without `MALLEUS_DEFAULT_MODEL`, a request
 that omits `model` uses the only model when the directory holds one, and is refused when there are several.
 
+The same port serves two API surfaces. Under `/v1` it is OpenAI- and Anthropic-compatible (`/v1/models`,
+`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/messages/count_tokens`). At the root it serves the
+router shape that model-management clients speak:
+
+| Endpoint | What it answers |
+|---|---|
+| `GET /models` | The same catalog with `status.value` (`loaded` / `loading` / `unloaded` / `failed`), `source`, `meta.n_ctx` and the input modalities, so a client knows what it can use and what it may load. |
+| `GET /props?model=<id>` | The model's chat template (a template with `enable_thinking` is how a client learns the model takes a reasoning flag) and `models_autoload: false`: an unloaded model is never routed to implicitly. |
+| `POST /models/load` | `{"model": id}`. Answers at once and the entry goes `loading` → `loaded`: a model this size takes ~30 s to a minute, far longer than a client keeps a request open. |
+| `POST /models/unload` | `{"model": id}`. Queued behind the request in flight, so a generation is never cut; the entry then reads `unloaded` and the device memory is back. |
+| `GET /models/sse` | The load and unload transitions as server-sent `model_status` frames, from the subscription on (the catalog is the snapshot). |
+| `POST /models` | A download request: `501`, because this engine serves files that were converted on disk and makes no outbound connections. |
+
 Use the render node of your AMD GPU (`ls -l /dev/dri/by-path/`). A Podman quadlet and a Compose file are in
 [deploy/](deploy/). Other commands (`malleus --help`): `bench` (`--depth 0,8192,…,131072` grows one session and
 times prefill and decode at each depth: the measurement behind [MODELS.md](MODELS.md)), `bench-bw`, `spec-exact`
