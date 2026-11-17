@@ -11,8 +11,9 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use futures_util::stream::Stream;
 use malleus_chat::{Chat, RenderOptions, StreamDecoder};
-use malleus_sched::{Engine, Event, Finish, FinishReason, Request, Sampling};
+use malleus_sched::{Catalog, Engine, Event, Finish, FinishReason, ModelSpec, Request, Sampling};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,7 +22,6 @@ use text::{THINK_END, TOOL_START, holdback, openai_tool_calls, parse_output};
 use tokio::sync::mpsc;
 
 pub struct Config {
-    pub model_name: String,
     pub api_key: Option<String>,
     pub default_thinking: bool,
     pub max_tokens_default: usize,
@@ -29,26 +29,28 @@ pub struct Config {
 
 pub struct AppState {
     pub engine: Engine,
-    pub chat: Chat,
+    pub catalog: Arc<Catalog>,
+    /// Tokenizer and chat template of every catalog entry, loaded once at startup.
+    pub chats: HashMap<Arc<str>, Arc<Chat>>,
     pub cfg: Config,
-    pub eos: Vec<u32>,
     counter: AtomicU64,
 }
 
 type Shared = Arc<AppState>;
 
-pub fn router(engine: Engine, chat: Chat, cfg: Config, eos: Vec<u32>) -> Router {
+pub fn router(engine: Engine, catalog: Arc<Catalog>, chats: HashMap<Arc<str>, Arc<Chat>>, cfg: Config) -> Router {
     let st = Arc::new(AppState {
         engine,
-        chat,
+        catalog,
+        chats,
         cfg,
-        eos,
         counter: AtomicU64::new(0),
     });
     Router::new()
         .route("/", get(landing))
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/models/{id}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/messages", post(anthropic_messages))
@@ -69,6 +71,51 @@ impl IntoResponse for ApiError {
 
 fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
+}
+
+fn not_found(msg: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::NOT_FOUND, msg.into())
+}
+
+/// The catalog entry and tokenizer a request selects. The id is resolved against the catalog only: a request body
+/// never names a filesystem path.
+struct Resolved {
+    spec: Arc<ModelSpec>,
+    chat: Arc<Chat>,
+}
+
+fn available(st: &AppState) -> String {
+    st.catalog
+        .entries()
+        .iter()
+        .map(|s| s.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `model` from the request body: absent uses the default, a known id or alias selects that model, anything else is
+/// a 404 with the list. The tokenizer is part of the resolution so every later step uses the selected model's one.
+fn resolve_model(st: &AppState, body: &Value) -> Result<Resolved, ApiError> {
+    let requested = body["model"].as_str().filter(|s| !s.is_empty());
+    let spec = match requested {
+        Some(id) => st
+            .catalog
+            .get(id)
+            .ok_or_else(|| not_found(format!("model `{id}` is not available; models: {}", available(st))))?,
+        None => st.catalog.default().ok_or_else(|| {
+            bad(format!(
+                "the request does not name a model and the server has no default; models: {}",
+                available(st)
+            ))
+        })?,
+    };
+    let chat = st.chats.get(&spec.id).cloned().ok_or_else(|| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("tokenizer of `{}` is missing", spec.id),
+        )
+    })?;
+    Ok(Resolved { spec, chat })
 }
 
 fn check_auth(st: &AppState, h: &HeaderMap) -> Result<(), ApiError> {
@@ -117,7 +164,19 @@ async fn landing(State(st): State<Shared>, headers: HeaderMap) -> Html<String> {
             .replace('>', "&gt;")
             .replace('"', "&quot;")
     }
-    let model = esc(&st.cfg.model_name);
+    let count = st.catalog.entries().len();
+    let models = st
+        .catalog
+        .entries()
+        .iter()
+        .map(|s| format!("<code>{}</code>", esc(&s.id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let default = st
+        .catalog
+        .default()
+        .map(|s| format!("; the default is <code>{}</code>", esc(&s.id)))
+        .unwrap_or_default();
     Html(format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -134,10 +193,10 @@ footer{{margin-top:2.5rem;color:#888;font-size:.85rem;border-top:1px solid #eee;
 <body>
 <h1>Malleus</h1>
 <p class="sub">Open-source LLM inference engine for AMD RDNA 3.5 APUs (gfx1150 and gfx1151).</p>
-<p>Serving <code>{model}</code> on this port. The API is OpenAI-compatible and lives under <code>/v1</code>:</p>
+<p>Serving {count} model(s) on this port{default}: {models}. The API is OpenAI-compatible and lives under <code>/v1</code>:</p>
 <ul>
-<li><code>GET /health</code> &mdash; liveness and queue depth</li>
-<li><code>GET /v1/models</code> &mdash; the model served here</li>
+<li><code>GET /health</code> &mdash; liveness, loaded model and queue depth</li>
+<li><code>GET /v1/models</code> &mdash; the models available here</li>
 <li><code>POST /v1/chat/completions</code> &mdash; chat, OpenAI schema (streaming, tools)</li>
 <li><code>POST /v1/messages</code> &mdash; chat, Anthropic schema</li>
 <li><code>POST /v1/messages/count_tokens</code> &mdash; token counting</li>
@@ -149,15 +208,42 @@ footer{{margin-top:2.5rem;color:#888;font-size:.85rem;border-top:1px solid #eee;
 }
 
 async fn health(State(st): State<Shared>) -> Json<Value> {
-    Json(json!({ "status": "ok", "queued": st.engine.queued.load(Ordering::Relaxed) }))
+    Json(json!({
+        "status": "ok",
+        "queued": st.engine.queued.load(Ordering::Relaxed),
+        "model": st.engine.loaded().map(|s| s.id.to_string()),
+        "loading": st.engine.loading().map(|s| s.id.to_string()),
+    }))
+}
+
+fn model_json(spec: &ModelSpec) -> Value {
+    json!({
+        "id": spec.id.as_ref(),
+        "object": "model",
+        "owned_by": "malleus",
+        "context_length": spec.ctx,
+    })
 }
 
 async fn models(State(st): State<Shared>, h: HeaderMap) -> Result<Json<Value>, ApiError> {
     check_auth(&st, &h)?;
     Ok(Json(json!({
         "object": "list",
-        "data": [{ "id": st.cfg.model_name, "object": "model", "owned_by": "malleus", "context_length": st.engine.ctx }]
+        "data": st.catalog.entries().iter().map(|s| model_json(s)).collect::<Vec<_>>(),
     })))
+}
+
+async fn model(
+    State(st): State<Shared>,
+    h: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&st, &h)?;
+    let spec = st
+        .catalog
+        .get(&id)
+        .ok_or_else(|| not_found(format!("model `{id}` is not available; models: {}", available(&st))))?;
+    Ok(Json(model_json(&spec)))
 }
 
 fn now() -> u64 {
@@ -382,7 +468,7 @@ struct Prepared {
 /// line-numbered or JSON-escaped rendering and then rewrites the file without either, so a prompt lookup that only
 /// sees the prompt's own tokens can never match what it is about to copy. Capped: the last few messages, 8k tokens
 /// each and 16k in total, because this is drafted from, not attended to.
-fn draft_sources(st: &AppState, messages: &Value) -> Vec<Vec<u32>> {
+fn draft_sources(chat: &Chat, messages: &Value) -> Vec<Vec<u32>> {
     const PER: usize = 8192;
     const TOTAL: usize = 16384;
     let mut out: Vec<Vec<u32>> = vec![];
@@ -405,7 +491,7 @@ fn draft_sources(st: &AppState, messages: &Value) -> Vec<Vec<u32>> {
         if norm.trim().is_empty() {
             continue;
         }
-        let Ok(mut ids) = st.chat.encode(&norm) else { continue };
+        let Ok(mut ids) = chat.encode(&norm) else { continue };
         ids.truncate(left.min(PER));
         if ids.len() > 8 {
             left -= ids.len();
@@ -487,6 +573,8 @@ fn unescape(s: &str) -> String {
 
 fn prepare(
     st: &AppState,
+    chat: &Chat,
+    ctx: usize,
     messages: &Value,
     images: Vec<Vec<u8>>,
     tools: Option<&Value>,
@@ -517,36 +605,30 @@ fn prepare(
         reasoning_effort: effort,
         tools: tools_conv.as_ref(),
     };
-    let prompt = st
-        .chat
+    let prompt = chat
         .render(messages, &opts)
         .map_err(|e| bad(format!("chat template: {e:#}")))?;
-    let ids = st.chat.encode(&prompt).map_err(|e| bad(format!("{e:#}")))?;
+    let ids = chat.encode(&prompt).map_err(|e| bad(format!("{e:#}")))?;
     // Opt-in: the normalization is correct and wired (a 5-token lookup chain comes out of it) but at the
     // round depth this engine verifies today it buys nothing, and tokenizing the recent messages costs a few ms on
     // every request. MALLEUS_LOOKUP_NORM=1 turns it on for a measurement.
     let drafts = if std::env::var("MALLEUS_LOOKUP_NORM").is_ok_and(|v| v == "1") {
-        draft_sources(st, messages)
+        draft_sources(chat, messages)
     } else {
         vec![]
     };
-    if ids.len() >= st.engine.ctx {
-        return Err(bad(format!(
-            "prompt has {} tokens, context is {}",
-            ids.len(),
-            st.engine.ctx
-        )));
+    if ids.len() >= ctx {
+        return Err(bad(format!("prompt has {} tokens, context is {ctx}", ids.len())));
     }
     let image_token = if images.is_empty() {
         None
     } else {
         Some(
-            st.chat
-                .token_id("<|image_pad|>")
+            chat.token_id("<|image_pad|>")
                 .ok_or_else(|| bad("tokenizer has no <|image_pad|> token"))?,
         )
     };
-    let left = st.engine.ctx - ids.len();
+    let left = ctx - ids.len();
     let max_tokens = (max_tokens.unwrap_or(st.cfg.max_tokens_default as u64) as usize).clamp(1, left);
     let sampling = sampling_from(body, thinking);
     let stops = stops_from(body);
@@ -649,21 +731,22 @@ enum Piece {
 }
 
 impl Gen {
-    fn start(st: &AppState, p: &Prepared) -> Result<Gen, ApiError> {
+    fn start(st: &AppState, r: &Resolved, p: &Prepared) -> Result<Gen, ApiError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
         st.engine
             .submit(Request {
+                model: r.spec.clone(),
                 prompt: p.ids.clone(),
                 drafts: p.drafts.clone(),
                 images: p.images.clone(),
                 image_token: p.image_token,
                 max_tokens: p.max_tokens,
                 sampling: p.sampling.clone(),
-                stop_tokens: st.eos.clone(),
+                stop_tokens: r.spec.eos.to_vec(),
                 logprobs: p.logprobs,
                 top_logprobs: p.top_logprobs,
-                snapshot_at: st
+                snapshot_at: r
                     .chat
                     .token_id("<|im_start|>")
                     .and_then(|b| p.ids.iter().rposition(|&t| t == b))
@@ -733,6 +816,7 @@ impl Gen {
                         });
                     }
                 }
+                Some(Event::Loading { .. }) => continue,
                 Some(Event::Done(mut f)) => {
                     if self.stopped_by_string {
                         f.reason = FinishReason::Stop;
@@ -922,11 +1006,14 @@ async fn chat_completions(
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     check_auth(&st, &h)?;
+    let r = resolve_model(&st, &body)?;
     let (messages, images) = openai_messages(&body["messages"])?;
     let thinking = thinking_flag(&st, &body);
     let max_tokens = body["max_completion_tokens"].as_u64().or(body["max_tokens"].as_u64());
     let p = prepare(
         &st,
+        &r.chat,
+        r.spec.ctx,
         &messages,
         images,
         body.get("tools"),
@@ -936,12 +1023,12 @@ async fn chat_completions(
         max_tokens,
     )?;
     let id = format!("chatcmpl-{}-{}", now(), st.counter.fetch_add(1, Ordering::Relaxed));
-    let model = st.cfg.model_name.clone();
-    let mut g = Gen::start(&st, &p)?;
+    let model = r.spec.id.to_string();
+    let mut g = Gen::start(&st, &r, &p)?;
     if body["stream"].as_bool() != Some(true) {
         let mut logprobs: Vec<Logprob> = Vec::new();
         let f = loop {
-            match g.next(&st.chat).await? {
+            match g.next(&r.chat).await? {
                 Piece::Text { logprobs: l, .. } => logprobs.extend(l),
                 Piece::Done { finish: f, logprobs: l } => {
                     logprobs.extend(l);
@@ -960,7 +1047,7 @@ async fn chat_completions(
         return Ok(Json(json!({
             "id": id, "object": "chat.completion", "created": now(), "model": model,
             "choices": [{ "index": 0, "message": msg,
-                "logprobs": response_logprobs(&st.chat, p.logprobs, &logprobs),
+                "logprobs": response_logprobs(&r.chat, p.logprobs, &logprobs),
                 "finish_reason": finish_openai(&f, !parsed.tool_calls.is_empty()) }],
             "usage": usage_openai(&f, g.cached_tokens),
             "timings": timings(&f, g.cached_tokens),
@@ -968,7 +1055,7 @@ async fn chat_completions(
         .into_response());
     }
     let include_usage = body["stream_options"]["include_usage"].as_bool().unwrap_or(false);
-    let stream = openai_stream(st.clone(), g, p, id, model, include_usage);
+    let stream = openai_stream(r.chat.clone(), g, p, id, model, include_usage);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
 }
 
@@ -977,22 +1064,23 @@ async fn chat_completions(
 /// `{id, token, bytes, logprob, top_logprobs}` shape the chat endpoint uses, so a single tool scores both endpoints.
 async fn completions(State(st): State<Shared>, h: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {
     check_auth(&st, &h)?;
+    let r = resolve_model(&st, &body)?;
     let prompt = match &body["prompt"] {
         Value::String(s) => s.clone(),
         Value::Array(a) if a.len() == 1 && a[0].is_string() => a[0].as_str().unwrap().to_string(),
         _ => return Err(bad("prompt must be a string (arrays of prompts are not supported)")),
     };
-    let ids = st.chat.encode(&prompt).map_err(|e| bad(format!("{e:#}")))?;
-    if ids.len() >= st.engine.ctx {
+    let ids = r.chat.encode(&prompt).map_err(|e| bad(format!("{e:#}")))?;
+    if ids.len() >= r.spec.ctx {
         return Err(bad(format!(
             "prompt has {} tokens, context is {}",
             ids.len(),
-            st.engine.ctx
+            r.spec.ctx
         )));
     }
     let top_logprobs = body["logprobs"].as_u64().unwrap_or(0).min(20) as usize;
     let max_tokens = (body["max_tokens"].as_u64().unwrap_or(st.cfg.max_tokens_default as u64) as usize)
-        .clamp(1, st.engine.ctx - ids.len());
+        .clamp(1, r.spec.ctx - ids.len());
     let p = Prepared {
         ids,
         drafts: vec![],
@@ -1007,12 +1095,12 @@ async fn completions(State(st): State<Shared>, h: HeaderMap, Json(body): Json<Va
         top_logprobs,
     };
     let id = format!("cmpl-{}-{}", now(), st.counter.fetch_add(1, Ordering::Relaxed));
-    let model = st.cfg.model_name.clone();
-    let mut g = Gen::start(&st, &p)?;
+    let model = r.spec.id.to_string();
+    let mut g = Gen::start(&st, &r, &p)?;
     if body["stream"].as_bool() != Some(true) {
         let mut logprobs: Vec<Logprob> = Vec::new();
         let f = loop {
-            match g.next(&st.chat).await? {
+            match g.next(&r.chat).await? {
                 Piece::Text { logprobs: l, .. } => logprobs.extend(l),
                 Piece::Done { finish: f, logprobs: l } => {
                     logprobs.extend(l);
@@ -1023,17 +1111,18 @@ async fn completions(State(st): State<Shared>, h: HeaderMap, Json(body): Json<Va
         return Ok(Json(json!({
             "id": id, "object": "text_completion", "created": now(), "model": model,
             "choices": [{ "index": 0, "text": g.text,
-                "logprobs": response_logprobs(&st.chat, p.logprobs, &logprobs),
+                "logprobs": response_logprobs(&r.chat, p.logprobs, &logprobs),
                 "finish_reason": finish_openai(&f, false) }],
             "usage": usage_openai(&f, g.cached_tokens),
             "timings": timings(&f, g.cached_tokens),
         }))
         .into_response());
     }
+    let chat = r.chat.clone();
     let stream = async_stream(move |tx| async move {
         let send = |v: Value| tx.send(SseEvent::default().data(v.to_string())).is_ok();
         loop {
-            let piece = match g.next(&st.chat).await {
+            let piece = match g.next(&chat).await {
                 Ok(x) => x,
                 Err(e) => {
                     let _ = send(json!({ "error": { "message": e.1 } }));
@@ -1045,7 +1134,7 @@ async fn completions(State(st): State<Shared>, h: HeaderMap, Json(body): Json<Va
                 Piece::Done { finish, logprobs } => (String::new(), logprobs, Some(finish)),
             };
             let v = json!({ "id": id, "object": "text_completion", "created": now(), "model": model,
-                "choices": [{ "index": 0, "text": text, "logprobs": response_logprobs(&st.chat, p.logprobs, &lps),
+                "choices": [{ "index": 0, "text": text, "logprobs": response_logprobs(&chat, p.logprobs, &lps),
                     "finish_reason": Value::Null }] });
             if !send(v) {
                 return;
@@ -1069,7 +1158,7 @@ async fn completions(State(st): State<Shared>, h: HeaderMap, Json(body): Json<Va
 }
 
 fn openai_stream(
-    st: Shared,
+    chat: Arc<Chat>,
     mut g: Gen,
     p: Prepared,
     id: String,
@@ -1096,7 +1185,7 @@ fn openai_stream(
         }
         let mut sp = Splitter::new(p.thinking, p.tools);
         loop {
-            let piece = match g.next(&st.chat).await {
+            let piece = match g.next(&chat).await {
                 Ok(x) => x,
                 Err(e) => {
                     let _ = send(json!({ "error": { "message": e.1 } }));
@@ -1117,7 +1206,7 @@ fn openai_stream(
                 };
                 let lp = if p.logprobs && !attached {
                     attached = true;
-                    logprobs_value(&st.chat, &lps)
+                    logprobs_value(&chat, &lps)
                 } else {
                     Value::Null
                 };
@@ -1128,7 +1217,7 @@ fn openai_stream(
             if p.logprobs
                 && !attached
                 && !lps.is_empty()
-                && !send(chunk(json!({}), logprobs_value(&st.chat, &lps), Value::Null))
+                && !send(chunk(json!({}), logprobs_value(&chat, &lps), Value::Null))
             {
                 return;
             }
@@ -1205,9 +1294,12 @@ async fn anthropic_count_tokens(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&st, &h)?;
+    let r = resolve_model(&st, &body)?;
     let (messages, images) = anthropic_messages_to_template(&body)?;
     let p = prepare(
         &st,
+        &r.chat,
+        r.spec.ctx,
         &messages,
         images,
         body.get("tools"),
@@ -1225,10 +1317,13 @@ async fn anthropic_messages(
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     check_auth(&st, &h)?;
+    let r = resolve_model(&st, &body)?;
     let (messages, images) = anthropic_messages_to_template(&body)?;
     let thinking = anthropic_thinking(&st, &body);
     let p = prepare(
         &st,
+        &r.chat,
+        r.spec.ctx,
         &messages,
         images,
         body.get("tools"),
@@ -1238,11 +1333,11 @@ async fn anthropic_messages(
         body["max_tokens"].as_u64(),
     )?;
     let id = format!("msg_{}{}", now(), st.counter.fetch_add(1, Ordering::Relaxed));
-    let model = st.cfg.model_name.clone();
-    let mut g = Gen::start(&st, &p)?;
+    let model = r.spec.id.to_string();
+    let mut g = Gen::start(&st, &r, &p)?;
     if body["stream"].as_bool() != Some(true) {
         let f = loop {
-            match g.next(&st.chat).await? {
+            match g.next(&r.chat).await? {
                 Piece::Text { .. } => {}
                 Piece::Done { finish: f, .. } => break f,
             }
@@ -1267,6 +1362,7 @@ async fn anthropic_messages(
         }))
         .into_response());
     }
+    let chat = r.chat.clone();
     let stream = async_stream(move |tx| async move {
         let ev = |name: &str, v: Value| tx.send(SseEvent::default().event(name).data(v.to_string())).is_ok();
         let start = json!({ "type": "message_start", "message": { "id": id, "type": "message", "role": "assistant", "model": model,
@@ -1278,7 +1374,7 @@ async fn anthropic_messages(
         let mut idx: i64 = -1;
         let mut cur: Option<&'static str> = None;
         loop {
-            let piece = match g.next(&st.chat).await {
+            let piece = match g.next(&chat).await {
                 Ok(x) => x,
                 Err(e) => {
                     let _ = ev(

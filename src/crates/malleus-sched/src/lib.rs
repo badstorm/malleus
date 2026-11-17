@@ -1,6 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! Single-slot scheduler: one GPU thread owns the model and serves requests in FIFO order.
+//! Single-slot scheduler: one GPU thread owns the loaded model and serves requests in FIFO order.
+//!
+//! The server may know several models (see [`catalog`]); this module keeps one of them resident. A request for
+//! another model drops the current `Worker` and loads the requested one on the same GPU thread, because the HIP
+//! context is per thread and the weights share the device memory with the host.
+
+pub mod catalog;
+
+pub use catalog::{Catalog, ModelSpec};
 
 use anyhow::{Context, Result};
 use malleus_hip::DeviceBuffer;
@@ -93,6 +101,8 @@ fn penalized(logits: &[f32], s: &Sampling, history: &[u32], tail: &[u32]) -> Opt
 }
 
 pub struct Request {
+    /// The catalog entry the API resolved for this request. The worker switches to it when it is not the loaded one.
+    pub model: Arc<ModelSpec>,
     pub prompt: Vec<u32>,
     /// Token sequences a prompt-lookup draft may come from besides the prompt itself: the original text of the recent
     /// messages (line numbers and JSON escapes removed by the API layer). A tool result reaches the model as a
@@ -129,6 +139,10 @@ pub enum Event {
     Token {
         id: u32,
         top: Option<TokenProbs>,
+    },
+    /// The worker started loading this model. Streaming clients can keep their connection open while it loads.
+    Loading {
+        model: String,
     },
     Done(Finish),
     Error(String),
@@ -203,7 +217,10 @@ pub enum FinishReason {
 
 pub struct Engine {
     tx: mpsc::Sender<Request>,
-    pub ctx: usize,
+    /// The model currently resident, if any.
+    loaded: Arc<std::sync::Mutex<Option<Arc<ModelSpec>>>>,
+    /// The model being loaded, if any.
+    loading: Arc<std::sync::Mutex<Option<Arc<ModelSpec>>>>,
     pub queued: Arc<AtomicUsize>,
     /// Wall clock (ms since the epoch) at which the request in flight started, 0 when the worker is idle. Read by
     /// the watchdog: a GPU kernel cannot be cancelled from the host, so an overrun has to end the process.
@@ -449,6 +466,7 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 struct Worker {
+    spec: Arc<ModelSpec>,
     model: Model,
     sess: Session,
     cached: Vec<u32>,
@@ -860,72 +878,119 @@ impl Worker {
     }
 }
 
+/// Builds the GPU state of one model. It runs on the GPU thread: `load` must too, because the HIP context is per
+/// thread. The warm-up allocates the scratch of one prefill chunk before the first request.
+fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Result<Model>) -> Result<Worker> {
+    let ctx = spec.ctx;
+    let model = load(spec)?;
+    let mut sess = model.new_session(ctx)?;
+    if std::env::var("MALLEUS_WARMUP").map_or(true, |v| v != "0") {
+        let n = prefill_chunk(&model).min(ctx.saturating_sub(1));
+        let toks: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+        let t0 = Instant::now();
+        model.forward(&mut sess, &toks, None, 1)?;
+        model.reset_session(&mut sess)?;
+        eprintln!("warm-up: {n} tokens in {:.1}s", t0.elapsed().as_secs_f64());
+        // The number the pre-flight's estimate is checked against: the weights, one session and the working set of a
+        // full chunk are all allocated now.
+        eprintln!(
+            "memory: {:.1} GiB live on the device after the warm-up",
+            malleus_hip::device_bytes_live() as f64 / (1u64 << 30) as f64
+        );
+    }
+    Ok(Worker {
+        spec: spec.clone(),
+        drafts: if model.has_mtp() {
+            env_or("MALLEUS_SPEC_DRAFTS", DEFAULT_DRAFTS).min(malleus_model::qwen35::GEMV_MAX_T - 1)
+        } else {
+            0
+        },
+        draft_pmin: env_or("MALLEUS_DRAFT_PMIN", DEFAULT_DRAFT_PMIN),
+        lookup: std::env::var("MALLEUS_LOOKUP").map_or(true, |v| v != "0"),
+        snaps: Vec::new(),
+        snap_pool: Vec::new(),
+        max_snaps: env_or("MALLEUS_PROMPT_SNAPSHOTS", 8),
+        model,
+        sess,
+        cached: Vec::new(),
+    })
+}
+
 impl Engine {
-    /// Starts the GPU thread. `init` runs on that thread and must build the model (HIP context is per thread).
-    pub fn start(ctx: usize, init: impl FnOnce() -> Result<Model> + Send + 'static) -> Result<Engine> {
+    /// Starts the GPU thread. `load` runs on that thread and must build the model (HIP context is per thread). When
+    /// `initial` is set it is loaded before `start` returns, preserving the old startup check; otherwise the first
+    /// request loads its model.
+    pub fn start(
+        initial: Option<Arc<ModelSpec>>,
+        mut load: impl FnMut(&ModelSpec) -> Result<Model> + Send + 'static,
+    ) -> Result<Engine> {
         let (tx, rx) = mpsc::channel::<Request>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let queued = Arc::new(AtomicUsize::new(0));
         let q2 = queued.clone();
         let busy_since = Arc::new(AtomicU64::new(0));
         let b2 = busy_since.clone();
+        let loaded = Arc::new(std::sync::Mutex::new(None::<Arc<ModelSpec>>));
+        let l2 = loaded.clone();
+        let loading = Arc::new(std::sync::Mutex::new(None::<Arc<ModelSpec>>));
+        let g2 = loading.clone();
         std::thread::Builder::new().name("malleus-gpu".into()).spawn(move || {
-            let worker = init().and_then(|model| {
-                let mut sess = model.new_session(ctx)?;
-                // One prefill chunk at startup: its scratch buffers are allocated and their pages mapped before the
-                // first request (a longer request than any before otherwise pays for both, up to ~25 %).
-                if std::env::var("MALLEUS_WARMUP").map_or(true, |v| v != "0") {
-                    let n = prefill_chunk(&model).min(ctx.saturating_sub(1));
-                    let toks: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 50000).collect();
-                    let t0 = Instant::now();
-                    model.forward(&mut sess, &toks, None, 1)?;
-                    model.reset_session(&mut sess)?;
-                    eprintln!("warm-up: {n} tokens in {:.1}s", t0.elapsed().as_secs_f64());
-                    // The number the pre-flight's estimate is checked against: the weights, one session and
-                    // the working set of a full chunk are all allocated now.
-                    eprintln!(
-                        "memory: {:.1} GiB live on the device after the warm-up",
-                        malleus_hip::device_bytes_live() as f64 / (1u64 << 30) as f64
-                    );
-                }
-                Ok(Worker {
-                    drafts: if model.has_mtp() {
-                        env_or("MALLEUS_SPEC_DRAFTS", DEFAULT_DRAFTS).min(malleus_model::qwen35::GEMV_MAX_T - 1)
-                    } else {
-                        0
-                    },
-                    draft_pmin: env_or("MALLEUS_DRAFT_PMIN", DEFAULT_DRAFT_PMIN),
-                    lookup: std::env::var("MALLEUS_LOOKUP").map_or(true, |v| v != "0"),
-                    snaps: Vec::new(),
-                    snap_pool: Vec::new(),
-                    max_snaps: env_or("MALLEUS_PROMPT_SNAPSHOTS", 8),
-                    model,
-                    sess,
-                    cached: Vec::new(),
-                })
-            });
-            let mut worker = match worker {
-                Ok(w) => {
-                    let _ = ready_tx.send(Ok(()));
-                    w
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
+            let mut worker = match initial {
+                Some(spec) => match build_worker(&spec, &mut load) {
+                    Ok(w) => {
+                        *l2.lock().unwrap_or_else(|e| e.into_inner()) = Some(spec);
+                        Some(w)
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                },
+                None => None,
             };
+            let _ = ready_tx.send(Ok(()));
             while let Ok(req) = rx.recv() {
                 q2.fetch_sub(1, Ordering::Relaxed);
-                b2.store(now_ms(), Ordering::Relaxed);
                 let events = req.events.clone();
-                let served = worker.serve(req);
+                let model = req.model.clone();
+                if worker.as_ref().is_none_or(|w| w.spec.id != model.id) {
+                    // A model switch. The old model has to go before the new one is measured against the free memory:
+                    // two of these files do not fit together on the machines this engine targets.
+                    worker = None;
+                    *l2.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    *g2.lock().unwrap_or_else(|e| e.into_inner()) = Some(model.clone());
+                    let _ = malleus_hip::synchronize();
+                    let _ = events.send(Event::Loading {
+                        model: model.id.to_string(),
+                    });
+                    eprintln!("loading model {} from {}", model.id, model.path.display());
+                    let t0 = Instant::now();
+                    let built = build_worker(&model, &mut load);
+                    *g2.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    match built {
+                        Ok(w) => {
+                            eprintln!("model {} ready in {:.1}s", model.id, t0.elapsed().as_secs_f64());
+                            *l2.lock().unwrap_or_else(|e| e.into_inner()) = Some(model);
+                            worker = Some(w);
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Error(format!("loading model `{}`: {e:#}", model.id)));
+                            continue;
+                        }
+                    }
+                }
+                // The watchdog counts the request, not the model load: a slow disk must not look like a hung kernel.
+                b2.store(now_ms(), Ordering::Relaxed);
+                let served = worker.as_mut().expect("a worker is loaded before serving").serve(req);
                 b2.store(0, Ordering::Relaxed);
                 match served {
                     Ok(f) => {
                         let _ = events.send(Event::Done(f));
                     }
                     Err(e) => {
-                        worker.cached.clear();
+                        if let Some(w) = worker.as_mut() {
+                            w.cached.clear();
+                        }
                         let _ = events.send(Event::Error(format!("{e:#}")));
                     }
                 }
@@ -935,7 +1000,8 @@ impl Engine {
         start_watchdog(busy_since.clone())?;
         Ok(Engine {
             tx,
-            ctx,
+            loaded,
+            loading,
             queued,
             busy_since,
         })
@@ -944,6 +1010,16 @@ impl Engine {
     pub fn submit(&self, req: Request) -> Result<()> {
         self.queued.fetch_add(1, Ordering::Relaxed);
         self.tx.send(req).map_err(|_| anyhow::anyhow!("engine thread stopped"))
+    }
+
+    /// The model resident now, if any.
+    pub fn loaded(&self) -> Option<Arc<ModelSpec>> {
+        self.loaded.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The model being loaded now, if any.
+    pub fn loading(&self) -> Option<Arc<ModelSpec>> {
+        self.loading.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// How long the request in flight has been running, or `None` when the worker is idle.

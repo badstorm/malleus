@@ -25,13 +25,16 @@ NoNewPrivileges=true
 # Folder with the .malleus files; fast storage shortens the load (20 GB: ~40 s from NVMe, minutes from HDD).
 Volume=/srv/models/malleus:/models:ro
 
-# One MLS4 copy: `-mls4` in the name says so, and its prefill reads the same 4-bit weights (`-mls4-mls8` would be
-# twice the file and read the prompt at 8 bits). See AGENTS.md, "Model files".
-# Ornith-1.5-35B-A3B: 20.2 GB on disk, 26.2 GiB live on the device with a 262144 context and ~35 tok/s of decode
-# with MTP. This is the default: it leaves the host its RAM.
-Environment=MALLEUS_MODEL=/models/ornith-15-35b-a3b-mls4.malleus
-# Model name returned by /v1/models.
-Environment=MALLEUS_MODEL_NAME=Ornith-1.5-35b-a3b
+# Every .malleus file directly under /models is served; /v1/models lists them and each request selects one with
+# its `model` field. The scheduler keeps one model resident: a switch unloads the current one first.
+Environment=MALLEUS_MODELS_DIR=/models
+# Optional: preload a model and use it when a request omits `model`. Ornith-1.5-35B-A3B: 20.2 GB on disk,
+# 26.2 GiB live on the device with a 262144 context and ~35 tok/s of decode with MTP.
+#Environment=MALLEUS_MODEL=/models/ornith-15-35b-a3b-mls4.malleus
+# Optional: the id of the preloaded model (default: the file stem) and the name /v1/models reports.
+#Environment=MALLEUS_MODEL_NAME=Ornith-1.5-35b-a3b
+# Optional: choose another catalog id as the default when a request omits `model`.
+#Environment=MALLEUS_DEFAULT_MODEL=ornith-15-35b-a3b-mls4
 # Ornith-1.5-122B does not fit on a host that also runs other containers: resident it needs 72.6 GiB and drove a
 # 93.4 GiB host into global OOM (issue #14). The alternative is keeping the routed experts in the file on NVMe
 # (MALLEUS_EXPERT_CACHE): 24 GiB of per-layer pools keep 44.6 GiB live with a 262144 context, but the prefill streams

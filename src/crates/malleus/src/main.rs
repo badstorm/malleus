@@ -1,13 +1,16 @@
 #![forbid(unsafe_code)]
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use malleus_gguf::gguf::Gguf;
 use malleus_gguf::safetensors::SafeTensors;
 use malleus_model::kernels::{Kernels, select_device};
 use malleus_model::qwen35::{Config, LoadOptions, Model};
 use malleus_model::vision::{VisionConfig, VisionModel};
+use malleus_sched::{Catalog, ModelSpec};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// `malleus --version`: the version the build was made from (the git tag, set by `build.rs`) and the license with
@@ -110,8 +113,15 @@ enum Cmd {
     },
     /// Start the OpenAI / Anthropic compatible API server
     Serve {
+        /// Model to preload and use when a request omits `model`
         #[arg(long, env = "MALLEUS_MODEL")]
-        model: PathBuf,
+        model: Option<PathBuf>,
+        /// Directory whose `*.malleus` files the server exposes by file stem
+        #[arg(long, env = "MALLEUS_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
+        /// Catalog id to use when a request omits `model` (default: the id of `--model`)
+        #[arg(long, env = "MALLEUS_DEFAULT_MODEL")]
+        default_model: Option<String>,
         #[arg(long, env = "MALLEUS_HOST", default_value = "0.0.0.0")]
         host: String,
         #[arg(long, env = "MALLEUS_PORT", default_value_t = 8090)]
@@ -1144,8 +1154,102 @@ fn bench_bw(gb: f64) -> Result<()> {
     Ok(())
 }
 
+type ChatMap = HashMap<Arc<str>, Arc<malleus_chat::Chat>>;
+
+/// Builds the catalog the server exposes and loads each model's tokenizer once. `MALLEUS_MODEL` is the preloaded
+/// default and may be outside the directory; every other entry comes from `*.malleus` files directly under
+/// `MALLEUS_MODELS_DIR`. A broken file discovered in the directory is skipped with a warning; a broken explicit
+/// default is an error.
+fn build_catalog(
+    model: Option<PathBuf>,
+    models_dir: Option<PathBuf>,
+    ctx: usize,
+    model_name: Option<String>,
+    default_model: Option<String>,
+) -> Result<(Arc<Catalog>, ChatMap)> {
+    ensure!(
+        model.is_some() || models_dir.is_some(),
+        "serve needs --model or --models-dir (MALLEUS_MODEL / MALLEUS_MODELS_DIR)"
+    );
+    ensure!(
+        model_name.is_none() || model.is_some(),
+        "--model-name renames --model, but no --model was given"
+    );
+    let default_path = model
+        .map(|p| p.canonicalize().with_context(|| format!("model {}", p.display())))
+        .transpose()?;
+    let dir = models_dir
+        .map(|d| {
+            d.canonicalize()
+                .with_context(|| format!("models directory {}", d.display()))
+        })
+        .transpose()?;
+    let paths = malleus_sched::catalog::files_in(dir.as_deref(), default_path.as_deref())?;
+    if paths.is_empty() {
+        bail!(
+            "no models found{}",
+            dir.map(|d| format!(" under {}", d.display())).unwrap_or_default()
+        );
+    }
+    let mut specs: Vec<ModelSpec> = Vec::new();
+    let mut chats: ChatMap = HashMap::new();
+    let mut explicit_id: Option<String> = None;
+    for path in paths {
+        let is_explicit = default_path.as_ref() == Some(&path);
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .with_context(|| format!("{} has no UTF-8 file stem", path.display()))?
+            .to_string();
+        let (id, aliases) = if is_explicit {
+            match &model_name {
+                Some(name) => (name.clone(), vec![stem]),
+                None => (stem, vec![]),
+            }
+        } else {
+            (stem, vec![])
+        };
+        let chat = match load_chat(&path) {
+            Ok(chat) => chat,
+            Err(e) if is_explicit => {
+                return Err(e).with_context(|| format!("loading tokenizer of {}", path.display()));
+            }
+            Err(e) => {
+                eprintln!("warning: skipping {}: {e:#}", path.display());
+                continue;
+            }
+        };
+        let mut eos = vec![];
+        for t in ["<|im_end|>", "<|endoftext|>"] {
+            if let Some(id) = chat.token_id(t) {
+                eos.push(id);
+            }
+        }
+        let spec = ModelSpec {
+            id: Arc::from(id.as_str()),
+            path,
+            ctx,
+            eos: Arc::from(eos),
+            aliases: aliases.into_iter().map(|a| Arc::from(a.as_str())).collect(),
+        };
+        if is_explicit {
+            explicit_id = Some(spec.id.to_string());
+        }
+        chats.insert(spec.id.clone(), Arc::new(chat));
+        specs.push(spec);
+    }
+    if specs.is_empty() {
+        bail!("no loadable models found");
+    }
+    let default_id = default_model.or(explicit_id);
+    let catalog = Arc::new(Catalog::new(specs, default_id.as_deref())?);
+    Ok((catalog, chats))
+}
+
 fn serve(
-    model: PathBuf,
+    model: Option<PathBuf>,
+    models_dir: Option<PathBuf>,
+    default_model: Option<String>,
     host: String,
     port: u16,
     api_key: Option<String>,
@@ -1154,38 +1258,35 @@ fn serve(
     default_thinking: bool,
     max_tokens: usize,
 ) -> Result<()> {
-    preflight(&model, ctx, None)?;
-    let chat = load_chat(&model)?;
-    let name = model_name.unwrap_or_else(|| {
-        model
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("malleus")
-            .to_string()
-    });
-    let mp = model.clone();
-    let engine = malleus_sched::Engine::start(ctx, move || load_model(&mp))?;
-    let eos = {
-        let mut e = vec![];
-        for t in ["<|im_end|>", "<|endoftext|>"] {
-            e.extend(chat.token_id(t));
-        }
-        e
+    let (catalog, chats) = build_catalog(model, models_dir, ctx, model_name, default_model)?;
+    // The catalog default is loaded before `Engine::start` returns, preserving the old startup pre-flight. Without
+    // one the first request loads its model and pays that cost.
+    let initial = catalog.default();
+    let load = move |spec: &ModelSpec| {
+        preflight(&spec.path, spec.ctx, None)?;
+        load_model(&spec.path)
     };
+    let engine = malleus_sched::Engine::start(initial, load)?;
     let cfg = malleus_api::Config {
-        model_name: name.clone(),
         api_key,
         default_thinking,
         max_tokens_default: max_tokens,
     };
-    let app = malleus_api::router(engine, chat, cfg, eos);
+    let app = malleus_api::router(engine, catalog.clone(), chats, cfg);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()?;
+    let default = catalog
+        .default()
+        .map(|s| format!(", default {}", s.id))
+        .unwrap_or_default();
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
-        eprintln!("serving {name} on {host}:{port} (ctx {ctx})");
+        eprintln!(
+            "serving {} model(s) on {host}:{port} (ctx {ctx}{default})",
+            catalog.entries().len()
+        );
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -1546,6 +1647,8 @@ fn main() -> Result<()> {
         } => bench(&model, &prompt, decode, chunk, verify)?,
         Cmd::Serve {
             model,
+            models_dir,
+            default_model,
             host,
             port,
             api_key,
@@ -1555,6 +1658,8 @@ fn main() -> Result<()> {
             max_tokens,
         } => serve(
             model,
+            models_dir,
+            default_model,
             host,
             port,
             api_key,
