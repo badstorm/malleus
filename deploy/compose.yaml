@@ -15,7 +15,7 @@ services:
     environment:
       MALLEUS_MODELS_DIR: /models
       # Optional: preload one model and use it when a request omits `model`.
-      # MALLEUS_MODEL: /models/qwen36-35b-a3b-mls4.malleus
+      # MALLEUS_DEFAULT_MODEL: qwen36-35b-a3b-mls4
       MALLEUS_API_KEY: ${MALLEUS_API_KEY:-}
     ports:
       - "8090:8090"

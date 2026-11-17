@@ -113,13 +113,10 @@ enum Cmd {
     },
     /// Start the OpenAI / Anthropic compatible API server
     Serve {
-        /// Model to preload and use when a request omits `model`
-        #[arg(long, env = "MALLEUS_MODEL")]
-        model: Option<PathBuf>,
         /// Directory whose `*.malleus` files the server exposes by file stem
         #[arg(long, env = "MALLEUS_MODELS_DIR")]
-        models_dir: Option<PathBuf>,
-        /// Catalog id to use when a request omits `model` (default: the id of `--model`)
+        models_dir: PathBuf,
+        /// Catalog id to preload and use when a request omits `model` (default: the only model, if there is one)
         #[arg(long, env = "MALLEUS_DEFAULT_MODEL")]
         default_model: Option<String>,
         #[arg(long, env = "MALLEUS_HOST", default_value = "0.0.0.0")]
@@ -130,8 +127,6 @@ enum Cmd {
         api_key: Option<String>,
         #[arg(long, env = "MALLEUS_CTX", default_value_t = 32768)]
         ctx: usize,
-        #[arg(long, env = "MALLEUS_MODEL_NAME")]
-        model_name: Option<String>,
         /// Reasoning default when the request does not say (Qwen default: on)
         #[arg(long, env = "MALLEUS_DEFAULT_THINKING", default_value_t = true, action = clap::ArgAction::Set)]
         default_thinking: bool,
@@ -145,7 +140,7 @@ enum Cmd {
     },
     /// Write the Latin-script token ids (one per line) for MALLEUS_DRAFT_VOCAB_FILE
     DraftVocab {
-        #[arg(long, env = "MALLEUS_MODEL")]
+        #[arg(long)]
         model: PathBuf,
         #[arg(long)]
         out: PathBuf,
@@ -1156,64 +1151,27 @@ fn bench_bw(gb: f64) -> Result<()> {
 
 type ChatMap = HashMap<Arc<str>, Arc<malleus_chat::Chat>>;
 
-/// Builds the catalog the server exposes and loads each model's tokenizer once. `MALLEUS_MODEL` is the preloaded
-/// default and may be outside the directory; every other entry comes from `*.malleus` files directly under
-/// `MALLEUS_MODELS_DIR`. A broken file discovered in the directory is skipped with a warning; a broken explicit
-/// default is an error.
-fn build_catalog(
-    model: Option<PathBuf>,
-    models_dir: Option<PathBuf>,
-    ctx: usize,
-    model_name: Option<String>,
-    default_model: Option<String>,
-) -> Result<(Arc<Catalog>, ChatMap)> {
-    ensure!(
-        model.is_some() || models_dir.is_some(),
-        "serve needs --model or --models-dir (MALLEUS_MODEL / MALLEUS_MODELS_DIR)"
-    );
-    ensure!(
-        model_name.is_none() || model.is_some(),
-        "--model-name renames --model, but no --model was given"
-    );
-    let default_path = model
-        .map(|p| p.canonicalize().with_context(|| format!("model {}", p.display())))
-        .transpose()?;
+/// Builds the catalog the server exposes and loads each model's tokenizer once. Every entry comes from a
+/// `*.malleus` file directly under `MALLEUS_MODELS_DIR`; a broken file is skipped with a warning. The default is
+/// `MALLEUS_DEFAULT_MODEL` when set, otherwise the only model when the directory holds exactly one.
+fn build_catalog(models_dir: &Path, ctx: usize, default_model: Option<String>) -> Result<(Arc<Catalog>, ChatMap)> {
     let dir = models_dir
-        .map(|d| {
-            d.canonicalize()
-                .with_context(|| format!("models directory {}", d.display()))
-        })
-        .transpose()?;
-    let paths = malleus_sched::catalog::files_in(dir.as_deref(), default_path.as_deref())?;
+        .canonicalize()
+        .with_context(|| format!("models directory {}", models_dir.display()))?;
+    let paths = malleus_sched::catalog::files_in(&dir)?;
     if paths.is_empty() {
-        bail!(
-            "no models found{}",
-            dir.map(|d| format!(" under {}", d.display())).unwrap_or_default()
-        );
+        bail!("no models found under {}", dir.display());
     }
     let mut specs: Vec<ModelSpec> = Vec::new();
     let mut chats: ChatMap = HashMap::new();
-    let mut explicit_id: Option<String> = None;
     for path in paths {
-        let is_explicit = default_path.as_ref() == Some(&path);
-        let stem = path
+        let id = path
             .file_stem()
             .and_then(|s| s.to_str())
             .with_context(|| format!("{} has no UTF-8 file stem", path.display()))?
             .to_string();
-        let (id, aliases) = if is_explicit {
-            match &model_name {
-                Some(name) => (name.clone(), vec![stem]),
-                None => (stem, vec![]),
-            }
-        } else {
-            (stem, vec![])
-        };
         let chat = match load_chat(&path) {
             Ok(chat) => chat,
-            Err(e) if is_explicit => {
-                return Err(e).with_context(|| format!("loading tokenizer of {}", path.display()));
-            }
             Err(e) => {
                 eprintln!("warning: skipping {}: {e:#}", path.display());
                 continue;
@@ -1230,35 +1188,33 @@ fn build_catalog(
             path,
             ctx,
             eos: Arc::from(eos),
-            aliases: aliases.into_iter().map(|a| Arc::from(a.as_str())).collect(),
         };
-        if is_explicit {
-            explicit_id = Some(spec.id.to_string());
-        }
         chats.insert(spec.id.clone(), Arc::new(chat));
         specs.push(spec);
     }
     if specs.is_empty() {
-        bail!("no loadable models found");
+        bail!("no loadable models found under {}", dir.display());
     }
-    let default_id = default_model.or(explicit_id);
+    let default_id = match default_model {
+        Some(id) => Some(id),
+        None if specs.len() == 1 => Some(specs[0].id.to_string()),
+        None => None,
+    };
     let catalog = Arc::new(Catalog::new(specs, default_id.as_deref())?);
     Ok((catalog, chats))
 }
 
 fn serve(
-    model: Option<PathBuf>,
-    models_dir: Option<PathBuf>,
+    models_dir: PathBuf,
     default_model: Option<String>,
     host: String,
     port: u16,
     api_key: Option<String>,
     ctx: usize,
-    model_name: Option<String>,
     default_thinking: bool,
     max_tokens: usize,
 ) -> Result<()> {
-    let (catalog, chats) = build_catalog(model, models_dir, ctx, model_name, default_model)?;
+    let (catalog, chats) = build_catalog(&models_dir, ctx, default_model)?;
     // The catalog default is loaded before `Engine::start` returns, preserving the old startup pre-flight. Without
     // one the first request loads its model and pays that cost.
     let initial = catalog.default();
@@ -1280,7 +1236,7 @@ fn serve(
     let default = catalog
         .default()
         .map(|s| format!(", default {}", s.id))
-        .unwrap_or_default();
+        .unwrap_or_else(|| ", no default: requests must name a model".to_string());
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
         eprintln!(
@@ -1646,25 +1602,21 @@ fn main() -> Result<()> {
             ..
         } => bench(&model, &prompt, decode, chunk, verify)?,
         Cmd::Serve {
-            model,
             models_dir,
             default_model,
             host,
             port,
             api_key,
             ctx,
-            model_name,
             default_thinking,
             max_tokens,
         } => serve(
-            model,
             models_dir,
             default_model,
             host,
             port,
             api_key,
             ctx,
-            model_name,
             default_thinking,
             max_tokens,
         )?,

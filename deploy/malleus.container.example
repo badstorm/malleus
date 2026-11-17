@@ -29,11 +29,8 @@ Volume=/srv/models/malleus:/models:ro
 # its `model` field. The scheduler keeps one model resident: a switch unloads the current one first.
 Environment=MALLEUS_MODELS_DIR=/models
 # Optional: preload a model and use it when a request omits `model`. Ornith-1.5-35B-A3B: 20.2 GB on disk,
-# 26.2 GiB live on the device with a 262144 context and ~35 tok/s of decode with MTP.
-#Environment=MALLEUS_MODEL=/models/ornith-15-35b-a3b-mls4.malleus
-# Optional: the id of the preloaded model (default: the file stem) and the name /v1/models reports.
-#Environment=MALLEUS_MODEL_NAME=Ornith-1.5-35b-a3b
-# Optional: choose another catalog id as the default when a request omits `model`.
+# 26.2 GiB live on the device with a 262144 context and ~35 tok/s of decode with MTP. Without this, a request
+# that omits `model` uses the only model when /models holds one and is refused when there are several.
 #Environment=MALLEUS_DEFAULT_MODEL=ornith-15-35b-a3b-mls4
 # Ornith-1.5-122B does not fit on a host that also runs other containers: resident it needs 72.6 GiB and drove a
 # 93.4 GiB host into global OOM (issue #14). The alternative is keeping the routed experts in the file on NVMe
@@ -44,8 +41,7 @@ Environment=MALLEUS_MODELS_DIR=/models
 #Environment=MALLEUS_EXPERT_CACHE=24
 #Environment=MALLEUS_PREFILL_CHUNK=8192
 #Environment=MALLEUS_MTP=0
-#Environment=MALLEUS_MODEL=/models/ornith-15-122b-mls4.malleus
-#Environment=MALLEUS_MODEL_NAME=Ornith-1.5-122b
+#Environment=MALLEUS_DEFAULT_MODEL=ornith-15-122b-mls4
 # Prompt tokens per forward. 8192 instead of 2048: at 2048 the MoE gets ~64 rows per expert and the grouped
 # GEMM re-reads each expert's weights once per tile, so a bigger chunk is the only lever that lowers the weight
 # traffic per token (measured: MoE 0.300 ms/token against 0.392, +8 % of prefill on long prompts, +2.8 GB of GTT

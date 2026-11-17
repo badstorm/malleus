@@ -69,18 +69,18 @@ malleus convert --model /models/Qwen3.8-27B --out /models/qwen38-27b-mls4.malleu
 # the same with an 8-bit copy of the weights for prompt processing: twice the file, better prompts
 malleus convert --model /models/Qwen3.8-27B --out /models/qwen38-27b-mls4-mls8.malleus --prefill-int8
 
-# run a prompt, or serve the API on port 8090
-malleus run   --model qwen38-27b-mls4.malleus --prompt "Hello!"
-malleus serve --model qwen38-27b-mls4.malleus
+# run a prompt
+malleus run --model qwen38-27b-mls4.malleus --prompt "Hello!"
 
-# or expose every .malleus file in a directory: /v1/models lists them and each request chooses with "model"
+# serve every .malleus file in a directory: /v1/models lists them and each request chooses with "model"
 malleus serve --models-dir /models
 ```
 
 With `--models-dir`, the first version of this feature keeps **one model resident at a time**: a request for
 another model unloads the current one and loads the new one on the GPU thread, so its first request pays the load
 time and starts with an empty prompt cache. The tokenizer and EOS ids follow the selected model; the context length
-and the tuning variables are still server-wide in this first version.
+and the tuning variables are still server-wide in this first version. Without `MALLEUS_DEFAULT_MODEL`, a request
+that omits `model` uses the only model when the directory holds one, and is refused when there are several.
 
 Use the render node of your AMD GPU (`ls -l /dev/dri/by-path/`). A Podman quadlet and a Compose file are in
 [deploy/](deploy/). Other commands (`malleus --help`): `bench` (`--depth 0,8192,…,131072` grows one session and
@@ -105,10 +105,8 @@ engine behaves as if the variable were unset. Defaults that depend on the model 
 
 | Variable | Values (default) | What it does |
 |---|---|---|
-| `MALLEUS_MODEL` | path (off) | Model to preload and use when a request omits `model` (a `.malleus` file or a safetensors directory). |
-| `MALLEUS_MODELS_DIR` | directory (off) | Every `*.malleus` file directly under it is exposed by `/v1/models`; the id is the file stem. |
-| `MALLEUS_DEFAULT_MODEL` | id (default: id of `MALLEUS_MODEL`) | Catalog id used when a request omits `model`. |
-| `MALLEUS_MODEL_NAME` | string (model file stem) | The API id of `MALLEUS_MODEL`; the file stem remains an alias. |
+| `MALLEUS_MODELS_DIR` | directory (required) | Every `*.malleus` file directly under it is exposed by `/v1/models`; the id is the file stem. |
+| `MALLEUS_DEFAULT_MODEL` | id (off; the only model when there is one) | Catalog id to preload and use when a request omits `model`. |
 | `MALLEUS_HOST` | `0.0.0.0` | Address the API listens on. |
 | `MALLEUS_PORT` | `8090` | Port for the API (Chat Completions, Messages, `/health`). |
 | `MALLEUS_API_KEY` | string (off) | When set, every request needs `Authorization: Bearer <key>`. |
