@@ -2,7 +2,7 @@
 
 pub mod text;
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use futures_util::stream::Stream;
 use malleus_chat::{Chat, RenderOptions, StreamDecoder};
-use malleus_sched::{Catalog, Engine, Event, Finish, FinishReason, ModelSpec, Request, Sampling};
+use malleus_sched::{Catalog, Engine, Event, Finish, FinishReason, ModelSpec, ModelState, Request, Sampling};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use text::{THINK_END, TOOL_START, holdback, openai_tool_calls, parse_output};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 pub struct Config {
@@ -51,6 +52,13 @@ pub fn router(engine: Engine, catalog: Arc<Catalog>, chats: HashMap<Arc<str>, Ar
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/models/{id}", get(model))
+        // The router-shaped catalog that model-management clients (pi's `/llama`, `llama.cpp` clients) speak: the
+        // same models as `/v1/models`, with the status and the load and unload controls next to them.
+        .route("/models", get(router_models).post(router_download))
+        .route("/models/load", post(router_load))
+        .route("/models/unload", post(router_unload))
+        .route("/models/sse", get(router_sse))
+        .route("/props", get(router_props))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/messages", post(anthropic_messages))
@@ -197,6 +205,7 @@ footer{{margin-top:2.5rem;color:#888;font-size:.85rem;border-top:1px solid #eee;
 <ul>
 <li><code>GET /health</code> &mdash; liveness, loaded model and queue depth</li>
 <li><code>GET /v1/models</code> &mdash; the models available here</li>
+<li><code>GET /models</code> &mdash; the same catalog with per-model status, plus <code>/models/load</code>, <code>/models/unload</code> and <code>/models/sse</code></li>
 <li><code>POST /v1/chat/completions</code> &mdash; chat, OpenAI schema (streaming, tools)</li>
 <li><code>POST /v1/messages</code> &mdash; chat, Anthropic schema</li>
 <li><code>POST /v1/messages/count_tokens</code> &mdash; token counting</li>
@@ -244,6 +253,223 @@ async fn model(
         .get(&id)
         .ok_or_else(|| not_found(format!("model `{id}` is not available; models: {}", available(&st))))?;
     Ok(Json(model_json(&spec)))
+}
+
+/// What the router catalog says about the engine, read once per HTTP request so every entry of one answer agrees.
+struct RouterStatus {
+    loaded: Option<Arc<str>>,
+    loading: Option<Arc<str>>,
+    failure: Option<(Arc<str>, String)>,
+}
+
+impl RouterStatus {
+    fn of(engine: &Engine) -> Self {
+        let status = engine.status();
+        RouterStatus {
+            loaded: status.loaded().map(|s| s.id.clone()),
+            loading: status.loading().map(|s| s.id.clone()),
+            failure: status.failure().and_then(|f| match f.state {
+                ModelState::Failed(message) => Some((f.id, message)),
+                _ => None,
+            }),
+        }
+    }
+
+    /// The status of one entry. A failed load is reported for the id it failed for: another entry must not look
+    /// broken because of it.
+    fn value(&self, id: &str) -> Value {
+        if self.loaded.as_deref() == Some(id) {
+            json!({ "value": "loaded" })
+        } else if self.loading.as_deref() == Some(id) {
+            json!({ "value": "loading" })
+        } else if self.failure.as_ref().is_some_and(|(failed, _)| failed.as_ref() == id) {
+            let message = &self.failure.as_ref().expect("checked above").1;
+            json!({ "value": "failed", "failed": true, "message": message })
+        } else {
+            json!({ "value": "unloaded" })
+        }
+    }
+}
+
+/// One catalog entry in the router shape. It carries the OpenAI fields too, so a client can read either catalog the
+/// same way; `meta.n_ctx` is the context this server serves the model with, which is also the only training window
+/// this engine knows (it does not read the checkpoint's own `max_position_embeddings`).
+fn router_entry(st: &AppState, spec: &ModelSpec, status: &RouterStatus) -> Value {
+    let vision = st
+        .chats
+        .get(&spec.id)
+        .is_some_and(|c| c.token_id("<|image_pad|>").is_some());
+    json!({
+        "id": spec.id.as_ref(),
+        "object": "model",
+        "owned_by": "malleus",
+        "context_length": spec.ctx,
+        "status": status.value(&spec.id),
+        // Every entry is a file in the models directory and this server downloads nothing, so the source is always
+        // a preset: the one kind a client may load and unload at will.
+        "source": "preset",
+        "meta": { "n_ctx": spec.ctx, "n_ctx_train": spec.ctx },
+        "architecture": {
+            "input_modalities": if vision { json!(["text", "image"]) } else { json!(["text"]) },
+            "output_modalities": ["text"],
+        },
+    })
+}
+
+/// The command a load or an unload names its model with. Required: these endpoints control one model, they do not
+/// guess which one the caller meant.
+fn router_model(st: &AppState, body: &Value) -> Result<Arc<ModelSpec>, ApiError> {
+    let id = body["model"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("the request does not name a `model`"))?;
+    st.catalog
+        .get(id)
+        .ok_or_else(|| not_found(format!("model `{id}` is not available; models: {}", available(st))))
+}
+
+async fn router_models(State(st): State<Shared>, h: HeaderMap) -> Result<Json<Value>, ApiError> {
+    check_auth(&st, &h)?;
+    let status = RouterStatus::of(&st.engine);
+    Ok(Json(json!({
+        "object": "list",
+        "data": st
+            .catalog
+            .entries()
+            .iter()
+            .map(|s| router_entry(&st, s, &status))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// The per-model properties clients read without loading anything: the chat template (a template with
+/// `enable_thinking` is how they learn the model takes a reasoning flag) and whether an unloaded model may be routed
+/// to. Never: a load here is always explicit, because it costs a minute of disk and all of the device memory.
+#[derive(serde::Deserialize)]
+struct PropsQuery {
+    model: Option<String>,
+}
+
+async fn router_props(
+    State(st): State<Shared>,
+    h: HeaderMap,
+    Query(q): Query<PropsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&st, &h)?;
+    let spec = match q.model.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => st
+            .catalog
+            .get(id)
+            .ok_or_else(|| not_found(format!("model `{id}` is not available; models: {}", available(&st))))?,
+        None => st.catalog.default().ok_or_else(|| {
+            bad(format!(
+                "the request does not name a model and the server has no default; models: {}",
+                available(&st)
+            ))
+        })?,
+    };
+    let chat = st.chats.get(&spec.id).ok_or_else(|| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("tokenizer of `{}` is missing", spec.id),
+        )
+    })?;
+    Ok(Json(json!({
+        "model": spec.id.as_ref(),
+        "models_autoload": false,
+        "chat_template": chat.template(),
+    })))
+}
+
+/// Queues a load and answers at once: the load itself takes far longer than a client keeps the request open, so the
+/// caller follows the entry's `status` on `/models`. Idempotent when the model is already resident.
+async fn router_load(State(st): State<Shared>, h: HeaderMap, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
+    check_auth(&st, &h)?;
+    let spec = router_model(&st, &body)?;
+    if st.engine.loaded().is_some_and(|m| m.id == spec.id) {
+        return Ok(Json(
+            json!({ "success": true, "model": spec.id.as_ref(), "status": "loaded" }),
+        ));
+    }
+    st.engine
+        .load(spec.clone())
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(
+        json!({ "success": true, "model": spec.id.as_ref(), "status": "loading" }),
+    ))
+}
+
+/// Queues the drop of the resident model. Queued behind the request in flight, if any, so an unload never cuts a
+/// generation off; the caller polls `/models` until the entry says `unloaded`.
+async fn router_unload(
+    State(st): State<Shared>,
+    h: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&st, &h)?;
+    let spec = router_model(&st, &body)?;
+    st.engine
+        .unload(spec.id.clone())
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "success": true, "model": spec.id.as_ref() })))
+}
+
+/// A download request. This engine serves files that were converted on disk and has no network of its own, so the
+/// honest answer is what to do instead: a 404 would read as a missing endpoint.
+async fn router_download(State(st): State<Shared>, h: HeaderMap) -> Result<Json<Value>, ApiError> {
+    check_auth(&st, &h)?;
+    Err(ApiError(
+        StatusCode::NOT_IMPLEMENTED,
+        "this server does not download models: run `malleus convert` on the checkpoint and put the .malleus file in \
+         the models directory (MALLEUS_MODELS_DIR), then reload the catalog"
+            .to_string(),
+    ))
+}
+
+/// The load and unload transitions as server-sent events, one frame per change after the subscription. No snapshot
+/// of the current state on connect, deliberately: a client that has just asked for a load cannot tell a replayed
+/// `unloaded` from the failure of that load, and closes it as one. The catalog is the snapshot. A reader that falls
+/// behind is skipped rather than blocked: its next `/models` poll is authoritative.
+async fn router_sse(State(st): State<Shared>, h: HeaderMap) -> Result<Response, ApiError> {
+    check_auth(&st, &h)?;
+    let mut rx = st.engine.status().subscribe();
+    let stream = async_stream(move |tx| async move {
+        let send = |frame: String| tx.send(SseEvent::default().data(frame)).is_ok();
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if !send(router_status_frame(&event.id, &status_value(&event.state))) {
+                        return;
+                    }
+                }
+                // A reader that fell behind skips what it missed: its next `/models` poll is authoritative.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+}
+
+fn status_value(state: &ModelState) -> Value {
+    match state {
+        ModelState::Loading => json!({ "value": "loading" }),
+        ModelState::Loaded => json!({ "value": "loaded" }),
+        ModelState::Unloaded => json!({ "value": "unloaded" }),
+        ModelState::Failed(message) => json!({ "value": "failed", "failed": true, "message": message }),
+    }
+}
+
+/// One `model_status` frame: the shape a watching client parses (`event`, `model`, `data.status`), with the failure
+/// message only when there is one.
+fn router_status_frame(id: &str, status: &Value) -> String {
+    let mut data = json!({ "status": status["value"] });
+    for key in ["failed", "message"] {
+        if let Some(v) = status.get(key) {
+            data[key] = v.clone();
+        }
+    }
+    json!({ "event": "model_status", "model": id, "data": data }).to_string()
 }
 
 fn now() -> u64 {
@@ -1579,5 +1805,55 @@ mod norm_tests {
             "1234567890 is too long to be a line number"
         );
         assert_eq!(unescape("a\\n\\\"b\\\"\\\\c\\qd"), "a\n\"b\"\\c\\qd");
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+
+    fn id(s: &str) -> Arc<str> {
+        Arc::from(s)
+    }
+
+    /// A loaded model hides the loading state of another one, an entry that is neither is unloaded, and a failure is
+    /// reported for the id it happened on only: a broken model must not hide the one that works.
+    #[test]
+    fn status_reports_one_model_at_a_time() {
+        let status = RouterStatus {
+            loaded: Some(id("a")),
+            loading: Some(id("b")),
+            failure: Some((id("c"), "no memory".to_string())),
+        };
+        assert_eq!(status.value("a"), json!({ "value": "loaded" }));
+        assert_eq!(status.value("b"), json!({ "value": "loading" }));
+        assert_eq!(status.value("c")["value"], json!("failed"));
+        assert_eq!(status.value("c")["message"], json!("no memory"));
+        assert_eq!(status.value("d"), json!({ "value": "unloaded" }));
+        let idle = RouterStatus {
+            loaded: None,
+            loading: None,
+            failure: None,
+        };
+        assert_eq!(idle.value("a"), json!({ "value": "unloaded" }));
+    }
+
+    /// The frame carries what a watching client reads: the event name, the model and the status, and nothing that
+    /// looks like a failure when the load went fine.
+    #[test]
+    fn frames_carry_a_status_and_a_failure_only_when_there_is_one() {
+        let loaded: Value =
+            serde_json::from_str(&router_status_frame("a", &status_value(&ModelState::Loaded))).unwrap();
+        assert_eq!(loaded["event"], json!("model_status"));
+        assert_eq!(loaded["model"], json!("a"));
+        assert_eq!(loaded["data"]["status"], json!("loaded"));
+        assert!(loaded["data"].get("failed").is_none());
+        assert!(loaded["data"].get("message").is_none());
+
+        let failed = router_status_frame("b", &status_value(&ModelState::Failed("no memory".to_string())));
+        let failed: Value = serde_json::from_str(&failed).unwrap();
+        assert_eq!(failed["data"]["status"], json!("failed"));
+        assert_eq!(failed["data"]["failed"], json!(true));
+        assert_eq!(failed["data"]["message"], json!("no memory"));
     }
 }

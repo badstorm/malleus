@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc as tmpsc;
 
 #[derive(Clone, Debug)]
@@ -215,12 +216,129 @@ pub enum FinishReason {
     Cancelled,
 }
 
-pub struct Engine {
-    tx: mpsc::Sender<Request>,
-    /// The model currently resident, if any.
+/// What the GPU thread takes from its channel. One queue for everything, so FIFO holds: a load or an unload never
+/// jumps ahead of a request already in flight.
+pub enum Command {
+    /// Generate for one request, switching models first when it names another one.
+    Request(Box<Request>),
+    /// Load a model without generating, so the load is finished before the request that needs it arrives.
+    Load(Arc<ModelSpec>),
+    /// Drop the model with this id when it is the resident one, freeing the device memory.
+    Unload(Arc<str>),
+}
+
+/// Where one catalog entry stands. `Failed` carries why the last load failed, so a client polling the catalog stops
+/// waiting instead of waiting for a load that will never come.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelState {
+    Loading,
+    Loaded,
+    Unloaded,
+    Failed(String),
+}
+
+/// One transition, as served on the status stream and as read back by the catalog.
+#[derive(Clone, Debug)]
+pub struct ModelEvent {
+    pub id: Arc<str>,
+    pub state: ModelState,
+}
+
+/// What the GPU thread has resident, what it is loading and the last load that failed. Cloned into the API, which
+/// reads it on every catalog request; every setter also broadcasts, so a watching client needs no polling and a
+/// polling client sees exactly the same thing.
+#[derive(Clone)]
+pub struct Status {
     loaded: Arc<std::sync::Mutex<Option<Arc<ModelSpec>>>>,
-    /// The model being loaded, if any.
     loading: Arc<std::sync::Mutex<Option<Arc<ModelSpec>>>>,
+    failed: Arc<std::sync::Mutex<Option<ModelEvent>>>,
+    events: broadcast::Sender<ModelEvent>,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Status {
+            loaded: Arc::default(),
+            loading: Arc::default(),
+            failed: Arc::default(),
+            events: broadcast::channel(STATUS_CHANNEL).0,
+        }
+    }
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Status {
+    /// A load started: the previous model is gone by then (its memory has to be free for the new one) and a failure
+    /// of this same id no longer describes it.
+    fn set_loading(&self, spec: &Arc<ModelSpec>) {
+        *lock(&self.loaded) = None;
+        *lock(&self.loading) = Some(spec.clone());
+        self.clear_failure(&spec.id);
+        self.emit(&spec.id, ModelState::Loading);
+    }
+
+    fn set_loaded(&self, spec: &Arc<ModelSpec>) {
+        *lock(&self.loading) = None;
+        *lock(&self.loaded) = Some(spec.clone());
+        self.clear_failure(&spec.id);
+        self.emit(&spec.id, ModelState::Loaded);
+    }
+
+    fn set_unloaded(&self, id: &Arc<str>) {
+        *lock(&self.loaded) = None;
+        self.emit(id, ModelState::Unloaded);
+    }
+
+    fn set_failed(&self, id: &Arc<str>, message: String) {
+        *lock(&self.loading) = None;
+        *lock(&self.failed) = Some(ModelEvent {
+            id: id.clone(),
+            state: ModelState::Failed(message.clone()),
+        });
+        self.emit(id, ModelState::Failed(message));
+    }
+
+    fn clear_failure(&self, id: &Arc<str>) {
+        let mut failed = lock(&self.failed);
+        if failed.as_ref().is_some_and(|f| f.id == *id) {
+            *failed = None;
+        }
+    }
+
+    fn emit(&self, id: &Arc<str>, state: ModelState) {
+        // No receiver is not an error: the catalog and the stream are optional views of the same state.
+        let _ = self.events.send(ModelEvent { id: id.clone(), state });
+    }
+
+    pub fn loaded(&self) -> Option<Arc<ModelSpec>> {
+        lock(&self.loaded).clone()
+    }
+
+    pub fn loading(&self) -> Option<Arc<ModelSpec>> {
+        lock(&self.loading).clone()
+    }
+
+    /// The last load that failed, whoever it was for: the caller compares ids.
+    pub fn failure(&self) -> Option<ModelEvent> {
+        lock(&self.failed).clone()
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ModelEvent> {
+        self.events.subscribe()
+    }
+}
+
+/// How many transitions a slow `/models/sse` reader may fall behind before it is told it lagged. A load is two
+/// transitions, so this covers far more switching than a client can use.
+const STATUS_CHANNEL: usize = 64;
+
+pub struct Engine {
+    tx: mpsc::Sender<Command>,
+    /// Resident, loading and last failure, shared with the API.
+    status: Status,
     pub queued: Arc<AtomicUsize>,
     /// Wall clock (ms since the epoch) at which the request in flight started, 0 when the worker is idle. Read by
     /// the watchdog: a GPU kernel cannot be cancelled from the host, so an overrun has to end the process.
@@ -916,6 +1034,44 @@ fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Resu
     })
 }
 
+/// Makes `model` the resident one, loading it when it is not already. The old model has to go first: it is dropped,
+/// the device memory comes back, and only then is the new one measured against what is free, because two of these
+/// files do not fit together on the machines this engine targets. `notify` is the events channel of the request that
+/// triggered the switch, which gets `Event::Loading` before the thread blocks; an explicit load has no such channel.
+fn ensure_loaded(
+    worker: &mut Option<Worker>,
+    model: &Arc<ModelSpec>,
+    load: &mut impl FnMut(&ModelSpec) -> Result<Model>,
+    status: &Status,
+    notify: Option<&tmpsc::UnboundedSender<Event>>,
+) -> Result<()> {
+    if worker.as_ref().is_some_and(|w| w.spec.id == model.id) {
+        return Ok(());
+    }
+    *worker = None;
+    status.set_loading(model);
+    if let Some(events) = notify {
+        let _ = events.send(Event::Loading {
+            model: model.id.to_string(),
+        });
+    }
+    let _ = malleus_hip::synchronize();
+    eprintln!("loading model {} from {}", model.id, model.path.display());
+    let t0 = Instant::now();
+    match build_worker(model, load) {
+        Ok(w) => {
+            eprintln!("model {} ready in {:.1}s", model.id, t0.elapsed().as_secs_f64());
+            status.set_loaded(model);
+            *worker = Some(w);
+            Ok(())
+        }
+        Err(e) => {
+            status.set_failed(&model.id, format!("{e:#}"));
+            Err(e)
+        }
+    }
+}
+
 impl Engine {
     /// Starts the GPU thread. `load` runs on that thread and must build the model (HIP context is per thread). When
     /// `initial` is set it is loaded before `start` returns, preserving the old startup check; otherwise the first
@@ -924,74 +1080,67 @@ impl Engine {
         initial: Option<Arc<ModelSpec>>,
         mut load: impl FnMut(&ModelSpec) -> Result<Model> + Send + 'static,
     ) -> Result<Engine> {
-        let (tx, rx) = mpsc::channel::<Request>();
+        let (tx, rx) = mpsc::channel::<Command>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let queued = Arc::new(AtomicUsize::new(0));
         let q2 = queued.clone();
         let busy_since = Arc::new(AtomicU64::new(0));
         let b2 = busy_since.clone();
-        let loaded = Arc::new(std::sync::Mutex::new(None::<Arc<ModelSpec>>));
-        let l2 = loaded.clone();
-        let loading = Arc::new(std::sync::Mutex::new(None::<Arc<ModelSpec>>));
-        let g2 = loading.clone();
+        let status = Status::default();
+        let s2 = status.clone();
         std::thread::Builder::new().name("malleus-gpu".into()).spawn(move || {
-            let mut worker = match initial {
-                Some(spec) => match build_worker(&spec, &mut load) {
-                    Ok(w) => {
-                        *l2.lock().unwrap_or_else(|e| e.into_inner()) = Some(spec);
-                        Some(w)
-                    }
+            let status = s2;
+            let mut worker = None;
+            if let Some(spec) = initial {
+                match ensure_loaded(&mut worker, &spec, &mut load, &status, None) {
+                    Ok(()) => {}
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                         return;
                     }
-                },
-                None => None,
-            };
+                }
+            }
             let _ = ready_tx.send(Ok(()));
-            while let Ok(req) = rx.recv() {
-                q2.fetch_sub(1, Ordering::Relaxed);
-                let events = req.events.clone();
-                let model = req.model.clone();
-                if worker.as_ref().is_none_or(|w| w.spec.id != model.id) {
-                    // A model switch. The old model has to go before the new one is measured against the free memory:
-                    // two of these files do not fit together on the machines this engine targets.
-                    worker = None;
-                    *l2.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    *g2.lock().unwrap_or_else(|e| e.into_inner()) = Some(model.clone());
-                    let _ = malleus_hip::synchronize();
-                    let _ = events.send(Event::Loading {
-                        model: model.id.to_string(),
-                    });
-                    eprintln!("loading model {} from {}", model.id, model.path.display());
-                    let t0 = Instant::now();
-                    let built = build_worker(&model, &mut load);
-                    *g2.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    match built {
-                        Ok(w) => {
-                            eprintln!("model {} ready in {:.1}s", model.id, t0.elapsed().as_secs_f64());
-                            *l2.lock().unwrap_or_else(|e| e.into_inner()) = Some(model);
-                            worker = Some(w);
-                        }
-                        Err(e) => {
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    Command::Request(req) => {
+                        let req = *req;
+                        q2.fetch_sub(1, Ordering::Relaxed);
+                        let events = req.events.clone();
+                        let model = req.model.clone();
+                        if let Err(e) = ensure_loaded(&mut worker, &model, &mut load, &status, Some(&events)) {
                             let _ = events.send(Event::Error(format!("loading model `{}`: {e:#}", model.id)));
                             continue;
                         }
-                    }
-                }
-                // The watchdog counts the request, not the model load: a slow disk must not look like a hung kernel.
-                b2.store(now_ms(), Ordering::Relaxed);
-                let served = worker.as_mut().expect("a worker is loaded before serving").serve(req);
-                b2.store(0, Ordering::Relaxed);
-                match served {
-                    Ok(f) => {
-                        let _ = events.send(Event::Done(f));
-                    }
-                    Err(e) => {
-                        if let Some(w) = worker.as_mut() {
-                            w.cached.clear();
+                        // The watchdog counts the request, not the model load: a slow disk must not look like a hung
+                        // kernel.
+                        b2.store(now_ms(), Ordering::Relaxed);
+                        let served = worker.as_mut().expect("a worker is loaded before serving").serve(req);
+                        b2.store(0, Ordering::Relaxed);
+                        match served {
+                            Ok(f) => {
+                                let _ = events.send(Event::Done(f));
+                            }
+                            Err(e) => {
+                                if let Some(w) = worker.as_mut() {
+                                    w.cached.clear();
+                                }
+                                let _ = events.send(Event::Error(format!("{e:#}")));
+                            }
                         }
-                        let _ = events.send(Event::Error(format!("{e:#}")));
+                    }
+                    Command::Load(model) => {
+                        if let Err(e) = ensure_loaded(&mut worker, &model, &mut load, &status, None) {
+                            eprintln!("loading model {} failed: {e:#}", model.id);
+                        }
+                    }
+                    Command::Unload(id) => {
+                        if worker.as_ref().is_some_and(|w| w.spec.id == id) {
+                            worker = None;
+                            let _ = malleus_hip::synchronize();
+                            status.set_unloaded(&id);
+                            eprintln!("unloaded model {id}");
+                        }
                     }
                 }
             }
@@ -1000,8 +1149,7 @@ impl Engine {
         start_watchdog(busy_since.clone())?;
         Ok(Engine {
             tx,
-            loaded,
-            loading,
+            status,
             queued,
             busy_since,
         })
@@ -1009,17 +1157,40 @@ impl Engine {
 
     pub fn submit(&self, req: Request) -> Result<()> {
         self.queued.fetch_add(1, Ordering::Relaxed);
-        self.tx.send(req).map_err(|_| anyhow::anyhow!("engine thread stopped"))
+        self.tx
+            .send(Command::Request(Box::new(req)))
+            .map_err(|_| anyhow::anyhow!("engine thread stopped"))
+    }
+
+    /// Loads `model` on the GPU thread without waiting for a request. Returns as soon as the command is queued: a load
+    /// of a file this size takes a minute, far longer than a client keeps a request open. Follow [`Status`] (or
+    /// [`Engine::loaded`]) for the outcome.
+    pub fn load(&self, model: Arc<ModelSpec>) -> Result<()> {
+        self.tx
+            .send(Command::Load(model))
+            .map_err(|_| anyhow::anyhow!("engine thread stopped"))
+    }
+
+    /// Drops the model with this id when it is the resident one. Queued behind the request in flight, if any.
+    pub fn unload(&self, id: Arc<str>) -> Result<()> {
+        self.tx
+            .send(Command::Unload(id))
+            .map_err(|_| anyhow::anyhow!("engine thread stopped"))
+    }
+
+    /// The status the API reads: what is resident, what is loading, the last failure, and the transition stream.
+    pub fn status(&self) -> &Status {
+        &self.status
     }
 
     /// The model resident now, if any.
     pub fn loaded(&self) -> Option<Arc<ModelSpec>> {
-        self.loaded.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.status.loaded()
     }
 
     /// The model being loaded now, if any.
     pub fn loading(&self) -> Option<Arc<ModelSpec>> {
-        self.loading.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.status.loading()
     }
 
     /// How long the request in flight has been running, or `None` when the worker is idle.
@@ -1262,5 +1433,73 @@ mod lookup_tests {
         assert!(lookup_drafts(&hist, &[vec![9, 9, 9]], 3, 5).is_empty());
         assert!(lookup_drafts(&[1u32, 2], &[], 3, 5).is_empty());
         assert!(lookup_drafts(&[1u32, 2, 3, 1, 2, 3], &[], 3, 0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn spec(id: &str) -> Arc<ModelSpec> {
+        Arc::new(ModelSpec {
+            id: Arc::from(id),
+            path: std::path::PathBuf::from("/dev/null"),
+            ctx: 8,
+            eos: Arc::from(Vec::<u32>::new()),
+        })
+    }
+
+    /// The state the API reads: one resident model at a time, and a failure that stays with the id it happened on
+    /// until that id is loaded again. A failure of one model must not leak onto another.
+    #[test]
+    fn a_failure_belongs_to_the_model_that_failed() {
+        let st = Status::default();
+        st.set_loading(&spec("a"));
+        assert_eq!(st.loading().map(|s| s.id.to_string()), Some("a".to_string()));
+        assert!(st.loaded().is_none());
+        st.set_loaded(&spec("a"));
+        assert_eq!(st.loaded().map(|s| s.id.to_string()), Some("a".to_string()));
+        assert!(st.loading().is_none());
+
+        st.set_failed(&spec("b").id, "no memory".to_string());
+        assert_eq!(st.failure().map(|f| f.id.to_string()), Some("b".to_string()));
+
+        // Dropping `a` leaves `b`'s failure in place.
+        st.set_unloaded(&spec("a").id);
+        assert!(st.loaded().is_none());
+        assert_eq!(st.failure().map(|f| f.id.to_string()), Some("b".to_string()));
+
+        // A new attempt at `b` clears the failure it belongs to, and it is cleared while the load runs, not after.
+        st.set_loading(&spec("b"));
+        assert!(st.failure().is_none());
+        assert!(st.loaded().is_none());
+        assert_eq!(st.loading().map(|s| s.id.to_string()), Some("b".to_string()));
+    }
+
+    /// Every setter broadcasts, in order, so a watching client sees the same transitions a polling one does.
+    #[test]
+    fn transitions_are_broadcast_in_order() {
+        let st = Status::default();
+        let mut rx = st.subscribe();
+        st.set_loading(&spec("a"));
+        st.set_loaded(&spec("a"));
+        st.set_loaded(&spec("b"));
+        st.set_unloaded(&spec("b").id);
+        let seen: Vec<(String, ModelState)> = (0..4)
+            .map(|_| {
+                let e = rx.try_recv().expect("a broadcast transition");
+                (e.id.to_string(), e.state)
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a".to_string(), ModelState::Loading),
+                ("a".to_string(), ModelState::Loaded),
+                ("b".to_string(), ModelState::Loaded),
+                ("b".to_string(), ModelState::Unloaded),
+            ]
+        );
+        assert!(rx.try_recv().is_err());
     }
 }

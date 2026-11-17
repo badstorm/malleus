@@ -9,6 +9,7 @@ use tokenizers::Tokenizer;
 pub struct Chat {
     tok: Tokenizer,
     env: Environment<'static>,
+    template: String,
 }
 
 pub struct RenderOptions<'a> {
@@ -42,14 +43,20 @@ impl Chat {
 
     pub fn from_parts(tokenizer_json: &[u8], template: String) -> Result<Self> {
         let tok = Tokenizer::from_bytes(tokenizer_json).map_err(|e| anyhow!("tokenizer: {e}"))?;
-        let tpl = template;
+        let tpl = template.clone();
         let mut env = Environment::new();
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", raise_exception);
         env.set_trim_blocks(false);
         env.add_template_owned("chat", tpl)?;
-        Ok(Chat { tok, env })
+        Ok(Chat { tok, env, template })
+    }
+
+    /// The Jinja template as it was loaded. The API serves it to clients that decide what a model supports from it
+    /// (a template with `enable_thinking` takes the reasoning flag, an `image_pad` tokenizer takes images).
+    pub fn template(&self) -> &str {
+        &self.template
     }
 
     pub fn render(&self, messages: &serde_json::Value, o: &RenderOptions) -> Result<String> {
