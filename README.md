@@ -139,7 +139,7 @@ engine behaves as if the variable were unset. Defaults that depend on the model 
 | `MALLEUS_HOST_RESERVE_GIB` | GiB, default `8` | RAM the memory plan leaves to the host for the page cache of a table read from disk (the n-gram table); `0` for a model without one. |
 | `MALLEUS_BUF_POOL` | `0` to disable, default on | Keeps freed device buffers of up to 16 MiB (512 MiB in all) for the next allocation of the same size, so a decode step makes no `hipMalloc`/`hipFree`. |
 | `MALLEUS_MEM_IGNORE` | any value except `0`/`false` | Skip the memory pre-flight and let the allocator fail instead. |
-| `MALLEUS_SLOTS` | sessions, default `1` | Sessions the memory plan assumes. It is not a batch: the scheduler serves one request at a time. |
+| `MALLEUS_SLOTS` | sessions, default `1` | Sessions kept resident and served in turn: each in-flight request holds one, and the context is split between them (`MALLEUS_CTX / slots` each). With more than one slot a long prefill no longer freezes the conversations already decoding — every round gives each session one step — but the sessions take turns rather than sharing a forward, so the aggregate decode rate is the single-request one (issue #33, v1). `1` is the old behaviour, unchanged. The prompt snapshots (`MALLEUS_PROMPT_SNAPSHOTS`) are per session and therefore split too. |
 | `MALLEUS_DECODE_INT8` | `1` (default off) | Decode on the MLS8 prefill copies of the non-expert linears: quality over speed. |
 | `MALLEUS_ARGMAX_GPU` | `1` (default on) | Greedy decode computes the argmax on the device and reads back 4 bytes instead of the 1 MB logits row. Output identical; the host copy is gone, speed within noise (34.8-35.0 tok/s at 256K). `0` keeps the host argmax. |
 | `MALLEUS_LMHEAD_W4` | `1` (default off) | Convert `lm_head` to MLS4 at load: half its bytes per token, a few argmax points. |
@@ -157,6 +157,7 @@ engine behaves as if the variable were unset. Defaults that depend on the model 
 | Variable | Values (default) | What it does |
 |---|---|---|
 | `MALLEUS_PREFILL_CHUNK` | tokens, default `16384` with hyper-connections else `2048` | Tokens per prompt-processing chunk; the expert weights are streamed once per chunk. The working set grows with it (about 1 MiB per token on Flash-Next), and the memory plan counts it. |
+| `MALLEUS_PREFILL_QUANTUM` | tokens, default: the chunk with one slot, `min(chunk, 256)` with more | Prompt tokens processed per step when several sessions take turns: it is what a decoding session waits for, so a neighbour gets one token every `quantum / prefill_rate` seconds (measured on Qwen3.8-27B: 11 s at 2048, 1.5 s at 256, 0.9 s at 128, and 256 loses nothing on the prefill alone while 128 loses 13 %). |
 | `MALLEUS_PREFILL_GEMM` | `f16` (default int8/W4A8) | Prompt GEMMs on fp16 activations instead of int8. |
 | `MALLEUS_DENSE_W4A4` | `1`, `w4a8`, `acts`, `2`, `3` (default off) | `1`: int4 activations on the plain dense GEMMs. `w4a8`: also 4-bit weights for the projections whose input needs a transform (`o_proj`, `out_proj`). `acts`: int4 activations there too — faster, about −1.6 points of argmax. |
 | `MALLEUS_DENSE_W4A8_ACTS` | `0` (default on) | `0` keeps those projections on int8, for an A/B of the line above. |

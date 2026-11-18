@@ -290,10 +290,14 @@ fn preflight(path: &Path, ctx: usize, chunk: Option<usize>) -> Result<()> {
         (Config::from_hf(path)?, bytes)
     };
     let mtp = std::env::var("MALLEUS_MTP").map_or(true, |v| v != "0");
+    // The context is the budget of all the sessions together, as it is for a batched server: every session holds
+    // `ctx / slots` of it.
+    let sessions = malleus_model::memplan::sessions();
+    let per_slot = (ctx / sessions).max(1);
     let usage = malleus_model::memplan::Usage {
         weights,
-        session: malleus_model::memplan::session_bytes(&cfg, ctx, mtp),
-        sessions: malleus_model::memplan::sessions(),
+        session: malleus_model::memplan::session_bytes(&cfg, per_slot, mtp),
+        sessions,
         reserve: malleus_model::memplan::reserve_bytes(
             &cfg,
             chunk
@@ -305,7 +309,7 @@ fn preflight(path: &Path, ctx: usize, chunk: Option<usize>) -> Result<()> {
     };
     malleus_model::memplan::check(
         &path.display().to_string(),
-        ctx,
+        per_slot,
         &usage,
         malleus_model::memplan::MemInfo::read(),
     )
