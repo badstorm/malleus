@@ -48,6 +48,24 @@ flash attention.
 Measured memory bandwidth is ~80 GB/s (`malleus bench-bw`), so the 4-bit decode of a dense 27B model is bandwidth
 bound at ~5.8 tokens/s; MTP speculative decoding is what goes past that limit.
 
+### Concurrent requests (2026-11-18)
+
+Same machine, `malleus serve` with `MALLEUS_SLOTS=4`, `MALLEUS_CTX=16384` (4096 per session), MTP off; one client
+at a time against N clients sending the same kind of request together (256-token prompt, 192 generated tokens,
+greedy). The sessions share one pass over the weights, one token each, so the aggregate rate multiplies while a
+single request keeps its speed.
+
+| clients | aggregate | per-request wall (p50) |
+|---|---|---|
+| 1 | 4.92 tok/s | 39.0 s |
+| 2 | 8.88 tok/s | 43.2 s |
+| 4 | **12.82 tok/s** | 59.7 s |
+
+`llama.cpp` (server-rocm, build 12464, `-fa on`, four slots) on the same box, same burst: 4.32 tok/s at one client
+and 13.16 at four. The act of batching is worth the same to both engines; what differs is the single-request rate
+and the prefill. Two sessions of 48 tokens put next to a 20 043-token prefill finish in 76 s at
+`MALLEUS_PREFILL_QUANTUM=256` (they waited 120 s before the sessions were resident).
+
 ## Ornith-1.5-35B-A3B — the long-context case (2026-11-15/16)
 
 A 35B-A3B hybrid MoE (40 layers, full attention every 4th, 256 experts / 8 active, native window 262 144), 20.2 GB

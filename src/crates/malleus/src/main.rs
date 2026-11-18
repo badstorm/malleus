@@ -193,6 +193,30 @@ enum Cmd {
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
     },
+    /// One pass over the weights for several sessions must give every row what the serial step gives it: the same
+    /// prompt is advanced serially in one session and batched in `sessions - 1` others, comparing the argmax of every
+    /// row at every step (issue #35).
+    BatchExact {
+        #[arg(long)]
+        model: PathBuf,
+        /// A golden file (golden/<model>/golden.json): its token ids are the prompt
+        #[arg(long)]
+        golden: PathBuf,
+        /// Which prompt of the golden file
+        #[arg(long, default_value = "long-context")]
+        only: String,
+        /// Sessions in the batch (one of them is the serial reference is not counted: 2 means one + one)
+        #[arg(long, default_value_t = 2)]
+        sessions: usize,
+        /// Decode steps to compare
+        #[arg(long, default_value_t = 32)]
+        steps: usize,
+        /// Prompt tokens to keep (the golden prompts are short; this only truncates)
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+    },
     /// Measure GPU memory bandwidth (read and copy)
     BenchBw {
         #[arg(long, default_value_t = 2.0)]
@@ -424,6 +448,92 @@ fn log_softmax(x: &[f32]) -> Vec<f64> {
 /// time: the drafts only propose, so the committed text must not depend on how many rows a step checked. The
 /// verifies run first, so that with `MALLEUS_DUMP_DIR` set the last one-token step dumped is the reference of
 /// row 0 (the reference then stops there, and only row 0 is compared).
+/// The batched decode of several sessions must equal the serial decode of the same state, row by row.
+///
+/// One session is advanced serially, `sessions` others in one batched step of the same token; every row's argmax is
+/// compared at every step, and the token the serial path chose is what the batch is fed next. A difference means the
+/// row offsets or the shared buffers of `Model::decode_batch` are wrong, which is exactly the failure this engine
+/// had while `decode_batch` was being written.
+fn batch_exact(
+    model: &Path,
+    golden: &Path,
+    only: &str,
+    sessions: usize,
+    steps: usize,
+    limit: Option<usize>,
+    ctx: usize,
+) -> Result<()> {
+    let g: serde_json::Value = serde_json::from_reader(std::fs::File::open(golden)?)?;
+    let entry = g["text"]
+        .as_array()
+        .context("text")?
+        .iter()
+        .find(|e| e["id"].as_str() == Some(only))
+        .with_context(|| format!("no prompt `{only}` in the golden file"))?;
+    let mut ids: Vec<u32> = entry["input_ids"]
+        .as_array()
+        .context("ids")?
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    if let Some(n) = limit {
+        ids.truncate(n);
+    }
+    ensure!(!ids.is_empty(), "empty prompt");
+    ensure!(sessions >= 1, "--sessions must be at least 1");
+    let m = load_model(model)?;
+    ensure!(m.can_batch(), "this model has no batched decode");
+    let argmax = |row: &[f32]| -> u32 {
+        let mut best = 0usize;
+        for (i, v) in row.iter().enumerate() {
+            if *v > row[best] {
+                best = i;
+            }
+        }
+        best as u32
+    };
+    let mut serial = m.new_session(ctx)?;
+    let mut batched: Vec<malleus_model::qwen35::Session> =
+        (0..sessions).map(|_| m.new_session(ctx)).collect::<Result<_>>()?;
+    // The prompt is the same for every session, and so is its first token.
+    let first = m.forward_argmax(&mut serial, &ids)?;
+    let mut tok = first;
+    for s in batched.iter_mut() {
+        let t = m.forward_argmax(s, &ids)?;
+        ensure!(t == first, "the prefills disagree ({t} against {first})");
+    }
+    println!(
+        "prompt {} tokens, first token {first}, {sessions} batched session(s)",
+        ids.len()
+    );
+    for step in 0..steps {
+        let row = m.forward(&mut serial, &[tok], None, 1)?;
+        let want = argmax(&row);
+        let mut runs: Vec<(&mut malleus_model::qwen35::Session, u32)> = batched.iter_mut().map(|s| (s, tok)).collect();
+        let rows = m.decode_batch(&mut runs)?;
+        for (i, r) in rows.iter().enumerate() {
+            ensure!(r.len() == row.len(), "row {i} is not a logits row");
+            let got = argmax(r);
+            ensure!(
+                got == want,
+                "step {step}: row {i} chose {got}, the serial step chose {want}"
+            );
+            let same = r.iter().zip(&row).all(|(a, b)| a.to_bits() == b.to_bits());
+            println!(
+                "step {step:3} row {i}: argmax {got} {}",
+                if same {
+                    "identical"
+                } else {
+                    "same argmax, logits differ"
+                }
+            );
+        }
+        tok = want;
+    }
+    println!("every step agrees with the serial decode");
+    Ok(())
+}
+
 fn spec_exact(
     model: &Path,
     golden: &Path,
@@ -1761,6 +1871,15 @@ fn main() -> Result<()> {
             replay,
             ctx,
         } => spec_exact(&model, &g, &only, &prefix, width, replay, ctx)?,
+        Cmd::BatchExact {
+            model,
+            golden: g,
+            only,
+            sessions,
+            steps,
+            limit,
+            ctx,
+        } => batch_exact(&model, &g, &only, sessions, steps, limit, ctx)?,
     }
     Ok(())
 }
