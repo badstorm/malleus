@@ -1,6 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! Single-slot scheduler: one GPU thread owns the loaded model and serves requests in FIFO order.
+//! Scheduler: one GPU thread owns the loaded model and up to `MALLEUS_SLOTS` sessions.
+//!
+//! Requests are admitted first come first served, one per free slot, and every round gives each active session one
+//! step: a prefill piece, or a token of decode. A long prompt therefore no longer freezes the conversations already
+//! running next to it — one piece is the longest a decoding session waits. One slot is what this module always did:
+//! one session, one request at a time, the whole context, byte for byte the same work order.
+//!
+//! This first version splits the *waiting*, not the weight read: the sessions take turns, each step still loads the
+//! weights for one token (issue #33, v1). Sharing one forward between the sessions is the next step and needs the
+//! attention kernels to carry a per-row KV base.
 //!
 //! The server may know several models (see [`catalog`]); this module keeps one of them resident. A request for
 //! another model drops the current `Worker` and loads the requested one on the same GPU thread, because the HIP
@@ -586,22 +595,35 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 struct Worker {
     spec: Arc<ModelSpec>,
     model: Model,
-    sess: Session,
-    cached: Vec<u32>,
+    /// Sessions resident, one per slot: each holds its own KV, recurrent state, prompt cache and snapshots, so
+    /// several requests take turns on the GPU instead of queueing behind each other.
+    slots: Vec<Slot>,
     /// MTP drafts per decode step (0: plain decode).
     drafts: usize,
     draft_pmin: f32,
     /// Prompt-lookup drafts from the context when they agree with the MTP head.
     lookup: bool,
+    /// Prompt snapshots kept per slot.
+    max_snaps: usize,
+    /// Prompt tokens processed per step: the whole prefill chunk with one slot, a slice of it when several sessions
+    /// take turns (`MALLEUS_PREFILL_QUANTUM`), because one piece is what a decoding session waits for.
+    quantum: usize,
+}
+
+/// One session and the prompt state that belongs to it. This split is what makes two requests independent on one
+/// GPU: the weights are shared, the state is not.
+struct Slot {
+    sess: Session,
+    /// Tokens whose KV rows this session holds, from the start of its context.
+    cached: Vec<u32>,
     /// Prompt snapshots (tokens, states), least recently used first; at most `max_snaps`.
     snaps: Vec<(Vec<u32>, Snapshot)>,
     /// Snapshots whose GPU buffers are already allocated, waiting to be refilled: a prompt is snapshotted on every
     /// request, and allocating the ~100 state buffers costs far more than copying them (`Model::new_snapshot`).
     snap_pool: Vec<Snapshot>,
-    max_snaps: usize,
 }
 
-impl Worker {
+impl Slot {
     /// Hands a retired snapshot's buffers back to the pool; freeing them would give the pages right back to the
     /// allocator we are trying not to call on the request path.
     fn recycle(&mut self, snap: Snapshot) {
@@ -612,25 +634,25 @@ impl Worker {
 
     /// A snapshot to fill: one from the pool, else the buffers of the least recently used snapshot when all
     /// `max_snaps` are full (it is the one about to be dropped anyway), else a fresh allocation.
-    fn take_snap(&mut self) -> Option<Snapshot> {
+    fn take_snap(&mut self, model: &Model, max_snaps: usize) -> Option<Snapshot> {
         self.snap_pool.pop().or_else(|| {
-            if !self.snaps.is_empty() && self.snaps.len() >= self.max_snaps {
+            if !self.snaps.is_empty() && self.snaps.len() >= max_snaps {
                 return Some(self.snaps.remove(0).1);
             }
-            self.model.new_snapshot(&self.sess).ok()
+            model.new_snapshot(&self.sess).ok()
         })
     }
 
     /// Keeps the session states for the tokens in `cached` (least recently used snapshots dropped first).
-    fn push_snapshot(&mut self) {
-        if self.max_snaps == 0 {
+    fn push_snapshot(&mut self, model: &Model, max_snaps: usize) {
+        if max_snaps == 0 {
             return;
         }
-        let mut snap = match self.take_snap() {
+        let mut snap = match self.take_snap(model, max_snaps) {
             Some(s) => s,
             None => return,
         };
-        if self.model.snapshot_into(&self.sess, &mut snap).is_err() {
+        if model.snapshot_into(&self.sess, &mut snap).is_err() {
             self.recycle(snap);
             return;
         }
@@ -639,13 +661,113 @@ impl Worker {
             self.recycle(old);
         }
         self.snaps.push((self.cached.clone(), snap));
-        while self.snaps.len() > self.max_snaps {
+        while self.snaps.len() > max_snaps {
             let old = self.snaps.remove(0).1;
             self.recycle(old);
         }
     }
 
-    fn serve(&mut self, mut req: Request) -> Result<Finish> {
+    /// Back to an empty context, keeping the snapshots (they are keyed by their own tokens).
+    fn reset(&mut self, model: &Model) -> Result<()> {
+        model.reset_session(&mut self.sess)?;
+        self.cached.clear();
+        Ok(())
+    }
+}
+
+/// Where a step of a request stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// Prompt tokens still to process; nothing has been emitted yet.
+    Prefill,
+    /// One token (or one verify round) per step.
+    Decode,
+}
+
+/// The outcome of one step: the request runs on, or it is over (finished, cancelled, or out of context).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Progress {
+    More,
+    Done,
+}
+
+/// One request being served. Everything that has to survive from one step to the next and used to live in the body
+/// of the old `serve()`: the pieces still to prefill, the sampler, the emitted count and the pending drafts.
+struct Active {
+    req: Request,
+    slot: usize,
+    phase: Phase,
+    /// Ranges `(start, len)` of `req.prompt` still to prefill, in order.
+    pieces: Vec<(usize, usize)>,
+    piece: usize,
+    /// Index in `pieces` after which a snapshot is kept (the start of the last chat turn).
+    mid: Option<usize>,
+    image_req: bool,
+    image_pos: Option<Vec<[i32; 3]>>,
+    image_inserts: Vec<(usize, DeviceBuffer)>,
+    t0: Instant,
+    t1: Instant,
+    /// Prefill time, fixed when the first token is sampled.
+    prefill_s: f64,
+    /// Logits of the last prefill piece, waiting for the first token to be sampled off them.
+    logits: Vec<f32>,
+    rng: Rng,
+    n: usize,
+    tok: u32,
+    pend: Vec<u32>,
+    top: Option<TokenProbs>,
+    reason: FinishReason,
+    max_tokens: usize,
+    ctx: usize,
+}
+
+impl Active {
+    /// Emits one token with its log-probability data (None when logprobs were not asked); false when generation
+    /// must stop.
+    fn emit(&mut self, t: u32, top: Option<TokenProbs>) -> bool {
+        self.n += 1;
+        if self.req.stop_tokens.contains(&t) {
+            self.reason = FinishReason::Stop;
+            return false;
+        }
+        if self.req.events.send(Event::Token { id: t, top }).is_err() || self.req.cancel.load(Ordering::Relaxed) {
+            self.reason = FinishReason::Cancelled;
+            return false;
+        }
+        self.n < self.max_tokens
+    }
+
+    fn finish(&self) -> Finish {
+        Finish {
+            reason: self.reason,
+            prompt_tokens: self.req.prompt.len(),
+            completion_tokens: self.n,
+            prefill_s: self.prefill_s,
+            decode_s: self.t1.elapsed().as_secs_f64(),
+        }
+    }
+}
+
+/// Splits `[start, end)` into pieces of at most `quantum` tokens.
+fn prompt_pieces(start: usize, end: usize, quantum: usize) -> Vec<(usize, usize)> {
+    let q = quantum.max(1);
+    (start..end).step_by(q).map(|s| (s, (s + q).min(end) - s)).collect()
+}
+
+/// The free slot a request starts on: the one whose session already holds the longest prefix of `prompt`, so a
+/// conversation keeps hitting its own prompt cache whatever the interleaving, else the first free one.
+fn pick_slot(free: &[usize], cached: &[&[u32]], prompt: &[u32]) -> Option<usize> {
+    free.iter().copied().max_by_key(|&i| {
+        let held = cached.get(i).copied().unwrap_or(&[]);
+        let lcp = held.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        (lcp, std::cmp::Reverse(i))
+    })
+}
+
+impl Worker {
+    /// Prepares one request on `slot`: expands images, finds the prompt cache and emits `Started`. Nothing runs on
+    /// the GPU here; the prefill is `prefill_step`.
+    fn begin(&mut self, mut req: Request, slot: usize) -> Result<Active> {
         // Images are expanded and encoded before anything else: the prompt the rest of this function sees is the
         // one with the `<|image_pad|>` placeholder replaced by the grid's tokens, and its mrope positions are the
         // ones the vision tower's merge size implies.
@@ -716,7 +838,16 @@ impl Worker {
             image_pos = Some(pos);
             image_inserts = starts.into_iter().zip(merged).collect();
         }
-        let ctx = self.sess.max_ctx;
+        let max_snaps = self.max_snaps;
+        let quantum = self.quantum;
+        let model = &self.model;
+        let Slot {
+            sess,
+            cached,
+            snaps,
+            snap_pool,
+        } = &mut self.slots[slot];
+        let ctx = sess.max_ctx;
         anyhow::ensure!(
             req.prompt.len() < ctx,
             "prompt of {} tokens exceeds the context of {ctx}",
@@ -726,18 +857,16 @@ impl Worker {
         // A prompt with images cannot reuse a token-prefix snapshot: two different images of the same grid have
         // the same tokens but different embeddings. Image requests restart from an empty session and drop the
         // snapshots, so a later text request cannot restore a state that contains an image either.
-        let reuse = !image_req
-            && self.cached.len() < req.prompt.len()
-            && req.prompt.starts_with(&self.cached)
-            && !self.cached.is_empty();
+        let reuse =
+            !image_req && cached.len() < req.prompt.len() && req.prompt.starts_with(&cached[..]) && !cached.is_empty();
         if !reuse {
             // The longest snapshot that is a prefix of the prompt and whose tokens the session's KV rows still hold
             // (they were not overwritten since): restart there instead of from the beginning.
-            let lcp = self.cached.iter().zip(&req.prompt).take_while(|(a, b)| a == b).count();
+            let lcp = cached.iter().zip(&req.prompt).take_while(|(a, b)| a == b).count();
             let best = if image_req {
                 None
             } else {
-                self.snaps
+                snaps
                     .iter()
                     .enumerate()
                     .filter(|(_, (toks, snap))| {
@@ -751,263 +880,301 @@ impl Worker {
             };
             match best {
                 Some(i) => {
-                    let (toks, snap) = &self.snaps[i];
-                    self.model.restore(&mut self.sess, snap)?;
-                    self.cached.truncate(toks.len());
-                    // Most recently used last.
-                    let e = self.snaps.remove(i);
-                    self.snaps.push(e);
+                    // Most recently used last; the snapshot is moved out because restoring borrows the session.
+                    let e = snaps.remove(i);
+                    model.restore(sess, &e.1)?;
+                    cached.truncate(e.0.len());
+                    snaps.push(e);
                 }
                 None => {
-                    self.model.reset_session(&mut self.sess)?;
-                    self.cached.clear();
+                    model.reset_session(sess)?;
+                    cached.clear();
                 }
             }
         }
         if image_req {
-            while let Some((_, snap)) = self.snaps.pop() {
-                self.recycle(snap);
+            while let Some((_, snap)) = snaps.pop() {
+                if snap_pool.len() < 2 {
+                    snap_pool.push(snap);
+                }
             }
         }
-        let cached_tokens = self.cached.len();
+        let cached_tokens = cached.len();
         let _ = req.events.send(Event::Started {
             prompt_tokens: req.prompt.len(),
             cached_tokens,
         });
         let t0 = Instant::now();
-        let todo = &req.prompt[cached_tokens..];
-        let mut logits = Vec::new();
-        let dbg = std::env::var_os("MALLEUS_DEBUG_SNAPS").is_some();
-        // Prefill pieces: the chunking alone. Splitting at the snapshot point costs a whole extra forward, and a
-        // forward costs what it costs whatever the number of tokens (on the 35B-A3B: 502 ms for 7 tokens against
-        // 576 ms for 306), so the mid-prompt snapshot is taken at the last piece boundary that still precedes it
-        // and skipped when there is none. The end-of-prompt snapshot covers the common case on its own: the prompt
-        // ends with the assistant marker, so it is already the point a rewritten answer still shares.
-        // An image prompt is chunked like a text one: its `positions` and its embedding inserts are per token, so
-        // they are sliced per piece. What made it a single forward, and what made a long prompt with a screenshot
-        // ask for tens of GiB of scratch in one allocation, is in `image_pieces`.
-        let chunk_tokens = prefill_chunk(&self.model);
-        let pieces: Vec<&[u32]> = if image_req && !todo.is_empty() {
+        // Prefill pieces: at most `quantum` tokens each, and never cut across an image block. An image prompt is
+        // chunked like a text one: its `positions` and its embedding inserts are per token, so they are sliced per
+        // piece; what cannot be sliced is an insert, because `forward_mm` copies it whole.
+        let total = req.prompt.len();
+        let pieces: Vec<(usize, usize)> = if image_req {
             let blocks = image_blocks(&image_inserts, self.model.cfg.hidden);
-            let pieces = image_pieces(todo.len(), &blocks, chunk_tokens);
-            if pieces.len() > 1 {
-                eprintln!("image prompt: {} tokens in {} prefill pieces", todo.len(), pieces.len());
-            }
-            pieces.into_iter().map(|(s, e)| &todo[s..e]).collect()
+            image_pieces(total - cached_tokens, &blocks, quantum)
+                .into_iter()
+                .map(|(s, e)| (cached_tokens + s, e - s))
+                .collect()
         } else {
-            todo.chunks(chunk_tokens).collect()
+            prompt_pieces(cached_tokens, total, quantum)
         };
         let snap_at = req
             .snapshot_at
-            .filter(|&c| self.max_snaps > 0 && c > cached_tokens && c < req.prompt.len());
+            .filter(|&c| max_snaps > 0 && c > cached_tokens && c < total);
         let mid = if image_req {
             None
         } else {
             snap_at.and_then(|at| {
-                let mut acc = cached_tokens;
                 let mut best = None;
-                for (i, pc) in pieces.iter().enumerate() {
-                    acc += pc.len();
-                    if acc <= at && acc < req.prompt.len() {
+                for (i, (s, len)) in pieces.iter().enumerate() {
+                    let end = s + len;
+                    if end <= at && end < total {
                         best = Some(i);
                     }
                 }
                 best
             })
         };
-        // Offset of the piece being prefilled inside `todo`: the image positions and inserts are indexed against
-        // the whole prompt (an image request always restarts from an empty session, so `cached_tokens` is 0, but
-        // the sum is what the indices mean).
-        let mut off = 0usize;
-        for (i, chunk) in pieces.iter().enumerate() {
-            if req.cancel.load(Ordering::Relaxed) {
-                self.cached.clear();
-                self.model.reset_session(&mut self.sess)?;
-                return Ok(Finish {
-                    reason: FinishReason::Cancelled,
-                    prompt_tokens: req.prompt.len(),
-                    completion_tokens: 0,
-                    prefill_s: t0.elapsed().as_secs_f64(),
-                    decode_s: 0.0,
-                });
-            }
-            let tp = Instant::now();
-            logits = if image_req {
-                let base = cached_tokens + off;
-                let pos = image_pos.as_deref().map(|p| &p[base..base + chunk.len()]);
-                let ins: Vec<(usize, &DeviceBuffer)> = image_inserts
+        ok_or_empty(pieces.len())?;
+        Ok(Active {
+            req,
+            slot,
+            phase: Phase::Prefill,
+            pieces,
+            piece: 0,
+            mid,
+            image_req,
+            image_pos,
+            image_inserts,
+            t0,
+            t1: Instant::now(),
+            prefill_s: 0.0,
+            logits: Vec::new(),
+            rng: Rng(0),
+            n: 0,
+            tok: 0,
+            pend: Vec::new(),
+            top: None,
+            reason: FinishReason::Length,
+            max_tokens,
+            ctx,
+        })
+    }
+
+    /// Processes one prefill piece; on the last one it samples the first token and hands the request to the decode
+    /// steps.
+    fn prefill_step(&mut self, act: &mut Active) -> Result<Progress> {
+        let max_snaps = self.max_snaps;
+        let model = &self.model;
+        if act.req.cancel.load(Ordering::Relaxed) {
+            self.slots[act.slot].reset(model)?;
+            act.reason = FinishReason::Cancelled;
+            act.prefill_s = act.t0.elapsed().as_secs_f64();
+            act.t1 = Instant::now();
+            return Ok(Progress::Done);
+        }
+        let (start, len) = act.pieces[act.piece];
+        let tp = Instant::now();
+        let logits = {
+            let Slot { sess, cached, .. } = &mut self.slots[act.slot];
+            let logits = if act.image_req {
+                let pos = act.image_pos.as_ref().map(|p| &p[start..start + len]);
+                let ins: Vec<(usize, &DeviceBuffer)> = act
+                    .image_inserts
                     .iter()
                     .filter_map(|(s, b)| {
-                        let rows = b.len() / (self.model.cfg.hidden * 4);
-                        (*s >= base && *s + rows <= base + chunk.len()).then(|| (*s - base, b))
+                        let rows = b.len() / (model.cfg.hidden * 4);
+                        (*s >= start && *s + rows <= start + len).then(|| (*s - start, b))
                     })
                     .collect();
-                self.model.forward_mm(&mut self.sess, chunk, pos, 1, &ins)?
+                model.forward_mm(sess, &act.req.prompt[start..start + len], pos, 1, &ins)?
             } else {
-                self.model.forward(&mut self.sess, chunk, None, 1)?
+                model.forward(sess, &act.req.prompt[start..start + len], None, 1)?
             };
-            off += chunk.len();
-            if dbg {
-                eprintln!("piece {} tok: {:.1} ms", chunk.len(), tp.elapsed().as_secs_f64() * 1e3);
-            }
-            self.cached.extend_from_slice(chunk);
-            if mid == Some(i) {
-                let ts = Instant::now();
-                self.push_snapshot();
-                if dbg {
-                    eprintln!("snap mid: {:.1} ms", ts.elapsed().as_secs_f64() * 1e3);
-                }
+            cached.extend_from_slice(&act.req.prompt[start..start + len]);
+            logits
+        };
+        if std::env::var_os("MALLEUS_DEBUG_SNAPS").is_some() {
+            eprintln!("piece {} tok: {:.1} ms", len, tp.elapsed().as_secs_f64() * 1e3);
+        }
+        act.piece += 1;
+        if act.mid == Some(act.piece - 1) {
+            let ts = Instant::now();
+            self.slots[act.slot].push_snapshot(model, max_snaps);
+            if std::env::var_os("MALLEUS_DEBUG_SNAPS").is_some() {
+                eprintln!("snap mid: {:.1} ms", ts.elapsed().as_secs_f64() * 1e3);
             }
         }
-        let prefill_s = t0.elapsed().as_secs_f64();
+        if act.piece < act.pieces.len() {
+            return Ok(Progress::More);
+        }
         // Snapshot at the end of the prompt: the next turn of a conversation usually extends it (the previous
         // answer may come back rewritten, e.g. without its reasoning, so the session itself would not match).
-        if !todo.is_empty() && self.cached.len() == req.prompt.len() {
-            let tsn = Instant::now();
-            self.push_snapshot();
-            if std::env::var_os("MALLEUS_DEBUG_SNAPS").is_some() {
-                eprintln!("snap end: {:.1} ms", tsn.elapsed().as_secs_f64() * 1e3);
-            }
+        let tsn = Instant::now();
+        self.slots[act.slot].push_snapshot(model, max_snaps);
+        if std::env::var_os("MALLEUS_DEBUG_SNAPS").is_some() {
+            eprintln!("snap end: {:.1} ms", tsn.elapsed().as_secs_f64() * 1e3);
         }
-        let t1 = Instant::now();
-        let mut rng = Rng(req.sampling.seed ^ 0x5EED);
-        let mut n = 0;
-        let mut reason = FinishReason::Length;
-        let vocab = self.model.cfg.vocab;
-        let mut tok = {
-            let pen = penalized(&logits, &req.sampling, &self.cached, &[]);
-            sample(pen.as_deref().unwrap_or(&logits), &req.sampling, &mut || rng.next_f32())
-        };
-        let mut pend = vec![tok];
-        // Emits a token with its log-probability data (None when logprobs were not asked); false when generation
-        // must stop.
-        let emit = |t: u32, top: Option<TokenProbs>, n: &mut usize, reason: &mut FinishReason| -> bool {
-            *n += 1;
-            if req.stop_tokens.contains(&t) {
-                *reason = FinishReason::Stop;
-                return false;
-            }
-            if req.events.send(Event::Token { id: t, top }).is_err() || req.cancel.load(Ordering::Relaxed) {
-                *reason = FinishReason::Cancelled;
-                return false;
-            }
-            *n < max_tokens
-        };
-        // The data of the token about to be emitted, captured from the row it was sampled from. In the raw path the
-        // row lives in `logits` until the next forward; after a verify step the next token's row is the slice saved
-        // before `l` goes out of scope, so `top` is carried from one iteration to the next.
-        let mut top = if req.logprobs {
-            Some(token_probs(&logits, tok, req.top_logprobs))
+        // First token: sampled from the last prefill piece's logits.
+        act.prefill_s = act.t0.elapsed().as_secs_f64();
+        act.t1 = Instant::now();
+        act.phase = Phase::Decode;
+        act.rng = Rng(act.req.sampling.seed ^ 0x5EED);
+        act.logits = logits;
+        let Slot { cached, .. } = &mut self.slots[act.slot];
+        let pen = penalized(&act.logits, &act.req.sampling, cached, &[]);
+        let row = pen.as_deref().unwrap_or(&act.logits);
+        let tok = sample(row, &act.req.sampling, &mut || act.rng.next_f32());
+        act.top = if act.req.logprobs {
+            Some(token_probs(row, tok, act.req.top_logprobs))
         } else {
             None
         };
-        while n < max_tokens {
-            if !emit(tok, top.take(), &mut n, &mut reason) || self.sess.len + 1 > ctx {
-                break;
-            }
-            let spec = self.drafts > 0 && self.sess.len + 2 <= ctx && self.model.mtp_pending(&self.sess) == pend.len();
-            if !spec {
-                logits = self.model.forward(&mut self.sess, &[tok], None, 1)?;
-                self.cached.push(tok);
-                let pen = penalized(&logits, &req.sampling, &self.cached, &[]);
-                let row = pen.as_deref().unwrap_or(&logits);
-                tok = sample(row, &req.sampling, &mut || rng.next_f32());
-                pend = vec![tok];
-                top = if req.logprobs {
-                    Some(token_probs(row, tok, req.top_logprobs))
-                } else {
-                    None
-                };
-                continue;
-            }
-            let max = self.drafts.min(ctx - self.sess.len - 1);
-            self.cached.push(tok);
-            let ds = draft_tokens(
-                &self.model,
-                &mut self.sess,
-                &pend,
-                max,
-                self.draft_pmin,
-                self.lookup.then_some((&self.cached[..], &req.drafts[..])),
-            )?;
-            self.cached.pop();
-            let nd = ds.len();
-            let toks: Vec<u32> = std::iter::once(tok).chain(ds.iter().copied()).collect();
-            let l = self.model.forward_verify(&mut self.sess, &toks)?;
-            self.cached.push(tok);
-            let mut acc = 0;
-            let mut y = 0;
-            while acc <= nd {
-                let row = &l[acc * vocab..(acc + 1) * vocab];
-                // A draft accepted in this round is a token of the sequence like any other: the row that samples
-                // after it must see it, or the penalty would differ from the serial step.
-                let pen = penalized(row, &req.sampling, &self.cached, &ds[..acc]);
-                let row = pen.as_deref().unwrap_or(row);
-                if acc == nd {
-                    y = sample(row, &req.sampling, &mut || rng.next_f32());
-                    break;
-                }
-                let (t, ok) = sample_spec(row, &req.sampling, ds[acc], &mut || rng.next_f32());
-                if !ok {
-                    y = t;
-                    break;
-                }
-                acc += 1;
-            }
-            self.model.rollback(&mut self.sess, nd - acc)?;
-            self.cached.extend_from_slice(&ds[..acc]);
-            // One event per accepted draft, from the verify row that produced each of them: row `i` of the verify
-            // predicts `toks[i + 1]`, so draft `i` carries the log-probabilities of slice `i`. Iterated by index so
-            // the no-logprobs path stays a plain slice over `ds` with no extra copy.
-            let mut done = false;
-            for i in 0..acc {
-                let d = ds[i];
-                let t = if req.logprobs {
-                    Some(token_probs(&l[i * vocab..(i + 1) * vocab], d, req.top_logprobs))
-                } else {
-                    None
-                };
-                if !emit(d, t, &mut n, &mut reason) {
-                    done = true;
-                    break;
-                }
-            }
-            if done {
-                break;
-            }
-            // The next token's data, from the row it was sampled off: slice `acc` is the fallback row when draft
-            // `acc` was rejected, the last verify row when all `n_drafts` were accepted.
-            top = if req.logprobs {
-                Some(token_probs(&l[acc * vocab..(acc + 1) * vocab], y, req.top_logprobs))
+        act.tok = tok;
+        act.pend = vec![tok];
+        act.logits = Vec::new();
+        Ok(Progress::More)
+    }
+
+    /// Runs one decode step: one token, or one verify round when the MTP head is drafting.
+    fn decode_step(&mut self, act: &mut Active) -> Result<Progress> {
+        let (drafts, draft_pmin, lookup) = (self.drafts, self.draft_pmin, self.lookup);
+        let model = &self.model;
+        let Slot { sess, cached, .. } = &mut self.slots[act.slot];
+        let vocab = model.cfg.vocab;
+        if act.n >= act.max_tokens || sess.len + 1 > act.ctx {
+            return Ok(Progress::Done);
+        }
+        let (tok, top) = (act.tok, act.top.take());
+        if !act.emit(tok, top) {
+            return Ok(Progress::Done);
+        }
+        let spec = drafts > 0 && sess.len + 2 <= act.ctx && model.mtp_pending(sess) == act.pend.len();
+        if !spec {
+            let logits = model.forward(sess, &[tok], None, 1)?;
+            cached.push(tok);
+            let pen = penalized(&logits, &act.req.sampling, cached, &[]);
+            let row = pen.as_deref().unwrap_or(&logits);
+            let next = sample(row, &act.req.sampling, &mut || act.rng.next_f32());
+            act.top = if act.req.logprobs {
+                Some(token_probs(row, next, act.req.top_logprobs))
             } else {
                 None
             };
-            pend = ds[..acc].to_vec();
-            pend.push(y);
-            tok = y;
+            act.pend = vec![next];
+            act.tok = next;
+            return Ok(Progress::More);
         }
-        Ok(Finish {
-            reason,
-            prompt_tokens: req.prompt.len(),
-            completion_tokens: n,
-            prefill_s,
-            decode_s: t1.elapsed().as_secs_f64(),
-        })
+        let max = drafts.min(act.ctx - sess.len - 1);
+        cached.push(tok);
+        let ds = draft_tokens(
+            model,
+            sess,
+            &act.pend,
+            max,
+            draft_pmin,
+            lookup.then_some((&cached[..], &act.req.drafts[..])),
+        )?;
+        cached.pop();
+        let nd = ds.len();
+        let toks: Vec<u32> = std::iter::once(tok).chain(ds.iter().copied()).collect();
+        let l = model.forward_verify(sess, &toks)?;
+        cached.push(tok);
+        let mut acc = 0;
+        let mut y = 0;
+        while acc <= nd {
+            let row = &l[acc * vocab..(acc + 1) * vocab];
+            // A draft accepted in this round is a token of the sequence like any other: the row that samples
+            // after it must see it, or the penalty would differ from the serial step.
+            let pen = penalized(row, &act.req.sampling, cached, &ds[..acc]);
+            let row = pen.as_deref().unwrap_or(row);
+            if acc == nd {
+                y = sample(row, &act.req.sampling, &mut || act.rng.next_f32());
+                break;
+            }
+            let (t, ok) = sample_spec(row, &act.req.sampling, ds[acc], &mut || act.rng.next_f32());
+            if !ok {
+                y = t;
+                break;
+            }
+            acc += 1;
+        }
+        model.rollback(sess, nd - acc)?;
+        cached.extend_from_slice(&ds[..acc]);
+        // One event per accepted draft, from the verify row that produced each of them: row `i` of the verify
+        // predicts `toks[i + 1]`, so draft `i` carries the log-probabilities of slice `i`.
+        for i in 0..acc {
+            let d = ds[i];
+            let t = if act.req.logprobs {
+                Some(token_probs(&l[i * vocab..(i + 1) * vocab], d, act.req.top_logprobs))
+            } else {
+                None
+            };
+            if !act.emit(d, t) {
+                return Ok(Progress::Done);
+            }
+        }
+        // The next token's data, from the row it was sampled off: slice `acc` is the fallback row when draft
+        // `acc` was rejected, the last verify row when all `n_drafts` were accepted.
+        act.top = if act.req.logprobs {
+            Some(token_probs(&l[acc * vocab..(acc + 1) * vocab], y, act.req.top_logprobs))
+        } else {
+            None
+        };
+        act.pend = ds[..acc].to_vec();
+        act.pend.push(y);
+        act.tok = y;
+        Ok(Progress::More)
     }
+}
+
+/// `begin` refuses a prompt that leaves nothing to prefill: it would sample the first token from an empty logits
+/// row. (A prompt is at least one token and `cached` is always a proper prefix of it, so this is a guard, not a
+/// branch.)
+fn ok_or_empty(pieces: usize) -> Result<()> {
+    anyhow::ensure!(pieces > 0, "nothing to prefill");
+    Ok(())
 }
 
 /// Builds the GPU state of one model. It runs on the GPU thread: `load` must too, because the HIP context is per
 /// thread. The warm-up allocates the scratch of one prefill chunk before the first request.
+/// Prompt tokens per prefill step when several sessions take turns (`MALLEUS_PREFILL_QUANTUM`).
+///
+/// Measured on Qwen3.8-27B (gfx1150, 2026-11-18): a neighbour decodes one token per `quantum / prefill_rate` seconds
+/// while a long prefill runs, and the long prompt itself pays the smaller piece only when it gets short. A 20 043
+/// token prompt alone: 178 tok/s at 2048 and at 256, 155 at 128. The same prompt with a second client generating 48
+/// tokens: 114 s / 119 s (2048), 121 s / 76 s (256), 139 s / 46 s (128), against 113 s / 120 s with one session
+/// (no interleaving at all). 256 is the point where the neighbour's stream keeps moving (a token every ~1.5 s) and
+/// the prefill pays nothing on its own; merging the decode rows into the prefill forward removes the tradeoff
+/// entirely (issue #33, v2).
+const DEFAULT_PREFILL_QUANTUM: usize = 256;
+
 fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Result<Model>) -> Result<Worker> {
     let ctx = spec.ctx;
     let model = load(spec)?;
-    let mut sess = model.new_session(ctx)?;
+    // Sessions resident: `MALLEUS_SLOTS`, one session each, with the context split between them as a batched server
+    // does. One slot is what this server always did: one session holding the whole context.
+    let slots = malleus_model::memplan::sessions().max(1);
+    let per_slot = (ctx / slots).max(2);
+    let mut sessions = Vec::with_capacity(slots);
+    for _ in 0..slots {
+        sessions.push(Slot {
+            sess: model.new_session(per_slot)?,
+            cached: Vec::new(),
+            snaps: Vec::new(),
+            snap_pool: Vec::new(),
+        });
+    }
+    if slots > 1 {
+        eprintln!("slots: {slots} sessions of {per_slot} tokens ({ctx} in all)");
+    }
+    let chunk = prefill_chunk(&model).min(per_slot.saturating_sub(1)).max(1);
     if std::env::var("MALLEUS_WARMUP").map_or(true, |v| v != "0") {
-        let n = prefill_chunk(&model).min(ctx.saturating_sub(1));
+        let n = chunk;
         let toks: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 50000).collect();
         let t0 = Instant::now();
-        model.forward(&mut sess, &toks, None, 1)?;
-        model.reset_session(&mut sess)?;
+        model.forward(&mut sessions[0].sess, &toks, None, 1)?;
+        model.reset_session(&mut sessions[0].sess)?;
         eprintln!("warm-up: {n} tokens in {:.1}s", t0.elapsed().as_secs_f64());
         // The number the pre-flight's estimate is checked against: the weights, one session and the working set of a
         // full chunk are all allocated now.
@@ -1016,6 +1183,25 @@ fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Resu
             malleus_hip::device_bytes_live() as f64 / (1u64 << 30) as f64
         );
     }
+    // Prompt tokens per step: with one slot the whole chunk, exactly as before, because nobody waits for it; with
+    // several, a slice of it, because one piece is what the sessions decoding next to it wait for.
+    let quantum = env_or(
+        "MALLEUS_PREFILL_QUANTUM",
+        if slots == 1 {
+            chunk
+        } else {
+            chunk.min(DEFAULT_PREFILL_QUANTUM)
+        },
+    )
+    .clamp(1, chunk);
+    // Prompt snapshots are per session, so the total is split: N sessions with 8 snapshots each would otherwise
+    // keep N times the state copies the memory plan was written for.
+    let snaps_total: usize = env_or("MALLEUS_PROMPT_SNAPSHOTS", 8);
+    let max_snaps = if snaps_total == 0 {
+        0
+    } else {
+        (snaps_total / slots).max(1)
+    };
     Ok(Worker {
         spec: spec.clone(),
         drafts: if model.has_mtp() {
@@ -1025,13 +1211,28 @@ fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Resu
         },
         draft_pmin: env_or("MALLEUS_DRAFT_PMIN", DEFAULT_DRAFT_PMIN),
         lookup: std::env::var("MALLEUS_LOOKUP").map_or(true, |v| v != "0"),
-        snaps: Vec::new(),
-        snap_pool: Vec::new(),
-        max_snaps: env_or("MALLEUS_PROMPT_SNAPSHOTS", 8),
+        max_snaps,
+        quantum,
         model,
-        sess,
-        cached: Vec::new(),
+        slots: sessions,
     })
+}
+
+/// Queues what a command asks for: a request goes to the FIFO the scheduler admits from, a load or an unload waits
+/// in `deferred` until the requests in flight are done, so it never preempts them.
+fn route(
+    cmd: Command,
+    pending: &mut std::collections::VecDeque<Box<Request>>,
+    deferred: &mut std::collections::VecDeque<Command>,
+    queued: &AtomicUsize,
+) {
+    match cmd {
+        Command::Request(req) => {
+            queued.fetch_sub(1, Ordering::Relaxed);
+            pending.push_back(req);
+        }
+        other => deferred.push_back(other),
+    }
 }
 
 /// Makes `model` the resident one, loading it when it is not already. The old model has to go first: it is dropped,
@@ -1073,9 +1274,6 @@ fn ensure_loaded(
 }
 
 impl Engine {
-    /// Starts the GPU thread. `load` runs on that thread and must build the model (HIP context is per thread). When
-    /// `initial` is set it is loaded before `start` returns, preserving the old startup check; otherwise the first
-    /// request loads its model.
     pub fn start(
         initial: Option<Arc<ModelSpec>>,
         mut load: impl FnMut(&ModelSpec) -> Result<Model> + Send + 'static,
@@ -1088,9 +1286,13 @@ impl Engine {
         let b2 = busy_since.clone();
         let status = Status::default();
         let s2 = status.clone();
+        let slots = malleus_model::memplan::sessions().max(1);
         std::thread::Builder::new().name("malleus-gpu".into()).spawn(move || {
             let status = s2;
-            let mut worker = None;
+            let mut worker: Option<Worker> = None;
+            let mut pending: std::collections::VecDeque<Box<Request>> = std::collections::VecDeque::new();
+            let mut deferred: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
+            let mut active: Vec<Active> = Vec::new();
             if let Some(spec) = initial {
                 match ensure_loaded(&mut worker, &spec, &mut load, &status, None) {
                     Ok(()) => {}
@@ -1101,47 +1303,111 @@ impl Engine {
                 }
             }
             let _ = ready_tx.send(Ok(()));
-            while let Ok(cmd) = rx.recv() {
-                match cmd {
-                    Command::Request(req) => {
-                        let req = *req;
-                        q2.fetch_sub(1, Ordering::Relaxed);
-                        let events = req.events.clone();
-                        let model = req.model.clone();
-                        if let Err(e) = ensure_loaded(&mut worker, &model, &mut load, &status, Some(&events)) {
-                            let _ = events.send(Event::Error(format!("loading model `{}`: {e:#}", model.id)));
-                            continue;
-                        }
-                        // The watchdog counts the request, not the model load: a slow disk must not look like a hung
-                        // kernel.
-                        b2.store(now_ms(), Ordering::Relaxed);
-                        let served = worker.as_mut().expect("a worker is loaded before serving").serve(req);
-                        b2.store(0, Ordering::Relaxed);
-                        match served {
-                            Ok(f) => {
-                                let _ = events.send(Event::Done(f));
-                            }
-                            Err(e) => {
-                                if let Some(w) = worker.as_mut() {
-                                    w.cached.clear();
+            loop {
+                if active.is_empty() && pending.is_empty() && deferred.is_empty() {
+                    // Nothing to do: sleep on the channel, as an idle service must.
+                    match rx.recv() {
+                        Ok(cmd) => route(cmd, &mut pending, &mut deferred, &q2),
+                        Err(_) => break,
+                    }
+                }
+                while let Ok(cmd) = rx.try_recv() {
+                    route(cmd, &mut pending, &mut deferred, &q2);
+                }
+                // A load or an unload sits behind the queue and the requests in flight, as it always has.
+                if active.is_empty() && pending.is_empty() {
+                    while let Some(cmd) = deferred.pop_front() {
+                        match cmd {
+                            Command::Load(model) => {
+                                if let Err(e) = ensure_loaded(&mut worker, &model, &mut load, &status, None) {
+                                    eprintln!("loading model {} failed: {e:#}", model.id);
                                 }
-                                let _ = events.send(Event::Error(format!("{e:#}")));
                             }
+                            Command::Unload(id) => {
+                                if worker.as_ref().is_some_and(|w| w.spec.id == id) {
+                                    worker = None;
+                                    let _ = malleus_hip::synchronize();
+                                    status.set_unloaded(&id);
+                                    eprintln!("unloaded model {id}");
+                                }
+                            }
+                            Command::Request(_) => unreachable!("requests are routed to `pending`"),
                         }
                     }
-                    Command::Load(model) => {
-                        if let Err(e) = ensure_loaded(&mut worker, &model, &mut load, &status, None) {
-                            eprintln!("loading model {} failed: {e:#}", model.id);
+                }
+                // Admit from the FIFO: one model resident, one request per free slot.
+                while active.len() < slots {
+                    let Some(head) = pending.front() else { break };
+                    let want = head.model.clone();
+                    if !worker.as_ref().is_some_and(|w| w.spec.id == want.id) {
+                        if !active.is_empty() {
+                            // The resident sessions come first; the switch waits for them.
+                            break;
+                        }
+                        let req = pending.pop_front().expect("a queued request");
+                        let events = req.events.clone();
+                        if let Err(e) = ensure_loaded(&mut worker, &want, &mut load, &status, Some(&events)) {
+                            let _ = events.send(Event::Error(format!("loading model `{}`: {e:#}", want.id)));
+                        } else {
+                            pending.push_front(req);
+                        }
+                        continue;
+                    }
+                    let req = pending.pop_front().expect("a queued request");
+                    let events = req.events.clone();
+                    // The slot whose session already holds the longest prefix of this prompt, else any free one.
+                    let busy: Vec<usize> = active.iter().map(|a| a.slot).collect();
+                    let free: Vec<usize> = (0..slots).filter(|s| !busy.contains(s)).collect();
+                    let slot = {
+                        let w = worker.as_ref().expect("a worker is loaded before serving");
+                        let cached: Vec<&[u32]> = w.slots.iter().map(|s| &s.cached[..]).collect();
+                        pick_slot(&free, &cached, &req.prompt).unwrap_or_else(|| free.first().copied().unwrap_or(0))
+                    };
+                    let w = worker.as_mut().expect("a worker is loaded before serving");
+                    match w.begin(*req, slot) {
+                        Ok(act) => {
+                            // The watchdog counts the request, not the model load: a slow disk must not look like a
+                            // hung kernel.
+                            if active.is_empty() {
+                                b2.store(now_ms(), Ordering::Relaxed);
+                            }
+                            active.push(act);
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Error(format!("{e:#}")));
                         }
                     }
-                    Command::Unload(id) => {
-                        if worker.as_ref().is_some_and(|w| w.spec.id == id) {
-                            worker = None;
-                            let _ = malleus_hip::synchronize();
-                            status.set_unloaded(&id);
-                            eprintln!("unloaded model {id}");
+                }
+                if active.is_empty() {
+                    b2.store(0, Ordering::Relaxed);
+                    continue;
+                }
+                // One round: every active session gets one step, in arrival order. A session that finishes frees its
+                // slot for the next round, so a queued request joins without waiting for the others to drain.
+                let mut i = 0;
+                while i < active.len() {
+                    let w = worker.as_mut().expect("a worker is loaded before serving");
+                    let step = match active[i].phase {
+                        Phase::Prefill => w.prefill_step(&mut active[i]),
+                        Phase::Decode => w.decode_step(&mut active[i]),
+                    };
+                    match step {
+                        Ok(Progress::More) => i += 1,
+                        Ok(Progress::Done) => {
+                            let act = active.remove(i);
+                            let _ = act.req.events.send(Event::Done(act.finish()));
+                        }
+                        Err(e) => {
+                            let act = active.remove(i);
+                            if let Some(w) = worker.as_mut() {
+                                let _ = w.slots[act.slot].reset(&w.model);
+                            }
+                            let _ = act.req.events.send(Event::Error(format!("{e:#}")));
                         }
                     }
+                }
+                if active.is_empty() {
+                    b2.store(0, Ordering::Relaxed);
                 }
             }
         })?;
@@ -1238,6 +1504,38 @@ fn start_watchdog(busy_since: Arc<AtomicU64>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pieces of a prompt tile it exactly: no gap, no overlap, never more than the quantum, one token at least.
+    #[test]
+    fn prompt_pieces_tile_the_prompt() {
+        for (start, end, q) in [(0usize, 5000usize, 2048usize), (0, 1, 8), (17, 18, 4), (0, 4096, 4096)] {
+            let p = prompt_pieces(start, end, q);
+            assert_eq!(p.first().unwrap().0, start, "the pieces start at the first token");
+            let last = p.last().unwrap();
+            assert_eq!(last.0 + last.1, end, "the pieces reach the last token");
+            for w in p.windows(2) {
+                assert_eq!(w[0].0 + w[0].1, w[1].0, "contiguous: no gaps and no overlaps");
+            }
+            for (s, len) in &p {
+                assert!(*len > 0 && *len <= q, "piece {s}+{len} over the quantum {q}");
+            }
+        }
+        assert!(prompt_pieces(5, 5, 16).is_empty(), "nothing left to prefill");
+    }
+
+    /// A conversation keeps hitting its own prompt cache: the free slot that already holds a prefix of the prompt
+    /// wins, and with nothing in common the lowest index does (a fresh request does not walk from slot to slot).
+    #[test]
+    fn the_slot_with_the_longest_prefix_wins() {
+        let a = [1u32, 2, 3, 4, 5, 6];
+        let b = [1u32, 2, 3, 9];
+        let cached: [&[u32]; 2] = [&a, &b];
+        assert_eq!(pick_slot(&[0, 1], &cached, &[1, 2, 3, 4, 5, 7]), Some(0));
+        assert_eq!(pick_slot(&[0, 1], &cached, &[1, 2, 3, 9, 9]), Some(1));
+        assert_eq!(pick_slot(&[0, 1], &cached, &[7, 7]), Some(0));
+        assert_eq!(pick_slot(&[1], &cached, &[1, 2, 3, 4]), Some(1));
+        assert_eq!(pick_slot(&[], &cached, &[1]), None, "no free slot, no admission");
+    }
 
     #[test]
     fn image_pieces_cover_the_prompt_and_never_cut_a_block() {

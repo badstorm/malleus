@@ -254,7 +254,12 @@ fn gib(bytes: u64) -> f64 {
 /// `path_label` is what to show in the messages (the model path as the user gave it).
 pub fn check(label: &str, ctx: usize, usage: &Usage, info: Option<MemInfo>) -> Result<()> {
     let state = if usage.sessions > 1 {
-        format!("{:.1} GiB of state ({} sessions)", gib(usage.state()), usage.sessions)
+        format!(
+            "{:.1} GiB of state ({} sessions of {} tokens)",
+            gib(usage.state()),
+            usage.sessions,
+            ctx
+        )
     } else {
         format!("{:.1} GiB of state", gib(usage.state()))
     };
@@ -333,7 +338,9 @@ pub fn host_reserve_bytes(tables: u64) -> u64 {
     env_gib("MALLEUS_HOST_RESERVE_GIB").unwrap_or(8 * GIB).min(tables)
 }
 
-/// Sessions the check assumes: `MALLEUS_SLOTS`, default 1. One in-flight request holds one session.
+/// Sessions the scheduler keeps resident: `MALLEUS_SLOTS`, default 1. One in-flight request holds one session and
+/// the context is split between them (`ctx / slots` each), so this is also the depth of the concurrency: with one
+/// slot the server serves one request at a time, exactly as it always did.
 pub fn sessions() -> usize {
     std::env::var("MALLEUS_SLOTS")
         .ok()
