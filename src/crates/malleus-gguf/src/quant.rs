@@ -1,5 +1,5 @@
-//! MLS4 / MLS8 weight formats (see PLAN.md §2.1). Both operate on rows rotated by a randomized
-//! Hadamard transform on 128-wide blocks, with fixed signs derived from `HADAMARD_SEED`.
+//! MLS2 / MLS3 / MLS4 / MLS8 weight formats. All operate on rows rotated by a randomized Hadamard transform on
+//! 128-wide blocks, with fixed signs derived from `HADAMARD_SEED`.
 
 pub const BLOCK: usize = 128;
 pub const HADAMARD_SEED: u64 = 0x4D4C_5334_0001;
@@ -10,6 +10,12 @@ pub const INT3_GROUP_BYTES: usize = BLOCK * 3 / 8;
 
 /// MLS3 codes are the 8 levels -4..3 stored as `value + 4`.
 pub const INT3_OFFSET: i32 = 4;
+
+/// Bytes of 2-bit codes of one group: 4 codes per byte, LSB-first.
+pub const INT2_GROUP_BYTES: usize = BLOCK / 4;
+
+/// Uniform MLS2 codes are the 4 levels -2..1 stored as `value + 2`.
+pub const INT2_OFFSET: i32 = 2;
 
 pub fn hadamard_signs(seed: u64) -> [i8; BLOCK] {
     let mut s = seed;
@@ -170,6 +176,99 @@ pub fn dequant_int3(bytes: &[u8], s: f32, out: &mut [f32; BLOCK]) {
     }
 }
 
+/// Which four-level grid an MLS2 tensor was packed with. The container carries the choice in metadata: the packed
+/// bytes are the same size either way, and a decoder that assumes the wrong grid reads plausible noise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Int2Grid {
+    /// The four levels -2, -1, 0, 1 of MLS4/MLS3, exactly (stored as `value + 2`).
+    Uniform,
+    /// A symmetric non-uniform grid taken from the `e2m1` table: -1.5, -0.5, 0.5, 1.5. A four-level code cannot
+    /// carry the whole e2m1 table (that is a 16-entry table, four bits per code), so MLS2 keeps the shape of that
+    /// table and not its width.
+    E2m1,
+}
+
+impl Int2Grid {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Int2Grid::Uniform => "uniform",
+            Int2Grid::E2m1 => "e2m1",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "uniform" => Some(Int2Grid::Uniform),
+            "e2m1" => Some(Int2Grid::E2m1),
+            _ => None,
+        }
+    }
+
+    /// The four levels in code order.
+    pub fn levels(self) -> [f32; 4] {
+        match self {
+            Int2Grid::Uniform => [-2.0, -1.0, 0.0, 1.0],
+            Int2Grid::E2m1 => [-1.5, -0.5, 0.5, 1.5],
+        }
+    }
+}
+
+/// Code of a value already divided by the scale, on `grid`.
+fn int2_code(v: f32, grid: Int2Grid) -> u32 {
+    let levels = grid.levels();
+    let mut best = 0usize;
+    let mut err = (v - levels[0]).abs();
+    for (i, &level) in levels.iter().enumerate().skip(1) {
+        let e = (v - level).abs();
+        if e < err {
+            best = i;
+            err = e;
+        }
+    }
+    best as u32
+}
+
+/// Quantizes one rotated group of 128 to 2-bit codes with an error-minimizing scale.
+///
+/// Codes are packed LSB-first, 4 per byte: code `i` lives at bits `2i..2i+2` of byte `i / 4`. The scale search
+/// mirrors `quantize_group_int4`; the range is wider than that format's because four levels leave more room for the
+/// scale to trade clipping against resolution.
+pub fn quantize_group_int2(g: &[f32], grid: Int2Grid) -> ([u8; INT2_GROUP_BYTES], f32) {
+    let amax = g.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let mut best = (f32::INFINITY, 0f32);
+    if amax > 0.0 {
+        for step in 0..=80 {
+            let s = amax / (1.0 + step as f32 * 0.025);
+            let mut err = 0f32;
+            for &v in g {
+                let q = grid.levels()[int2_code(v / s, grid) as usize] * s;
+                let d = v - q;
+                err += d * d;
+            }
+            if err < best.0 {
+                best = (err, s);
+            }
+        }
+    }
+    let s = half::f16::from_f32(best.1).to_f32();
+    let mut out = [0u8; INT2_GROUP_BYTES];
+    for (i, &v) in g.iter().enumerate() {
+        let code = if s > 0.0 { int2_code(v / s, grid) } else { 0 };
+        out[i / 4] |= (code as u8) << ((i % 4) * 2);
+    }
+    (out, s)
+}
+
+/// Inverse of `quantize_group_int2`: 32 bytes and a scale into 128 values.
+pub fn dequant_int2(bytes: &[u8], s: f32, grid: Int2Grid, out: &mut [f32; BLOCK]) {
+    debug_assert!(bytes.len() >= INT2_GROUP_BYTES);
+    let levels = grid.levels();
+    for (i, o) in out.iter_mut().enumerate() {
+        let code = ((bytes[i / 4] >> ((i % 4) * 2)) & 3) as usize;
+        *o = levels[code] * s;
+    }
+}
+
 /// Quantizes a full rotated row to int8 with a per-row scale. Returns the scale.
 pub fn quantize_row_int8(row: &[f32], out: &mut [i8]) -> f32 {
     let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -233,6 +332,85 @@ mod tests {
         let err: f32 = wr.iter().zip(&dq).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
         let norm: f32 = wr.iter().map(|a| a * a).sum::<f32>().sqrt();
         assert!(err / norm < 0.12, "relative error {}", err / norm);
+    }
+
+    #[test]
+    fn int2_packing_roundtrips_every_level() {
+        for grid in [Int2Grid::Uniform, Int2Grid::E2m1] {
+            let levels = grid.levels();
+            for offset in 0..4 {
+                let g: Vec<f32> = (0..BLOCK).map(|i| levels[(i + offset) % 4] * 0.25).collect();
+                let (bytes, s) = quantize_group_int2(&g, grid);
+                assert_eq!(bytes.len(), INT2_GROUP_BYTES);
+                let mut dq = [0f32; BLOCK];
+                dequant_int2(&bytes, s, grid, &mut dq);
+                for (i, (&a, &b)) in g.iter().zip(&dq).enumerate() {
+                    assert!(
+                        (a - b).abs() < 1e-6 * s.abs().max(1.0),
+                        "{grid:?} code {i}: {a} vs {b} (scale {s})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn int2_is_exact_on_representable_values() {
+        // Scale 0.25 makes both grids exactly representable.
+        for grid in [Int2Grid::Uniform, Int2Grid::E2m1] {
+            let g: Vec<f32> = (0..BLOCK).map(|i| grid.levels()[i % 4] * 0.25).collect();
+            let (bytes, s) = quantize_group_int2(&g, grid);
+            assert!((s - 0.25).abs() < 1e-3, "{grid:?}: scale {s}");
+            let mut dq = [0f32; BLOCK];
+            dequant_int2(&bytes, s, grid, &mut dq);
+            for (a, b) in g.iter().zip(&dq) {
+                assert!((a - b).abs() < 1e-6, "{grid:?}: {a} vs {b}");
+            }
+        }
+    }
+
+    /// 2 bits must cost more error than 3 and 4: that gap is why MLS2 is a routed-expert format, not a whole-model
+    /// one, and the gap to MLS3 is the number the conversion decision rests on.
+    #[test]
+    fn int2_error_is_worse_than_int3_and_int4() {
+        let signs = hadamard_signs(HADAMARD_SEED);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        };
+        let (mut e2u, mut e2e, mut e3, mut e4) = (0f64, 0f64, 0f64, 0f64);
+        for _ in 0..64 {
+            let mut g: Vec<f32> = (0..BLOCK).map(|_| rnd()).collect();
+            rotate_row(&mut g, &signs);
+            let norm = g.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let rel = |dq: &[f32; BLOCK]| {
+                g.iter()
+                    .zip(dq)
+                    .map(|(a, b)| ((a - b) as f64).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+                    / norm
+            };
+            let (nu, su) = quantize_group_int2(&g, Int2Grid::Uniform);
+            let (ne, se) = quantize_group_int2(&g, Int2Grid::E2m1);
+            let (n3, s3) = quantize_group_int3(&g);
+            let (n4, s4) = quantize_group_int4(&g);
+            let (mut d2u, mut d2e, mut d3, mut d4) = ([0f32; BLOCK], [0f32; BLOCK], [0f32; BLOCK], [0f32; BLOCK]);
+            dequant_int2(&nu, su, Int2Grid::Uniform, &mut d2u);
+            dequant_int2(&ne, se, Int2Grid::E2m1, &mut d2e);
+            dequant_int3(&n3, s3, &mut d3);
+            dequant_int4(&n4, s4, &mut d4);
+            e2u += rel(&d2u);
+            e2e += rel(&d2e);
+            e3 += rel(&d3);
+            e4 += rel(&d4);
+        }
+        let (e2u, e2e, e3, e4) = (e2u / 64.0, e2e / 64.0, e3 / 64.0, e4 / 64.0);
+        println!("relative L2 error: MLS2 uniform {e2u:.4}  MLS2 e2m1 {e2e:.4}  MLS3 {e3:.4}  MLS4 {e4:.4}");
+        assert!(e4 < e3 && e3 < e2e, "{e2u} {e2e} {e3} {e4}");
+        assert!(e2e < 3.5 * e4, "int2 should not be far worse than int4: {e2e} vs {e4}");
+        assert!(e2e < 0.45, "int2 relative error {e2e} too large");
     }
 
     /// Every one of the 128 bit positions is exercised: code i sits at bit 3i, so the shift cycles through

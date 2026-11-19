@@ -68,6 +68,12 @@ HC_FAMILIES = [
 ]
 # Experts with fewer routed calibration tokens than this keep round-to-nearest.
 MIN_EXPERT_TOKENS = 256
+# MLS2 grid(s): four levels and a scale per group of 128. "e2m1" is the symmetric subset of the e2m1 table that a
+# two-bit code can carry: -1.5, -0.5, 0.5, 1.5 (the full 16-entry table needs four bits per code).
+MLS2_GRIDS = {
+    "uniform": [-2.0, -1.0, 0.0, 1.0],
+    "e2m1": [-1.5, -0.5, 0.5, 1.5],
+}
 # Above this checkpoint size the bf16 model cannot be resident with the Hessians and the GPTQ working set, so the
 # layers are built one at a time. Qwen3.8-27B is 54 GB and loads whole; Qwen3.8-Flash-Next is 336 GB and cannot.
 LAYERWISE_BYTES = 100 << 30
@@ -134,6 +140,72 @@ def rtn(w):
         sl = slice(g * BLOCK, (g + 1) * BLOCK)
         s[..., g] = best_scale(w[..., sl])
         q[..., sl] = (w[..., sl] / s[..., g:g + 1]).round().clamp(-8, 7)
+    return q, s
+
+
+def nearest2(w, s, levels):
+    """Dequantized MLS2 weights and the code indices: a 4-level grid, nearest level per weight."""
+    v = w / s[..., None]
+    best = torch.full_like(v, levels[0])
+    err = (v - levels[0]).abs()
+    for level in levels[1:]:
+        e = (v - level).abs()
+        better = e < err
+        best = torch.where(better, torch.full_like(v, level), best)
+        err = torch.where(better, e, err)
+    return best, best
+
+
+def best_scale2(w, levels):
+    """Per-row error-minimizing scale for groups w [..., N, 128] on a four-level grid, fp16-rounded."""
+    amax = w.abs().amax(-1).clamp_min(1e-12)
+    best_err = torch.full_like(amax, float("inf"))
+    best_s = amax
+    for step in range(81):
+        s = amax / (1.0 + step * 0.025)
+        q, _ = nearest2(w, s, levels)
+        err = ((w - q * s[..., None]) ** 2).sum(-1)
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        best_s = torch.where(better, s, best_s)
+    return best_s.half().clamp_min(torch.finfo(torch.float16).tiny).float()
+
+
+def rtn2(w, levels):
+    q = torch.empty_like(w)
+    s = torch.empty(*w.shape[:-1], w.shape[-1] // BLOCK, device=w.device)
+    for g in range(w.shape[-1] // BLOCK):
+        sl = slice(g * BLOCK, (g + 1) * BLOCK)
+        s[..., g] = best_scale2(w[..., sl], levels)
+        q[..., sl], _ = nearest2(w[..., sl], s[..., g:g + 1], levels)
+    return q, s
+
+
+def gptq2(w, hinv, dead, levels):
+    """GPTQ on a four-level MLS2 grid; same batched shape as `gptq`."""
+    if w.dim() == 2:
+        q, s = gptq2(w[None], hinv[None], dead[None], levels)
+        return q[0], s[0]
+    w = w.clone()
+    b, n, k = w.shape
+    w.masked_fill_(dead[:, None, :], 0.0)
+    q = torch.zeros_like(w)
+    s = torch.zeros(b, n, k // BLOCK, device=w.device)
+    for g in range(k // BLOCK):
+        i1, i2 = g * BLOCK, (g + 1) * BLOCK
+        w1 = w[:, :, i1:i2].clone()
+        e1 = torch.zeros_like(w1)
+        hi = hinv[:, i1:i2, i1:i2]
+        sc = best_scale2(w1, levels)
+        s[:, :, g] = sc
+        for i in range(BLOCK):
+            col = w1[:, :, i]
+            qc, _ = nearest2(col, sc, levels)
+            q[:, :, i1 + i] = qc
+            err = (col - qc * sc) / hi[:, i, i][:, None]
+            w1[:, :, i:] -= err[:, :, None] * hi[:, i, i:][:, None, :]
+            e1[:, :, i] = err
+        w[:, :, i2:] -= e1 @ hinv[:, i1:i2, i2:]
     return q, s
 
 
@@ -402,8 +474,9 @@ class expert_stats:
     """Replaces the forward of a stacked-experts module to accumulate, per expert, H of the rotated gate_up inputs
     (tokens routed to it) and of the rotated down inputs; quantize() then runs batched GPTQ on all experts."""
 
-    def __init__(self, mod, rot):
+    def __init__(self, mod, rot, mls2_levels=None):
         self.mod, self.rot = mod, rot
+        self.mls2_levels = mls2_levels
         e, n2, k = mod.gate_up_proj.shape
         dev = mod.gate_up_proj.device
         self.h_gu = torch.zeros(e, k, k, device=dev)
@@ -455,6 +528,11 @@ class expert_stats:
                         hinv[j], dead[j] = inverse_factor(hb[j], damp)
                 wt = rotate(p[sl].float(), rot)
                 qg, sg = gptq(wt, hinv, dead)
+                loss2 = None
+                if self.mls2_levels is not None:
+                    q2, s2 = rtn2(wt, self.mls2_levels)
+                    lg2, sg2 = gptq2(wt, hinv, dead, self.mls2_levels)
+                    loss2 = (q2, s2, lg2, sg2)
                 # A scale that is not finite poisons the whole expert: the packed scales reach the converter as
                 # they are, and a NaN there is a NaN in the model. Fall back to RTN for the experts it happens to
                 # and say so, rather than writing a model nobody can load.
@@ -469,11 +547,20 @@ class expert_stats:
                 r = rare[sl].to(h.device)
                 qg[r], sg[r] = qr[r], sr[r]
                 deq = qg * sg.repeat_interleave(BLOCK, -1)
+                if loss2 is not None:
+                    q2, s2, lg2, sg2 = loss2
+                    d2 = q2 * s2.repeat_interleave(BLOCK, -1)
+                    dg2 = lg2 * sg2.repeat_interleave(BLOCK, -1)
+                    loss["rtn2"] = loss.get("rtn2", 0.0)
+                    loss["gptq2"] = loss.get("gptq2", 0.0)
                 for j in range(hb.shape[0]):
                     base = max(proxy_loss(wt[j], hb[j]), 1e-30)
                     dr = wt[j] - qr[j] * sr[j].repeat_interleave(BLOCK, -1)
                     loss["rtn"] += proxy_loss(dr, hb[j]) / base / n_exp
                     loss["gptq"] += proxy_loss(wt[j] - deq[j], hb[j]) / base / n_exp
+                    if loss2 is not None:
+                        loss["rtn2"] += proxy_loss(wt[j] - d2[j], hb[j]) / base / n_exp
+                        loss["gptq2"] += proxy_loss(wt[j] - dg2[j], hb[j]) / base / n_exp
                 p.data[sl] = unrotate(deq, rot).reshape(deq.shape).to(p.dtype)
                 tq, ts = pack(qg, sg)
                 qs.append(tq)
@@ -505,6 +592,11 @@ def main():
                     help="calibrate the routed experts only, leaving every other family as the converter ships "
                          "it (round-to-nearest): isolates the effect of the experts on the model's quality, "
                          "which is what a checkpoint without their int8 prefill copy pays for")
+    ap.add_argument("--mls2-report", action="store_true",
+                    help="also report the reconstruction error of a four-level MLS2 grid next to rtn/gptq; the "
+                         "output stays MLS4, this is a screen and not a conversion")
+    ap.add_argument("--mls2-grid", default="e2m1", choices=sorted(MLS2_GRIDS),
+                    help="MLS2 grid for --mls2-report")
     ap.add_argument("--hc", action="store_true",
                     help="also calibrate the hyper-connection mixing (input_mix_weight_down/up, "
                          "block_inject_weight) of every layer, but not the final hyper_connection_mixer")
@@ -530,6 +622,7 @@ def main():
     print(f"{size >> 30} GB checkpoint, {'layer by layer' if layerwise else 'whole model'}", flush=True)
     types = backend.types
     rot = rotation_matrix(dev)
+    mls2_levels = torch.tensor(MLS2_GRIDS[args.mls2_grid], device=dev)
     prefix = "model.language_model.layers"
 
     hidden, kw = backend.capture(samples)
@@ -551,7 +644,7 @@ def main():
             + (MOE_FAMILIES if experts is not None else MLP_FAMILIES)
         )
         if routed is not None:
-            moe = expert_stats(routed, rot)
+            moe = expert_stats(routed, rot, mls2_levels if args.mls2_report else None)
         mods = {name: layer.get_submodule(name) for g in groups for name in g}
         # K rounded up to the 128-group grid: `input_mix_weight_up` is [10240, 320] and the converter stores it
         # padded to 384 columns, so the rotated grid and the Hessian have to agree with that. The padded columns
@@ -606,11 +699,18 @@ def main():
                     qg, sg = gptq(wt, hinv, dead)
                     deq = qg * sg.repeat_interleave(BLOCK, 1)
                     l_gptq = proxy_loss(wt - deq, hv)
+                    extra = {}
+                    if args.mls2_report:
+                        q2, s2 = rtn2(wt, mls2_levels)
+                        l2 = proxy_loss(wt - q2 * s2.repeat_interleave(BLOCK, 1), hv)
+                        qg2, sg2 = gptq2(wt, hinv, dead, mls2_levels)
+                        lg2 = proxy_loss(wt - qg2 * sg2.repeat_interleave(BLOCK, 1), hv)
+                        extra = {"rtn2": l2 / base, "gptq2": lg2 / base}
                     # Drop the padding again: the propagation runs the real module, whose K is unpadded.
                     lin.weight.copy_(unrotate(deq, rot)[:, :k0].to(lin.weight.dtype))
                     key = f"{prefix}.{li}.{name}.weight"
                     tensors[key], tensors[key + ".scales"] = pack(qg, sg)
-                    report.append({"tensor": key, "rtn": l_rtn / base, "gptq": l_gptq / base})
+                    report.append({"tensor": key, "rtn": l_rtn / base, "gptq": l_gptq / base, **extra})
                     print(f"  {li:2d} {name:28s} rtn {l_rtn / base:.3e} gptq {l_gptq / base:.3e} "
                           f"({l_rtn / max(l_gptq, 1e-30):.2f}x)", flush=True)
                 del hinv
@@ -620,9 +720,11 @@ def main():
                 for name, (tq, ts), loss in moe.quantize(args.damp):
                     tensors[f"{key}.{name}"], tensors[f"{key}.{name}.scales"] = tq, ts
                     report.append({"tensor": f"{key}.{name}", **loss})
-                    print(f"  {li:2d} experts.{name:19s} rtn {loss['rtn']:.3e} gptq {loss['gptq']:.3e} "
-                          f"({loss['rtn'] / max(loss['gptq'], 1e-30):.2f}x), {loss['rtn_experts']} experts RTN",
-                          flush=True)
+                    line = (f"  {li:2d} experts.{name:19s} rtn {loss['rtn']:.3e} gptq {loss['gptq']:.3e} "
+                            f"({loss['rtn'] / max(loss['gptq'], 1e-30):.2f}x), {loss['rtn_experts']} experts RTN")
+                    if "rtn2" in loss:
+                        line += f" | rtn2 {loss['rtn2']:.3e} gptq2 {loss['gptq2']:.3e}"
+                    print(line, flush=True)
                 del moe
             t_q = time.time() - tl - t_h
             from safetensors.torch import save_file

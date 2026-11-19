@@ -32,8 +32,28 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Qwen3.6-35B-A3B (text + images) | `qwen36-35b-a3b-mls4.malleus` | 54.8 GB | **yes** (680 tensors) | Converted before `--prefill-int8` became opt-in: the name says `-mls4` but the file holds both copies. `malleus slim` rewrites it as 4-bit only. |
 | Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
 | Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
-| Qwen3.8-Flash-Next (text) | — | — | — | gfx1151 only; the model the hyper-connection kernels were written for. No numbers on gfx1150. |
+| Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
+
+## Qwen3.8-Flash-Next — MLS2 (issue #37)
+
+Measured 2026-11-19 on gfx1151 with the bf16 checkpoint, the 21-prompt `golden` set at `--ctx 8192`, greedy, and
+`malleus bench --prompt 512 --decode 32 --depth 0` for speed. The MLS4 file is the one in production.
+
+| Format | On device | All-position argmax | Last-token top-1 | Worst KL | tg32 | pp512 |
+|---|---|---|---|---|---|---|
+| MLS4 (production) | 73.5 GB | **95.11 %** | 19/21 | **0.225** | **37.8** | 1085 |
+| MLS2 routed gate/up + MLS4 down | 50.1 GB | 89.45 % | 19/21 | 1.410 | 35.7 | 1075 |
+| MLS2 every routed projection + shared | 40.0 GB | 88.47 % | 20/21 | 1.229 | 35.5 | 1085 |
+
+Reconstruction error in the rotated space, average relative L2 per 128-group on four sampled layers (0, 3, 24, 47),
+both expert tensors, 256 rows each: MLS2 uniform 0.381, MLS2 e2m1 subset 0.342, MLS3 0.194, MLS4 0.104. The e2m1
+subset is -1.5, -0.5, 0.5, 1.5; the full 16-entry e2m1 table needs four bits per code, so it is not an MLS2 grid.
+
+**Conclusion: 2 bits does not pay here.** It reads fewer bytes but not faster (the decode GEMV is instruction-bound
+before it is bandwidth-bound), and both 2-bit variants lose 5.7-6.6 points of all-position argmax against MLS4. The
+format and kernels stay in the tree, opt-in and off by default (`malleus convert --expert-mls2 family`, plus
+`--mls2-down` for the down projection); MLS4 stays the production format.
 
 ## Qwen3.8-27B
 
