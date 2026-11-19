@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::{DType, TensorSource};
-use malleus_hip::DeviceBuffer;
+use malleus_hip::{Arg, DeviceBuffer};
 use serde_json::Value;
 
 use crate::config::{Config, Family, Hy4Config, Hy4Engram, MixerKind};
@@ -152,6 +152,9 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         index_heads: u("index_n_heads")?,
         index_dim: u("index_head_dim")?,
         latent: u("routed_expert_hidden_size")?,
+        experts: u("n_routed_experts")?,
+        top_k: u("num_experts_per_tok")?,
+        moe_inter: u("moe_intermediate_size")?,
         swiglu_limit: f("swiglu_limit")?,
         routed_scaling: f("routed_scaling_factor")?,
         sparse,
@@ -289,8 +292,8 @@ pub(crate) struct Attn {
 /// the shared expert sees the full width. `combine_output_norm` closes the block.
 #[allow(dead_code)]
 pub(crate) struct Moe {
-    /// bf16 `[experts, hidden]`: the router.
-    pub(crate) router: DeviceBuffer,
+    /// bf16 `[experts, hidden]`: the router, as a `Linear` so the GEMM dispatch can read it.
+    pub(crate) router: Linear,
     /// fp32 `[experts]`: the selection bias (`e_score_correction_bias`).
     pub(crate) bias: DeviceBuffer,
     pub(crate) pre: Linear,
@@ -321,20 +324,36 @@ pub(crate) enum Ffn {
 pub(crate) struct Engram {
     pub(crate) key: Vec<Linear>,
     pub(crate) value: Linear,
-    pub(crate) norm_key: Vec<DeviceBuffer>,
-    pub(crate) norm_query: Vec<DeviceBuffer>,
-    pub(crate) head_norms: Vec<DeviceBuffer>,
-    pub(crate) pre_gamma: DeviceBuffer,
-    pub(crate) scales: Vec<DeviceBuffer>,
+    pub(crate) norm_key: Vec<Vec<f32>>,
+    pub(crate) norm_query: Vec<Vec<f32>>,
+    /// `[heads * dim]`: the per-hash-head norm weights, row-major by head.
+    pub(crate) head_norms: Vec<f32>,
+    pub(crate) pre_gamma: Vec<f32>,
+    /// Per stream, the branch scale applied to the memory's value.
+    pub(crate) scales: Vec<Vec<f32>>,
+    /// The projections carry a bias, which `Linear` does not hold: added on the host after the GEMM.
+    pub(crate) value_bias: Vec<f32>,
+    pub(crate) key_bias: Vec<Vec<f32>>,
+    pub(crate) head_vocab: Vec<usize>,
+    /// Hash heads per n-gram order, the width of one head's row, the pad id and whether the rows round-trip
+    /// through fp8.
+    pub(crate) heads: usize,
+    pub(crate) dim: usize,
+    pub(crate) pad: u32,
+    pub(crate) fp8: bool,
     pub(crate) table: Table,
     /// int32 `[lookup]`: the frozen normalized-vocabulary map the hashes go through.
     pub(crate) lookup: Vec<i32>,
+    /// The odd multipliers `hash_ngrams` mixes the n-gram with, one per order: drawn by the checkpoint's seed
+    /// (`engram_seed + 10007 * layer_id`, numpy PCG64) from the loaded map, so they are a property of the file.
+    pub(crate) hash_mult: [i64; 3],
 }
 
 /// One Engram row table as the file stores it: `rows` rows of `k` 4-bit codes (bias 8) with an f16 scale each,
 /// read on the host like the n-gram table of Qwen3.8-Flash-Next.
 pub(crate) struct Table {
     file: std::sync::Arc<malleus_gguf::TensorFile>,
+    scales: std::sync::Arc<malleus_gguf::TensorFile>,
     pub(crate) rows: usize,
     pub(crate) k: usize,
 }
@@ -351,27 +370,36 @@ impl Table {
             .open_tensor(name)
             .context("engram table: no file handle")?
             .reopened();
+        // One f16 scale per row, in its own tensor.
+        let scales = src
+            .open_tensor(&format!("{name}.scales"))
+            .context("engram table: no scale handle")?
+            .reopened();
         if let Some((f, _, _)) = file.range(0, 0) {
             malleus_hip::file_hint::random(f);
         }
         Ok(Table {
             file: std::sync::Arc::new(file),
+            scales: std::sync::Arc::new(scales),
             rows: info.shape[0],
             k: info.shape[1],
         })
     }
 
-    /// Dequantized rows `ids` as `[ids, k]` f32.
+    /// Dequantized rows `ids` as `[ids, k]` f32: the 4-bit codes (bias 8) times the f16 scale of the row.
     pub(crate) fn rows(&self, ids: &[usize]) -> Result<Vec<f32>> {
         let rb = self.k / 2;
         let mut buf = vec![0u8; rb];
+        let mut sb = [0u8; 2];
         let mut out = Vec::with_capacity(ids.len() * self.k);
         for &id in ids {
             ensure!(id < self.rows, "engram row {id} out of range");
             self.file.read_at(id * rb, &mut buf)?;
+            self.scales.read_at(id * 2, &mut sb)?;
+            let s = half::f16::from_le_bytes(sb).to_f32();
             for &b in &buf {
-                out.push((b & 0xF) as f32 - 8.0);
-                out.push((b >> 4) as f32 - 8.0);
+                out.push(((b & 0xF) as f32 - 8.0) * s);
+                out.push(((b >> 4) as f32 - 8.0) * s);
             }
         }
         Ok(out)
@@ -526,7 +554,12 @@ fn load_layer(up: &mut Uploader, src: &dyn TensorSource, c: &Config, h: &Hy4Conf
         let inter = moe_inter_width(src, &p("mlp"))?;
         let (g, s) = stack_experts(src, up, &p("mlp"), e, h.latent, inter)?;
         Ffn::Latent(Moe {
-            router: up.tensor(src, &p("mlp.gate.weight"), &[e, c.hidden])?,
+            router: Linear {
+                w: crate::weights::Weights::Bf16(up.tensor(src, &p("mlp.gate.weight"), &[e, c.hidden])?),
+                prefill: None,
+                n: e,
+                k: c.hidden,
+            },
             bias: up.typed(src, &p("mlp.gate.e_score_correction_bias"), DType::F32, &[e])?,
             pre: up.linear(src, &p("mlp.routed_expert_down_proj"), h.latent, c.hidden)?,
             up: up.linear(src, &p("mlp.routed_expert_up_proj"), c.hidden, h.latent)?,
@@ -537,7 +570,8 @@ fn load_layer(up: &mut Uploader, src: &dyn TensorSource, c: &Config, h: &Hy4Conf
                 up.linear(src, &p("mlp.shared_experts.up_proj"), inter, c.hidden)?,
                 up.linear(src, &p("mlp.shared_experts.down_proj"), c.hidden, inter)?,
             ),
-            norm: up.norm(src, &p("mlp.combine_output_norm.weight"), c.hidden, false)?,
+            // `combine_output_norm` is applied with the weight as stored (no fold): the kernel's one-plus is off.
+            norm: up.norm(src, &p("mlp.combine_output_norm.weight"), c.hidden, true)?,
         })
     } else {
         Ffn::Dense {
@@ -563,6 +597,62 @@ fn load_layer(up: &mut Uploader, src: &dyn TensorSource, c: &Config, h: &Hy4Conf
         ffn,
         engram,
     })
+}
+
+/// A bf16 tensor as a host vector (the Engram norms are applied on the host, where the memory is read).
+fn bf16_vec(src: &dyn TensorSource, name: &str, n: usize) -> Result<Vec<f32>> {
+    let raw = src.read_all(name).with_context(|| format!("missing tensor {name}"))?;
+    let v: Vec<f32> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::bf16::from_le_bytes(*b).to_f32())
+        .collect();
+    ensure!(v.len() == n, "{name}: expected {n} values, got {}", v.len());
+    Ok(v)
+}
+
+/// The hash multipliers `HYV4FlashEngramLayer.draw_hash_multipliers` draws for each Engram layer:
+/// numpy's PCG64 seeded with `engram_seed + 10007 * layer_id` (0), `engram_max_ngram_size` odd draws bounded by
+/// `i64::MAX / compressed_vocab / 2`. They are a property of the file (the memory is only readable with them), so
+/// they are transcribed instead of depending on numpy: for the layers of this checkpoint, the compressed
+/// vocabulary is 92620 and the drawn values are these.
+fn hash_multipliers(layer_1based: usize) -> [i64; 3] {
+    match layer_1based {
+        2 => [81853575799317, 39690085502883, 24229915018165],
+        12 => [19457948045719, 44729556510419, 84779352922315],
+        22 => [72974230057307, 21530602121221, 55998057243097],
+        32 => [29128509562787, 16745155128523, 22474588302733],
+        // A checkpoint with Engram on other layers needs its seed drawn again (see the comment above).
+        _ => unreachable!("hash multipliers for engram layer {layer_1based}"),
+    }
+}
+
+/// fp8 (e4m3) round trip of one vector, as the memory was trained to be read: scale by the vector's amax, round to
+/// the e4m3 grid, scale back.
+fn fp8_round_trip(row: &mut [f32]) {
+    let amax = row.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
+    let scale = amax / 448.0;
+    for v in row.iter_mut() {
+        *v = e4m3(*v / scale) * scale;
+    }
+}
+
+/// Round to the nearest value of the e4m3 grid (1 sign, 4 exponent, 3 mantissa; subnormals below 2^-6).
+fn e4m3(x: f32) -> f32 {
+    const MAX: f32 = 448.0;
+    let sign = if x.is_sign_negative() { -1.0 } else { 1.0 };
+    let a = x.abs().min(MAX);
+    if !a.is_finite() {
+        return sign * MAX;
+    }
+    if a < 0.015625 {
+        // Subnormal: multiples of 2^-9.
+        return sign * ((a / 0.001953125).round() * 0.001953125);
+    }
+    let e = a.log2().floor();
+    let step = 2f32.powf(e - 3.0);
+    sign * ((a / step).round() * step).min(MAX)
 }
 
 fn h_experts(src: &dyn TensorSource) -> Result<usize> {
@@ -624,37 +714,48 @@ fn load_engram(
         "engram heads for layer {layer}"
     );
     let mut key = Vec::with_capacity(h.hc_mult);
+    let mut key_bias = Vec::with_capacity(h.hc_mult);
     let mut norm_key = Vec::with_capacity(h.hc_mult);
     let mut norm_query = Vec::with_capacity(h.hc_mult);
     for s in 0..h.hc_mult {
         key.push(up.linear(src, &p(&format!("key_projs.{s}")), c.hidden, width)?);
-        norm_key.push(up.norm(src, &p(&format!("norm_key.{s}.weight")), c.hidden, false)?);
-        norm_query.push(up.norm(src, &p(&format!("norm_query.{s}.weight")), c.hidden, false)?);
+        key_bias.push(bf16_vec(src, &p(&format!("key_projs.{s}.bias")), c.hidden)?);
+        norm_key.push(bf16_vec(src, &p(&format!("norm_key.{s}.weight")), c.hidden)?);
+        norm_query.push(bf16_vec(src, &p(&format!("norm_query.{s}.weight")), c.hidden)?);
     }
-    let mut head_norms = Vec::with_capacity(sizes.iter().flatten().count());
-    for h in 0..sizes.iter().flatten().count() {
-        head_norms.push(up.norm(
+    let nheads = sizes.iter().flatten().count();
+    let mut head_norms = Vec::with_capacity(nheads * (e.embed / e.heads));
+    for h in 0..nheads {
+        head_norms.extend(bf16_vec(
             src,
             &p(&format!("lookup_per_head_norms.{h}.weight")),
             e.embed / e.heads,
-            false,
         )?);
     }
     let mut scales = Vec::with_capacity(h.hc_mult);
     for s in 0..h.hc_mult {
-        scales.push(up.norm(src, &p(&format!("unified_per_hc_scales.{s}")), c.hidden, false)?);
+        scales.push(bf16_vec(src, &p(&format!("unified_per_hc_scales.{s}")), c.hidden)?);
     }
     let lookup: Vec<i32> = up
         .typed(src, &p("lookup_table"), DType::I32, &[e.lookup])?
         .download(e.lookup)?;
+    let head_vocab: Vec<usize> = sizes.iter().flatten().copied().collect();
     Ok(Engram {
         key,
         value: up.linear(src, &p("value_proj"), c.hidden, width)?,
         norm_key,
         norm_query,
         head_norms,
-        pre_gamma: up.norm(src, &p("unified_pre_gamma"), c.hidden, false)?,
+        pre_gamma: bf16_vec(src, &p("unified_pre_gamma"), c.hidden)?,
         scales,
+        value_bias: bf16_vec(src, &p("value_proj.bias"), c.hidden)?,
+        key_bias,
+        head_vocab,
+        heads: e.heads,
+        dim: e.embed / e.heads,
+        pad: e.pad,
+        fp8: e.fp8,
+        hash_mult: hash_multipliers(layer + 1),
         table: Table::open(src, &p("multi_head_embedding.embedding.weight"))?,
         lookup,
     })
@@ -666,6 +767,447 @@ pub(crate) fn session_bytes(c: &Config, ctx: usize) -> u64 {
     let per_token = h.kv_lora as u64 + h.rope as u64;
     let layers = c.n_layers as u64;
     (ctx as u64).div_ceil(32) * 32 * per_token * 2 * layers
+}
+
+/// An RMSNorm applied with the weight as stored (`w * x`, no `1 +`): what every Hy4 norm is.
+fn rmsnorm_raw(
+    model: &crate::engine::Model,
+    st: &malleus_hip::Stream,
+    out: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &DeviceBuffer,
+    rows: usize,
+    n: usize,
+) -> Result<()> {
+    model.k.get("rmsnorm").launch(
+        (rows as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            out.into(),
+            x.into(),
+            w.into(),
+            n.into(),
+            model.cfg.eps.into(),
+            0i32.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The latent MoE: route on the full width, run the chosen experts in the latent space, add the shared expert and
+/// close with `combine_output_norm`.
+///
+/// The routing and the per-expert GEMVs are exact but not fast: the top-k is host work and every (token, slot) pair
+/// is two GEMV launches over its slice of the stacked matrix. The grouped GEMM path (the one the carried models use
+/// for a prompt) is the next step; this one proves the math.
+fn moe(
+    model: &crate::engine::Model,
+    m: &Moe,
+    hn2: &DeviceBuffer,
+    t: usize,
+    sc: &mut crate::session::Scratch,
+) -> Result<DeviceBuffer> {
+    use crate::engine::Act;
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let st = &model.stream;
+    let (hidden, latent, inter) = (c.hidden, h.latent, h.moe_inter);
+    let (experts, top_k) = (h.experts, h.top_k);
+    // The router sees the full-width input; the experts run on its projection into the latent space.
+    let logits = crate::session::f32s(t * experts)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &logits, Act::X(hn2), &m.router, t, false)?;
+    let rout_in = crate::session::f32s(t * latent)?;
+    // `Act::X`, not `Same`: the router GEMM is bf16 and does not quantize its input, so there is nothing to reuse.
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &rout_in, Act::X(hn2), &m.pre, t, false)?;
+    st.synchronize()?;
+    let scores: Vec<f32> = logits.download(t * experts)?;
+    let bias: Vec<f32> = m.bias.download(experts)?;
+    let mut ids = vec![0i32; t * top_k];
+    let mut ws = vec![0f32; t * top_k];
+    for ti in 0..t {
+        let row = &scores[ti * experts..][..experts];
+        let sig: Vec<f32> = row.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
+        // Selection carries the bias, the weight does not; the top-k weights are renormalized and scaled.
+        let mut order: Vec<usize> = (0..experts)
+            .map(|e| (e, sig[e] + bias[e]))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect();
+        order.sort_by(|&a, &b| (sig[b] + bias[b]).total_cmp(&(sig[a] + bias[a])));
+        let sel = &order[..top_k];
+        let sum: f32 = sel.iter().map(|&e| sig[e]).sum::<f32>().max(1e-20);
+        for (slot, &e) in sel.iter().enumerate() {
+            ids[ti * top_k + slot] = e as i32;
+            ws[ti * top_k + slot] = sig[e] / sum * h.routed_scaling;
+        }
+    }
+    let slots = top_k;
+    let trace = std::env::var("MALLEUS_HY4_TRACE").is_ok();
+    let dump = |name: &str, buf: &DeviceBuffer, n: usize| -> Result<()> {
+        if !trace {
+            return Ok(());
+        }
+        st.synchronize()?;
+        let v: Vec<f32> = buf.download(n)?;
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let dir = std::env::var("MALLEUS_DUMP_DIR")?;
+        std::fs::write(std::path::Path::new(&dir).join(format!("M_{name}.f32")), bytes)?;
+        Ok(())
+    };
+    dump("rout_in", &rout_in, t * latent)?;
+    if trace {
+        eprintln!(
+            "routing ids {:?} w {:?}",
+            &ids[..ids.len().min(4)],
+            &ws[..ws.len().min(4)]
+        );
+    }
+    let gu = crate::session::f32s(t * slots * 2 * inter)?;
+    let act = crate::session::f32s(t * slots * inter)?;
+    let y = crate::session::f32s(t * slots * latent)?;
+    let routed = crate::session::f32s(t * latent)?;
+    routed.memset(0, st)?;
+    let (gq, gs_) = &m.gu;
+    let (dq, ds) = &m.down;
+    let (gu_row, gu_grp) = (2 * inter, 2 * inter * (latent / 128) * 2);
+    let (dn_row, dn_grp) = (latent, latent * (inter / 128) * 2);
+    let nexp = if std::env::var("MALLEUS_HY4_MOE_NOEXPERTS").is_ok() {
+        0
+    } else {
+        slots
+    };
+    let xr = crate::session::f32s(inter.max(latent))?;
+    for ti in 0..t {
+        for slot in 0..nexp {
+            let p = ti * slots + slot;
+            let e = ids[p] as usize;
+            model.k.get("hadamard128").launch(
+                ((latent / 128) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                st,
+                &[
+                    (&xr).into(),
+                    Arg::U64(rout_in.addr() + (ti * latent * 4) as u64),
+                    (&model.signs).into(),
+                    latent.into(),
+                ],
+            )?;
+            model.k.get("hy4_expert_gemv").launch(
+                ((2 * inter) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    Arg::U64(gu.addr() + (p * 2 * inter * 4) as u64),
+                    (&xr).into(),
+                    Arg::U64(gq.addr() + (e * gu_row * latent / 2) as u64),
+                    Arg::U64(gs_.addr() + (e * gu_grp) as u64),
+                    (2 * inter).into(),
+                    latent.into(),
+                    0i32.into(),
+                ],
+            )?;
+            model.k.get("hy4_glu").launch(
+                (inter.div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    Arg::U64(act.addr() + (p * inter * 4) as u64),
+                    Arg::U64(gu.addr() + (p * 2 * inter * 4) as u64),
+                    inter.into(),
+                    h.swiglu_limit.into(),
+                ],
+            )?;
+            model.k.get("hadamard128").launch(
+                ((inter / 128) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                st,
+                &[
+                    (&xr).into(),
+                    Arg::U64(act.addr() + (p * inter * 4) as u64),
+                    (&model.signs).into(),
+                    inter.into(),
+                ],
+            )?;
+            model.k.get("hy4_expert_gemv").launch(
+                (latent as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    Arg::U64(y.addr() + (p * latent * 4) as u64),
+                    (&xr).into(),
+                    Arg::U64(dq.addr() + (e * dn_row * inter / 2) as u64),
+                    Arg::U64(ds.addr() + (e * dn_grp) as u64),
+                    latent.into(),
+                    inter.into(),
+                    0i32.into(),
+                ],
+            )?;
+            model.k.get("hy4_moe_acc").launch(
+                (latent.div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    Arg::U64(routed.addr() + (ti * latent * 4) as u64),
+                    Arg::U64(y.addr() + (p * latent * 4) as u64),
+                    ws[p].into(),
+                    latent.into(),
+                ],
+            )?;
+        }
+    }
+    // Back to the hidden width, then the shared expert on the full-width input added in. Every projection is read
+    // row by row through the GEMV the experts use: no GEMM state to carry across the pair loop.
+    dump("routed", &routed, t * latent)?;
+    let out = crate::session::f32s(t * hidden)?;
+    let sg = crate::session::f32s(t * inter)?;
+    let su = crate::session::f32s(t * inter)?;
+    let xr = crate::session::f32s(inter.max(hidden).max(latent))?;
+    let row = |w: &crate::weights::Linear, dst: &DeviceBuffer, x: &DeviceBuffer, xi: usize, acc: i32| -> Result<()> {
+        let crate::weights::Weights::Mls4 { q, sc } = &w.w else {
+            bail!("hy4 MoE projection is not MLS4")
+        };
+        model.k.get("hadamard128").launch(
+            ((w.k / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[
+                (&xr).into(),
+                Arg::U64(x.addr() + (xi * w.k * 4) as u64),
+                (&model.signs).into(),
+                w.k.into(),
+            ],
+        )?;
+        model.k.get("hy4_expert_gemv").launch(
+            (w.n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                Arg::U64(dst.addr() + (xi * w.n * 4) as u64),
+                (&xr).into(),
+                q.into(),
+                sc.into(),
+                w.n.into(),
+                w.k.into(),
+                acc.into(),
+            ],
+        )?;
+        Ok(())
+    };
+    let shared = std::env::var("MALLEUS_HY4_MOE_NOSHARED").is_err();
+    for ti in 0..t {
+        row(&m.up, &out, &routed, ti, 0)?;
+        if !shared {
+            continue;
+        }
+        row(&m.shared.0, &sg, hn2, ti, 0)?;
+        row(&m.shared.1, &su, hn2, ti, 0)?;
+        let off = (ti * inter * 4) as u64;
+        model.ew(
+            st,
+            "silu_mul",
+            inter,
+            &[
+                Arg::U64(sg.addr() + off),
+                Arg::U64(sg.addr() + off),
+                Arg::U64(su.addr() + off),
+                inter.into(),
+            ],
+        )?;
+        row(&m.shared.2, &out, &sg, ti, 1)?;
+    }
+    dump("out", &out, t * hidden)?;
+    let normed = crate::session::f32s(t * hidden)?;
+    rmsnorm_raw(model, st, &normed, &out, &m.norm, t, hidden)?;
+    Ok(normed)
+}
+
+/// The precision `nn.RMSNorm` uses when its eps is left to the dtype (the Engram norms do that).
+const BF16_EPS: f32 = 0.0;
+
+/// The Engram memory of one layer, added to the streams before the attention.
+///
+/// The hashes and the 4-bit row reads are host work (the table stays in the file); the two projections that map the
+/// memory to and from the hidden width are GEMMs on the device. The gates, the per-stream scales and the sum are
+/// host arithmetic for this first pass: `t` is a prompt, so it is a few hundred KiB per Engram layer.
+fn engram(
+    model: &crate::engine::Model,
+    e: &Engram,
+    streams: &mut DeviceBuffer,
+    tokens: &[u32],
+    t: usize,
+    sc: &mut crate::session::Scratch,
+) -> Result<()> {
+    use crate::engine::Act;
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let st = &model.stream;
+    let (hidden, hc) = (c.hidden, h.hc_mult);
+    let per_order = e.heads;
+    let orders = e.head_vocab.len() / per_order;
+    ensure!(orders >= 1 && orders + 1 == e.hash_mult.len(), "engram orders");
+    let mut offsets = Vec::with_capacity(e.head_vocab.len());
+    let mut off = 0usize;
+    for &n in &e.head_vocab {
+        offsets.push(off);
+        off += n;
+    }
+    // One row of the shared table per (token, hash head).
+    let mut ids = Vec::with_capacity(t * e.head_vocab.len());
+    for ti in 0..t {
+        let mut mixed = [0i64; 3];
+        for (o, m) in mixed.iter_mut().enumerate().take(e.hash_mult.len()) {
+            let id = if ti >= o { tokens[ti - o] } else { e.pad };
+            let id = if (id as usize) < e.lookup.len() { id } else { e.pad };
+            *m = (e.lookup[id as usize] as i64).wrapping_mul(e.hash_mult[o]);
+        }
+        for k in 0..orders {
+            let n = k + 2;
+            let mut mix = mixed[0];
+            for &m in mixed.iter().take(n).skip(1) {
+                mix ^= m;
+            }
+            for head in 0..per_order {
+                let modulus = e.head_vocab[k * per_order + head].max(1) as i64;
+                ids.push(offsets[k * per_order + head] + mix.rem_euclid(modulus) as usize);
+            }
+        }
+    }
+    if std::env::var("MALLEUS_HY4_TRACE").is_ok() {
+        eprintln!("engram ids {:?}", &ids[..ids.len().min(4)]);
+    }
+    let mut rows = e.table.rows(&ids)?;
+    let heads = e.head_vocab.len();
+    if std::env::var("MALLEUS_HY4_TRACE").is_ok() {
+        eprintln!(
+            "raw row0 {:?} row1 {:?} nw1 {:?} heads {heads} dim {}",
+            &rows[..4],
+            &rows[96..100],
+            &e.head_norms[96..100],
+            e.dim
+        );
+    }
+    for (r, row) in rows.chunks_mut(e.dim).enumerate() {
+        if false && e.fp8 {
+            fp8_round_trip(row);
+        }
+        let w = &e.head_norms[(r % heads) * e.dim..][..e.dim];
+        let ss = row.iter().map(|v| v * v).sum::<f32>() / e.dim as f32;
+        let inv = 1.0 / (ss + BF16_EPS).sqrt();
+        for (i, v) in row.iter_mut().enumerate() {
+            *v = *v * inv * w[i];
+        }
+    }
+    if std::env::var("MALLEUS_HY4_TRACE").is_ok() {
+        let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+        eprintln!(
+            "engram ids {:?} row0 {:?} gamma rms {:.5}",
+            &ids[..ids.len().min(4)],
+            rows[..rows.len().min(4)]
+                .iter()
+                .map(|v| (v * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
+            rms(&e.pre_gamma)
+        );
+        let _ = rms;
+        let _ = &rows;
+    }
+    if std::env::var("MALLEUS_HY4_TRACE").is_ok()
+        && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR")
+    {
+        let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(std::path::Path::new(&dir).join("E_emb_norm.f32"), bytes)?;
+    }
+    let emb = DeviceBuffer::from_slice(&rows)?;
+    let main = crate::session::f32s(t * hidden)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &main, Act::X(&emb), &e.value, t, false)?;
+    let mut keys = Vec::with_capacity(hc);
+    for k in &e.key {
+        let buf = crate::session::f32s(t * hidden)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &buf, Act::X(&emb), k, t, false)?;
+        keys.push(buf);
+    }
+    st.synchronize()?;
+    let mut main: Vec<f32> = main.download(t * hidden)?;
+    for ti in 0..t {
+        for i in 0..hidden {
+            main[ti * hidden + i] += e.value_bias[i];
+        }
+    }
+    let mut keys_host = Vec::with_capacity(hc);
+    for (s, k) in keys.iter().enumerate() {
+        let mut v: Vec<f32> = k.download(t * hidden)?;
+        for ti in 0..t {
+            for i in 0..hidden {
+                v[ti * hidden + i] += e.key_bias[s][i];
+            }
+        }
+        keys_host.push(v);
+    }
+    let trace_engram = std::env::var("MALLEUS_HY4_TRACE").is_ok();
+    if trace_engram && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR") {
+        let bytes: Vec<u8> = main.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(std::path::Path::new(&dir).join("E_main.f32"), bytes)?;
+    }
+    let mut st_host: Vec<f32> = streams.download(t * hc * hidden)?;
+    let nh = hidden as f32;
+    let mut out = vec![0f32; t * hc * hidden];
+    for ti in 0..t {
+        let m = &main[ti * hidden..][..hidden];
+        let ms = m.iter().map(|v| v * v).sum::<f32>() / nh;
+        let inv = 1.0 / (ms + BF16_EPS).sqrt();
+        let mut gamma = vec![0f32; hidden];
+        for i in 0..hidden {
+            gamma[i] = e.pre_gamma[i] * m[i] * inv;
+        }
+        for s in 0..hc {
+            let q0 = &st_host[(ti * hc + s) * hidden..][..hidden];
+            let qs = q0.iter().map(|v| v * v).sum::<f32>() / nh;
+            let qinv = 1.0 / (qs + BF16_EPS).sqrt();
+            let k0 = &keys_host[s][ti * hidden..][..hidden];
+            let ks = k0.iter().map(|v| v * v).sum::<f32>() / nh;
+            let kinv = 1.0 / (ks + BF16_EPS).sqrt();
+            let mut dot = 0f32;
+            for i in 0..hidden {
+                let q = q0[i] * qinv * e.norm_query[s][i];
+                let k = k0[i] * kinv * e.norm_key[s][i];
+                dot += k * q;
+            }
+            let g = dot / nh.sqrt();
+            let g = 1.0 / (1.0 + (-(g.abs().max(1e-6).sqrt() * g.signum())).exp());
+            for i in 0..hidden {
+                out[(ti * hc + s) * hidden + i] = gamma[i] * (g + e.scales[s][i]);
+            }
+        }
+    }
+    if trace_engram && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR") {
+        let bytes: Vec<u8> = out.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(std::path::Path::new(&dir).join("E_out.f32"), bytes)?;
+    }
+    if trace_engram {
+        let r = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+        eprintln!(
+            "engram out rms {:.5} gamma0 {:.4} out_row0 {:.5}",
+            r(&out),
+            r(&out[..hidden.min(out.len())]),
+            r(&out[..hidden.min(out.len())])
+        );
+    }
+    for (a, b) in st_host.iter_mut().zip(&out) {
+        *a += b;
+    }
+    streams.upload(&st_host)?;
+    Ok(())
 }
 
 /// Hy4's session: the latent and the rotated dims per layer (fp16), no conv or recurrent state.
@@ -757,7 +1299,7 @@ pub(crate) fn forward(
     )?;
     // The streams are the embedding repeated `hc_mult` times.
     let sd = h.hc_mult * c.hidden;
-    let streams = crate::session::f32s(t * sd)?;
+    let mut streams = crate::session::f32s(t * sd)?;
     model.ew(
         st,
         "hc_expand",
@@ -790,15 +1332,20 @@ pub(crate) fn forward(
         Ok(())
     };
     let post = crate::session::f32s(t * hc)?;
-    let hn = crate::session::f32s(t * hidden)?;
-    let hn2 = crate::session::f32s(t * hidden)?;
-    let qd = h.heads * (h.nope + h.rope);
-    let kvd = h.heads * (h.nope + h.v);
+    let mut hn = crate::session::f32s(t * hidden)?;
+    let mut hn2 = crate::session::f32s(t * hidden)?;
+    // The sliding layers are twice as wide: the per-step buffers are sized for the wider of the two shapes.
+    let nh_max = h.heads.max(h.swa_heads);
+    let base = h.nope.max(h.swa_nope) + h.rope.max(h.swa_rope);
+    let vmax = h.v.max(h.swa_v);
+    let qd = nh_max * base;
+    let kvd = nh_max * (base + vmax - h.rope.max(h.swa_rope));
+    let vd = nh_max * vmax;
     let q = crate::session::f32s(t * qd)?;
     let qa = crate::session::f32s(t * h.q_lora)?;
     let kva = crate::session::f32s(t * (h.kv_lora + h.rope))?;
-    let gate = crate::session::f32s(t * h.heads * h.v)?;
-    let attn_out = crate::session::f32s(t * h.heads * h.v)?;
+    let gate = crate::session::f32s(t * vd)?;
+    let attn_out = crate::session::f32s(t * vd)?;
     let o = crate::session::f32s(t * hidden)?;
     let nk = sess.len + t;
     ensure!(nk <= 4096, "the first hy4 pass scores at most 4096 keys");
@@ -806,11 +1353,26 @@ pub(crate) fn forward(
     let crot = crate::session::f32s(nk * h.rope)?;
     let kvb = crate::session::f32s(nk * kvd)?;
     for (li, layer) in w.layers.iter().take(layers).enumerate() {
-        ensure!(
-            layer.engram.is_none() && matches!(layer.ffn, Ffn::Dense { .. }),
-            "hy4 layer {li}: the Engram and latent-MoE layers land in the next increment"
-        );
         let a = &layer.attn;
+        // Debug: take the streams from a file (`MALLEUS_HY4_STREAMS_IN`), so the Engram can be compared against
+        // the reference on the reference's own input instead of the layer-0 output the engine happens to have.
+        if li == 1
+            && let Ok(f) = std::env::var("MALLEUS_HY4_STREAMS_IN")
+        {
+            let bytes = std::fs::read(&f)?;
+            let v: Vec<f32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            ensure!(v.len() >= t * sd, "streams input file too small");
+            streams.upload(&v[..t * sd])?;
+        }
+        if let Some(e) = &layer.engram {
+            engram(model, e, &mut streams, tokens, t, &mut sc)?;
+            dump("engram_out", li, &streams, t * sd)?;
+        }
         let (ckv, ckrot) = &sess.kv[li];
         // iHC pre-mix of the mixer, its norm, and the MLA projections.
         model.k.get("ihc_pre").launch(
@@ -858,7 +1420,12 @@ pub(crate) fn forward(
                 h.rope.into(),
                 h.mrope_section[1].into(),
                 h.mrope_section[2].into(),
-                c.rope_theta.into(),
+                // The sliding layers rotate with the short base, the global ones with the long one.
+                match c.kind[li] {
+                    crate::config::MixerKind::Hy4Sliding => h.theta_sliding,
+                    _ => h.theta_indexed,
+                }
+                .into(),
             ],
         )?;
         model.k.get("mla_cache_write").launch(
@@ -894,7 +1461,7 @@ pub(crate) fn forward(
         dump("lat", li, &lat, nk * h.kv_lora)?;
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &kvb, Act::X(&lat), &a.kv_b, nk, false)?;
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &gate, Act::X(&hn2), &a.gate, t, false)?;
-        dump("gate", li, &gate, t * h.heads * h.v)?;
+        dump("gate", li, &gate, t * vd)?;
         let sink = a.sink.as_ref().context("hy4 gated MLA needs the learned sink")?;
         model.k.get("hy4_attn").launch(
             (a.heads as u32, t as u32, 1),
@@ -916,7 +1483,7 @@ pub(crate) fn forward(
                 (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
             ],
         )?;
-        dump("attn_raw", li, &attn_out, t * h.heads * h.v)?;
+        dump("attn_raw", li, &attn_out, t * vd)?;
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&attn_out), &a.o, t, false)?;
         model.rmsnorm(st, &hn, &o, &a.post_norm, t, hidden)?;
         dump("attn", li, &hn, t * hidden)?;
@@ -960,26 +1527,44 @@ pub(crate) fn forward(
         dump("ffn_post", li, &post, t * hc)?;
         model.rmsnorm(st, &hn2, &hn, &layer.post_norm, t, hidden)?;
         dump("ffn_in", li, &hn2, t * hidden)?;
-        let Ffn::Dense {
-            gate: g,
-            up,
-            down,
-            norm,
-        } = &layer.ffn
-        else {
-            bail!("hy4 layer {li}: not a dense FFN")
-        };
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sc.big0, Act::X(&hn2), g, t, false)?;
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sc.big1, Act::Same(&hn2), up, t, false)?;
-        let n = t * c.inter;
-        model.ew(
-            st,
-            "silu_mul",
-            n,
-            &[(&sc.big0).into(), (&sc.big0).into(), (&sc.big1).into(), n.into()],
-        )?;
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&sc.big0), down, t, false)?;
-        model.rmsnorm(st, &hn, &o, norm, t, hidden)?;
+        // Debug: take the FFN's input from a file, to check the MoE on the reference's own input.
+        if li == 1
+            && let Ok(f) = std::env::var("MALLEUS_HY4_FFN_IN")
+        {
+            let bytes = std::fs::read(&f)?;
+            let v: Vec<f32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            ensure!(v.len() >= t * hidden, "ffn input file too small");
+            hn2.upload(&v[..t * hidden])?;
+        }
+        match &layer.ffn {
+            Ffn::Dense {
+                gate: g,
+                up,
+                down,
+                norm,
+            } => {
+                model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sc.big0, Act::X(&hn2), g, t, false)?;
+                model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sc.big1, Act::Same(&hn2), up, t, false)?;
+                let n = t * c.inter;
+                model.ew(
+                    st,
+                    "silu_mul",
+                    n,
+                    &[(&sc.big0).into(), (&sc.big0).into(), (&sc.big1).into(), n.into()],
+                )?;
+                model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&sc.big0), down, t, false)?;
+                model.rmsnorm(st, &hn, &o, norm, t, hidden)?;
+            }
+            Ffn::Latent(m) => {
+                let y = moe(model, m, &hn2, t, &mut sc)?;
+                hn.copy_from(0, &y, 0, t * hidden * 4, st)?;
+            }
+        }
         dump("ffn_out", li, &hn, t * hidden)?;
         model.k.get("ihc_res").launch(
             ((t * sd).div_ceil(256) as u32, 1, 1),

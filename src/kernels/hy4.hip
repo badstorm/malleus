@@ -200,3 +200,48 @@ extern "C" __global__ void __launch_bounds__(256) ihc_head(float* out, const flo
         out[(size_t)ti * h + d] = acc;
     }
 }
+
+// The routed expert's SwiGLU: y[i] = silu(gu[i]).clamp(max = L) * gu[inter + i].clamp(-L, L).
+extern "C" __global__ void __launch_bounds__(256) hy4_glu(float* y, const float* gu, int inter, float limit) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= inter) return;
+    const float g = gu[i], u = gu[inter + i];
+    const float gs = g / (1.f + expf(-g));
+    y[i] = fminf(gs, limit) * fmaxf(-limit, fminf(u, limit));
+}
+
+// out[i] += w * y[i]: one (token, slot) pair added into its token's latent row.
+extern "C" __global__ void __launch_bounds__(256) hy4_moe_acc(float* out, const float* y, float w, int h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < h) out[i] += w * y[i];
+}
+
+// One routed expert's GEMV on MLS4 codes: y[o] = sum_k xr[k] * (sign_extend4(nibble) * scale[o][k / 128]), with the
+// input already rotated by `hadamard128` (the weights are stored in the rotated basis). One block per row.
+extern "C" __global__ void __launch_bounds__(256) hy4_expert_gemv(float* y, const float* xr,
+                                                                  const unsigned char* q, const __half* sc,
+                                                                  int n, int k, int acc_in) {
+    const int o = blockIdx.x;
+    if (o >= n) return;
+    const int g = k / 128;
+    const int packed = k / 2;
+    const unsigned char* row = q + (size_t)o * packed;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < packed; i += blockDim.x) {
+        const float s = __half2float(sc[(size_t)o * g + (2 * i) / 128]);
+        const int v0 = ((signed char)(row[i] << 4)) >> 4;
+        const int v1 = ((signed char)row[i]) >> 4;
+        acc += (xr[2 * i] * v0 + xr[2 * i + 1] * v1) * s;
+    }
+    __shared__ float red[256];
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        if (acc_in) y[o] += red[0];
+        else y[o] = red[0];
+    }
+}
