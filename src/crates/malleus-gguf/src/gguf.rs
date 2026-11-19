@@ -30,6 +30,7 @@ pub const GGML_MLS2: u32 = 0x4D4C_0002;
 pub const GGML_MLS3: u32 = 0x4D4C_0003;
 pub const GGML_MLS4: u32 = 0x4D4C_0004;
 pub const GGML_MLS8: u32 = 0x4D4C_0008;
+pub const GGML_ROW_I4: u32 = 0x4D4C_0014;
 
 fn dtype_to_ggml(d: DType) -> u32 {
     match d {
@@ -43,6 +44,7 @@ fn dtype_to_ggml(d: DType) -> u32 {
         DType::Mls3 => GGML_MLS3,
         DType::Mls4 => GGML_MLS4,
         DType::Mls8 => GGML_MLS8,
+        DType::RowI4 => GGML_ROW_I4,
     }
 }
 
@@ -58,6 +60,7 @@ fn ggml_to_dtype(t: u32) -> Result<DType> {
         GGML_MLS3 => DType::Mls3,
         GGML_MLS4 => DType::Mls4,
         GGML_MLS8 => DType::Mls8,
+        GGML_ROW_I4 => DType::RowI4,
         _ => bail!("unsupported ggml type {t}"),
     })
 }
