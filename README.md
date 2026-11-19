@@ -8,18 +8,21 @@
 
 </div>
 
-**Malleus** is DuckPage's open-source LLM inference engine for AMD RDNA 3.5 APUs — **gfx1150** (Strix Point) and
-**gfx1151** (Strix Halo). A Rust host and hand-written HIP kernels, built for one thing: the long prompt.
+**Malleus** is DuckPage's open-source LLM inference engine. Today it targets AMD RDNA 3.5 APUs — **gfx1150**
+(Strix Point) and **gfx1151** (Strix Halo) — with a Rust host and hand-written HIP kernels, built for one thing: the
+long prompt. Other GPUs are in progress.
 
 We put AI on the machines people already own — your computer, your server, your data, nothing sent outside: no
 third-party cloud, no sharing, the control stays with you. Malleus is how we push that to the limit on consumer
 hardware. It is the engine we run in production, and it is public because it is the concrete proof of the work.
 
-Strix APUs share 96–128 GB of memory with the GPU, a cheap way to run large models locally, but at the memory
-bandwidth of a laptop. On Ornith-1.5-35B-A3B, Malleus prefills **2.1x faster than llama.cpp in a fresh session and
-2.8x at 131 072 tokens** (196 against 69 tok/s), so a 110 000-token prompt costs 4.5 minutes instead of 12.7;
-decode is at parity, and the MTP head is how we go past it. [MODELS.md](MODELS.md) has the curves, the method and
-the quality numbers.
+**The advantage today is prompt processing.** Strix APUs share 96–128 GB of memory with the GPU — cheap capacity
+for large models at the bandwidth of a laptop — so a long prompt is the case general engines serve worst. On
+Ornith-1.5-35B-A3B, Malleus prefills **2.1x faster than llama.cpp in a fresh session and 2.8x at 131 072 tokens**
+(196 against 69 tok/s), so a 110 000-token prompt costs 4.5 minutes instead of 12.7. Decode is at parity — at 4
+bits a step reads every weight it touches — and quality sits where llama.cpp's `Q4_K_M` sits; the MTP head is how
+we go past parity. If the prompts are short, any good engine will do; this one is for the long ones.
+[MODELS.md](MODELS.md) has the curves, the method and the numbers.
 
 Nothing here is generic: every kernel targets those two chips, the model files are quantized for their memory
 hierarchy, and prefill chunking, the KV and indexer budgets, the MTP head and the expert cache keep a long context
@@ -31,7 +34,7 @@ with no code, kernels or weight formats from any closed engine.
 | | |
 |---|---|
 | Models | Five families carried, with the file sizes on the device and the tokens/s measured: [MODELS.md](MODELS.md) |
-| Hardware | gfx1150 (development and production), gfx1151 (supported) |
+| Hardware | gfx1150 (development and production), gfx1151 (supported); other GPUs in progress |
 | API | OpenAI Chat Completions + Anthropic Messages, streaming, tool calls, `logprobs`, image input, one port |
 | Speculative decoding | MTP head + chained drafts, verified in one pass |
 
