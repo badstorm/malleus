@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::gguf::{ARCH_PREFIX, GgufWriter, Value};
-use malleus_gguf::quant::{self, BLOCK, HADAMARD_SEED, LAYOUT_VERSION};
+use malleus_gguf::quant::{self, BLOCK, HADAMARD_SEED, Int2Grid, LAYOUT_VERSION};
 use malleus_gguf::safetensors::SafeTensors;
 use malleus_gguf::{DType, TensorSource};
 use rayon::prelude::*;
@@ -23,6 +23,7 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Raw,
+    Mls2,
     Mls3,
     Mls4,
     Mls8,
@@ -38,6 +39,19 @@ pub enum Mls3Layers {
     #[default]
     Family,
     /// Every expert at 4 bit.
+    Off,
+    /// Inclusive layer range.
+    Range(usize, usize),
+}
+
+/// Which MoE layers store both routed expert projections at 2 bit (MLS2). The step from 4 to 2 bits is a quality
+/// decision, not a default: the layer range is measured per family, and the last layers can stay at 4 bit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mls2Layers {
+    /// The range the family's model document chose, derived from `config.json`.
+    #[default]
+    Family,
+    /// Every routed expert at 4 bit.
     Off,
     /// Inclusive layer range.
     Range(usize, usize),
@@ -64,6 +78,13 @@ pub struct Options {
     pub mls4_from: Option<std::path::PathBuf>,
     /// Layers whose MoE `gate`/`up` go to MLS3; MLS3 tensors are always round-to-nearest, calibration is MLS4 only.
     pub mls3_layers: Mls3Layers,
+    /// Layers whose routed `gate`/`up` go to MLS2 (2 bits per weight); `down` follows only with `mls2_down`. MLS2
+    /// is round-to-nearest: the calibration tool reports its reconstruction error, but the GPTQ files are MLS4 only.
+    pub mls2_layers: Mls2Layers,
+    /// Also store the routed `down` projection at 2 bits. The default keeps it at 4: measured on
+    /// Qwen3.8-Flash-Next, 2 bits on both projections cost 6.6 points of all-position argmax against MLS4, while
+    /// gate/up alone keeps most of it and still reads a third less per routed expert.
+    pub mls2_down: bool,
     /// Also store the hyper-connection `mix_down`/`mix_up` as MLS4 for decode, keeping the MLS8 copy for prefill.
     /// Decode then reads 4 bit per weight instead of 8 on the 0.78 GB per token the mixing costs; `prefill` keeps
     /// working unchanged because `gemm_i8_hcmix` and `gemm_i8_sk` have no int4 form.
@@ -133,8 +154,16 @@ impl Family {
         }
     }
 
-    /// Format of one output tensor. `mls3` is the resolved inclusive layer range for the MoE `gate`/`up`.
-    pub fn classify(self, name: &str, shape: &[usize], opts: &Options, mls3: Option<(usize, usize)>) -> Kind {
+    /// Format of one output tensor. `mls3` is the resolved inclusive layer range for the MoE `gate`/`up`; `mls2`
+    /// is the same for both routed projections at 2 bits.
+    pub fn classify(
+        self,
+        name: &str,
+        shape: &[usize],
+        opts: &Options,
+        mls3: Option<(usize, usize)>,
+        mls2: Option<(usize, usize)>,
+    ) -> Kind {
         if name == "lm_head.weight" {
             return Kind::Mls8;
         }
@@ -163,6 +192,22 @@ impl Family {
         {
             return Kind::Mls8;
         }
+        // MLS2 is the routed-expert format. A family that stacks its shared expert into the same matrix (Qwen's
+        // `shared_expert_gate`) has to keep it in the same packing: one stacked buffer has one stride, and the
+        // shared expert is expert E of it. Dense linears keep 4 or 8 bits. The MTP layer is deliberately left at
+        // 4 bits: it drafts, and a worse draft costs accepted tokens on every step.
+        let routed =
+            name.ends_with("mlp.experts.gate_up_proj") || (opts.mls2_down && name.ends_with("mlp.experts.down_proj"));
+        let shared = name.ends_with("mlp.shared_expert.gate_proj.weight")
+            || name.ends_with("mlp.shared_expert.up_proj.weight")
+            || (opts.mls2_down && name.ends_with("mlp.shared_expert.down_proj.weight"));
+        if let Some((from, to)) = mls2
+            && !name.starts_with("mtp.")
+            && (routed || shared)
+            && layer_index(name).is_some_and(|i| (from..=to).contains(&i))
+        {
+            return Kind::Mls2;
+        }
         // Only the fused gate/up of the routed experts goes to 3 bit: `down` and the shared expert stay at 4.
         if let Some((from, to)) = mls3
             && name.ends_with("mlp.experts.gate_up_proj")
@@ -185,6 +230,22 @@ impl Family {
                 last.checked_sub(1 + MLS3_SKIP_LAST_LAYERS).map(|to| (from, to))
             }
             Family::Qwen35 | Family::Qwen4Exp | Family::Dflash => None,
+        }
+    }
+
+    /// The MLS2 layer range the family chose. Only Qwen3.8-Flash-Next is measured with it; a family that has not been
+    /// checked keeps every expert at 4 bit.
+    fn default_mls2(self, cfg: &serde_json::Value) -> Option<(usize, usize)> {
+        match self {
+            Family::Qwen4Exp => {
+                let t = if cfg["text_config"].is_object() {
+                    &cfg["text_config"]
+                } else {
+                    cfg
+                };
+                t["num_hidden_layers"].as_u64().map(|n| (0, n as usize - 1))
+            }
+            Family::Qwen35 | Family::Ling3 | Family::Dflash => None,
         }
     }
 }
@@ -402,6 +463,33 @@ fn quantize_mls3(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     (q, s)
 }
 
+fn quantize_mls2(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    let signs = quant::hadamard_signs(HADAMARD_SEED);
+    let g = k / BLOCK;
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+        .into_par_iter()
+        .map(|r| {
+            let mut row = w[r * k..(r + 1) * k].to_vec();
+            quant::rotate_row(&mut row, &signs);
+            let mut q = Vec::with_capacity(k / 4);
+            let mut s = Vec::with_capacity(g * 2);
+            for grp in row.as_chunks::<BLOCK>().0 {
+                let (bits, sc) = quant::quantize_group_int2(grp, Int2Grid::E2m1);
+                q.extend_from_slice(&bits);
+                s.extend_from_slice(&half::f16::from_f32(sc).to_le_bytes());
+            }
+            (q, s)
+        })
+        .collect();
+    let mut q = Vec::with_capacity(n * k / 4);
+    let mut s = Vec::with_capacity(n * g * 2);
+    for (a, b) in rows {
+        q.extend(a);
+        s.extend(b);
+    }
+    (q, s)
+}
+
 fn quantize_mls8(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     let signs = quant::hadamard_signs(HADAMARD_SEED);
     let rows: Vec<(Vec<u8>, f32)> = (0..n)
@@ -459,6 +547,7 @@ fn plan(
     fam: Family,
     geom: Option<MoeGeom>,
     mls3: Option<(usize, usize)>,
+    mls2: Option<(usize, usize)>,
 ) -> Result<Vec<Out>> {
     let mut outs = Vec::new();
     let mut seen_tables = std::collections::HashSet::new();
@@ -474,7 +563,7 @@ fn plan(
                     let which = if gate_up { "gate_up_proj" } else { "down_proj" };
                     let name = format!("{prefix}.mlp.experts.{which}");
                     let shape = fused_shape(g, gate_up);
-                    let kind = fam.classify(&name, &shape, opts, mls3);
+                    let kind = fam.classify(&name, &shape, opts, mls3, mls2);
                     ensure!(kind != Kind::Raw, "{name}: experts must be quantized");
                     let parts = expert_parts(g, &prefix, gate_up);
                     for p in &parts {
@@ -613,7 +702,7 @@ fn plan(
             });
             continue;
         }
-        let kind = fam.classify(name, &info.shape, opts, mls3);
+        let kind = fam.classify(name, &info.shape, opts, mls3, mls2);
         let mut o = one(kind);
         if kind != Kind::Raw {
             ensure!(
@@ -717,12 +806,21 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
         Mls3Layers::Range(from, to) => Some((from, to)),
         Mls3Layers::Family => fam.default_mls3(&cfg),
     };
+    let mls2 = match opts.mls2_layers {
+        Mls2Layers::Off => None,
+        Mls2Layers::Range(from, to) => Some((from, to)),
+        Mls2Layers::Family => fam.default_mls2(&cfg),
+    };
     match mls3 {
         Some((from, to)) => log(&format!("MoE gate/up at MLS3 for layers {from}..={to}")),
         None => log("every expert at MLS4"),
     }
+    match mls2 {
+        Some((from, to)) => log(&format!("routed experts at MLS2 for layers {from}..={to}")),
+        None => log("no routed expert at MLS2"),
+    }
 
-    let plan = plan(&st, &names, opts, fam, geom, mls3)?;
+    let plan = plan(&st, &names, opts, fam, geom, mls3, mls2)?;
     let calib = opts.mls4_from.as_deref().map(SafeTensors::open_dir).transpose()?;
     let mut calibrated = 0;
     let mut bytes = 0usize;
@@ -740,6 +838,10 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
             Kind::Raw => {
                 let info = st.info(&o.name).context("info")?;
                 add(&o.name, info.dtype, &info.shape);
+            }
+            Kind::Mls2 => {
+                add(&o.name, DType::Mls2, &o.shape);
+                add(&format!("{}.scales", o.name), DType::F16, &dims(&[k / BLOCK]));
             }
             Kind::Mls3 => {
                 add(&o.name, DType::Mls3, &o.shape);
@@ -864,8 +966,9 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
                     wf[d..d + p.k].copy_from_slice(&src[r * p.k..(r + 1) * p.k]);
                 }
             }
-            if matches!(o.kind, Kind::Mls3 | Kind::Mls4) && cal.is_none() {
+            if matches!(o.kind, Kind::Mls2 | Kind::Mls3 | Kind::Mls4) && cal.is_none() {
                 let (q, s) = match o.kind {
+                    Kind::Mls2 => quantize_mls2(&wf, rows, k),
                     Kind::Mls3 => quantize_mls3(&wf, rows, k),
                     _ => quantize_mls4(&wf, rows, k),
                 };
@@ -878,7 +981,7 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
                 s8.extend(s);
             }
         }
-        if matches!(o.kind, Kind::Mls3 | Kind::Mls4) {
+        if matches!(o.kind, Kind::Mls2 | Kind::Mls3 | Kind::Mls4) {
             if let Some(c) = cal {
                 (qd, sd) = read_calibrated(c, o, n, k)?;
             }
@@ -968,6 +1071,8 @@ mod tests {
             keep_int8_layers: vec![],
             mls4_from: None,
             mls3_layers: Mls3Layers::Off,
+            mls2_layers: Mls2Layers::Off,
+            mls2_down: false,
             hc_mls4: false,
         }
     }
@@ -990,7 +1095,7 @@ mod tests {
     #[test]
     fn ling3_classification() {
         let o = opts();
-        let c = |name: &str, shape: &[usize]| Family::Ling3.classify(name, shape, &o, None);
+        let c = |name: &str, shape: &[usize]| Family::Ling3.classify(name, shape, &o, None, None);
         let l2 = "model.layers.2.";
         let l5 = "model.layers.5.";
         // KDA (layer 2)
@@ -1046,7 +1151,7 @@ mod tests {
     #[test]
     fn qwen35_classification_is_unchanged() {
         let o = opts();
-        let c = |name: &str| Family::Qwen35.classify(name, &[4096, 2048], &o, None);
+        let c = |name: &str| Family::Qwen35.classify(name, &[4096, 2048], &o, None, None);
         assert_eq!(c("model.language_model.layers.0.self_attn.q_proj.weight"), Kind::Mls4);
         assert_eq!(c("model.language_model.layers.3.mlp.experts.gate_up_proj"), Kind::Mls4);
         assert_eq!(
@@ -1066,6 +1171,7 @@ mod tests {
                 "model.language_model.layers.3.mlp.experts.gate_up_proj",
                 &[1, 1, 128],
                 &keep,
+                None,
                 None
             ),
             Kind::Mls8
@@ -1089,7 +1195,7 @@ mod tests {
 
         let o = opts();
         let m3 = Some((2, 34));
-        let c = |name: &str, shape: &[usize]| Family::Ling3.classify(name, shape, &o, m3);
+        let c = |name: &str, shape: &[usize]| Family::Ling3.classify(name, shape, &o, m3, None);
         let gu = &[512, 1536, 2560][..];
         let dn = &[512, 2560, 768][..];
         assert_eq!(c("model.layers.2.mlp.experts.gate_up_proj", gu), Kind::Mls3);
@@ -1105,7 +1211,7 @@ mod tests {
         assert_eq!(c("model.layers.2.attention.q_proj.weight", &[4096, 2560]), Kind::Mls4);
         assert_eq!(c("model.layers.0.mlp.gate_proj.weight", &[6144, 2560]), Kind::Mls4);
         // An explicit empty range turns MLS3 off everywhere.
-        let none = |name: &str| Family::Ling3.classify(name, gu, &o, Some((1, 0)));
+        let none = |name: &str| Family::Ling3.classify(name, gu, &o, Some((1, 0)), None);
         assert_eq!(none("model.layers.2.mlp.experts.gate_up_proj"), Kind::Mls4);
 
         // 48 bytes of codes + 2 of scale per group of 128 = 3.125 bpw.
@@ -1114,6 +1220,97 @@ mod tests {
         assert_eq!(
             DType::Mls3.size_of_elems(n) + DType::F16.size_of_elems(n / BLOCK),
             n * 25 / 64
+        );
+    }
+
+    #[test]
+    fn mls2_covers_both_routed_projections_and_nothing_else() {
+        let cfg = serde_json::json!({"text_config": {"num_hidden_layers": 48}});
+        assert_eq!(Family::Qwen4Exp.default_mls2(&cfg), Some((0, 47)));
+        assert_eq!(Family::Qwen35.default_mls2(&cfg), None);
+        assert_eq!(Family::Ling3.default_mls2(&cfg), None);
+
+        let o = opts();
+        let m2 = Some((0, 47));
+        let c = |name: &str, shape: &[usize]| Family::Qwen4Exp.classify(name, shape, &o, None, m2);
+        let gu = &[512, 1280, 2560][..];
+        let dn = &[512, 2560, 640][..];
+        assert_eq!(
+            c("model.language_model.layers.0.mlp.experts.gate_up_proj", gu),
+            Kind::Mls2
+        );
+        // The default keeps `down` at 4 bit: it is a third of the routed parameters and the half of the matrix the
+        // 2-bit codes hurt most in the golden.
+        assert_eq!(
+            c("model.language_model.layers.47.mlp.experts.down_proj", dn),
+            Kind::Mls4
+        );
+        assert_eq!(
+            c(
+                "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+                &[640, 2560]
+            ),
+            Kind::Mls2
+        );
+        assert_eq!(
+            c(
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+                &[2560, 640]
+            ),
+            Kind::Mls4
+        );
+        assert_eq!(
+            c(
+                "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+                &[1, 2560]
+            ),
+            Kind::Raw
+        );
+        // With `--mls2-down` the whole routed expert follows.
+        let both = Options {
+            mls2_down: true,
+            ..opts()
+        };
+        let c2 = |name: &str, shape: &[usize]| Family::Qwen4Exp.classify(name, shape, &both, None, m2);
+        assert_eq!(
+            c2("model.language_model.layers.47.mlp.experts.down_proj", dn),
+            Kind::Mls2
+        );
+        assert_eq!(
+            c2(
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+                &[2560, 640]
+            ),
+            Kind::Mls2
+        );
+        assert_eq!(
+            c("model.language_model.layers.0.self_attn.q_proj.weight", &[4096, 2560]),
+            Kind::Mls4
+        );
+        assert_eq!(c("mtp.layers.0.mlp.experts.gate_up_proj", gu), Kind::Mls4);
+        assert_eq!(c("mtp.layers.0.mlp.experts.down_proj", dn), Kind::Mls4);
+        // An explicit range is inclusive, and an empty one turns MLS2 off.
+        let one = |name: &str| Family::Qwen4Exp.classify(name, gu, &o, None, Some((3, 3)));
+        assert_eq!(
+            one("model.language_model.layers.3.mlp.experts.gate_up_proj"),
+            Kind::Mls2
+        );
+        assert_eq!(
+            one("model.language_model.layers.4.mlp.experts.gate_up_proj"),
+            Kind::Mls4
+        );
+        let none = |name: &str| Family::Qwen4Exp.classify(name, gu, &o, None, Some((1, 0)));
+        assert_eq!(
+            none("model.language_model.layers.3.mlp.experts.gate_up_proj"),
+            Kind::Mls4
+        );
+
+        // 32 bytes of codes + 2 of scale per group of 128 = 2.125 bpw.
+        let n = 512 * 1280 * 2560;
+        assert_eq!(DType::Mls2.size_of_elems(n), n / 4);
+        assert_eq!(
+            DType::Mls2.size_of_elems(n) + DType::F16.size_of_elems(n / BLOCK),
+            n * 17 / 64
         );
     }
 

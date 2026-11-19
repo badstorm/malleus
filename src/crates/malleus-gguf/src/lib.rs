@@ -12,6 +12,7 @@ pub enum DType {
     I8,
     I32,
     I64,
+    Mls2,
     Mls3,
     Mls4,
     Mls8,
@@ -24,7 +25,9 @@ impl DType {
             DType::I64 => n * 8,
             DType::F16 | DType::BF16 => n * 2,
             DType::I8 => n,
-            // MLS3 packs 8 codes per 3 bytes; quantized tensors always have a K that is a multiple of 128.
+            // MLS2 packs 4 codes per byte, MLS3 8 codes per 3 bytes; quantized tensors always have a K that is a
+            // multiple of 128.
+            DType::Mls2 => n / 4,
             DType::Mls3 => n / 8 * 3,
             DType::Mls4 => n / 2,
             DType::Mls8 => n,

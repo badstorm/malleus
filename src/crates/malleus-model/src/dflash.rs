@@ -301,7 +301,9 @@ impl DflashDraft {
 fn weights_bytes(w: &Weights) -> usize {
     match w {
         Weights::Bf16(b) => b.len(),
-        Weights::Mls4 { q, sc } | Weights::Mls3 { q, sc } | Weights::Mls8 { q, sc } => q.len() + sc.len(),
+        Weights::Mls2 { q, sc } | Weights::Mls4 { q, sc } | Weights::Mls3 { q, sc } | Weights::Mls8 { q, sc } => {
+            q.len() + sc.len()
+        }
     }
 }
 

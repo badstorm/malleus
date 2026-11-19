@@ -267,6 +267,22 @@ __device__ __forceinline__ void nib_to_s8(uint32_t w, uint32_t& lo, uint32_t& hi
     hi = __builtin_amdgcn_perm(os, es, 0x07030602u);
 }
 
+// Sixteen 2-bit codes (four bytes) -> sixteen int8 levels in four u32. The four levels are -3, -1, 1, 3, the
+// integer form of MLS2's -1.5, -0.5, 0.5, 1.5: the 0.5 lives in the group scale.
+__device__ __forceinline__ void w2_to_s8(uint32_t w, uint32_t o[4]) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint32_t d = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int c = (int)((w >> (2 * (4 * j + i))) & 3u);
+            const int v = 2 * c - 3;
+            d |= ((uint32_t)v & 0xffu) << (8 * i);
+        }
+        o[j] = d;
+    }
+}
+
 // out[T, N] (+)= (xq[T, K] * xsc[T, K / 128]) . W[N, K]^T with int8 WMMA. W4: MLS4 nibbles + fp16 scale per 128-group;
 // otherwise MLS8 int8 + fp32 scale per row. One 128-wide K group per step: int32 partial sums are folded into fp32
 // with the group scale. 256 threads = 8 waves as WAVES_T x (8 / WAVES_T).
@@ -440,20 +456,22 @@ GEMM_A4(gemm_w4a4_m32, 32, 1)
 // Otherwise, as gemm_a8_impl: the weight group is widened to int8 in LDS,
 // int32 WMMA per 128-group folded into fp32 with both scales. GLU: N = 2I, per expert I gate rows then I up rows;
 // a 128-column tile takes 16-row blocks of gate and up in turn and writes silu(gate) * up to out [P, I].
-template <int BM, int WAVES_T, bool GLU, bool A4, bool YB = false>
+template <int BM, int WAVES_T, bool GLU, bool A4, bool YB = false, bool W2 = false>
 __device__ __forceinline__ void moe_a4_impl(float* out, const int8_t* xq, const float* xsc, const uint8_t* q,
                                             const __half* sc, const int* offs, const int2* tiles, const int* ntiles,
                                             int N, int K) {
+    static_assert(!(A4 && W2), "the int4 path is for MLS4 weights");
     constexpr int WAVES_N = 8 / WAVES_T, WT = BM / WAVES_T, WN = BN / WAVES_N, FA = WT / 16, FB = WN / 16;
     // Bytes of one 128-wide K group held in LDS per row: 128 with the activations widened to int8, 64 when both
     // operands stay nibbles (A4). The 72-byte A4 row stride keeps the fragment loads bank-conflict free but is only
     // 8-byte aligned, so that path moves everything 8 bytes at a time; the weight group is 64 nibble bytes either
     // way, loaded by the two threads of a row at wpart * 32.
     constexpr int XP = 256 / BM, AB = A4 ? 64 : 128, STR = A4 ? 72 : 144, XBA = AB / XP;
-    // Where the two threads of a weight row write: 32 nibble bytes stay 32 bytes, widened to int8 they are 64.
-    constexpr int WOB = A4 ? 32 : 64;
+    // Where the two threads of a weight row write: for MLS4 32 nibble bytes stay 32 bytes, widened to int8 they are
+    // 64; MLS2 loads 16 packed bytes and widens them to 64 int8. The row is 128 int8 either way.
+    constexpr int WOB = A4 ? 32 : 64, WGB = W2 ? 16 : 32;
     using VT = std::conditional_t<A4, uint2, uint4>;
-    constexpr int VS = (int)sizeof(VT), XV = XBA / VS, XGS = AB / VS, WVN = 32 / VS, WGS = 64 / VS;
+    constexpr int VS = (int)sizeof(VT), XV = XBA / VS, XGS = AB / VS, WVN = WGB / VS, WGS = (2 * WGB) / VS;
     // Two LDS stages: group g + 1 writes into the other stage while the waves are still multiplying g, so one
     // barrier per group instead of two and the global loads overlap the WMMA. `gemm_a8_impl` already works this way
     // (85 % of the int8 ceiling); without it, the grouped MoE sat at 15 % of the int4 one.
@@ -468,7 +486,7 @@ __device__ __forceinline__ void moe_a4_impl(float* out, const int8_t* xq, const 
     const int2 td = tiles[tile];
     const int e = td.x, r0 = offs[e] + td.y, T = min(BM, offs[e + 1] - r0);
     const int G = K / 128, I = N / 2;
-    const uint8_t* qe = q + (size_t)e * N * (K / 2);
+    const uint8_t* qe = q + (size_t)e * N * (W2 ? K / 4 : K / 2);
     const __half* se = sc + (size_t)e * N * G;
     const int n0 = nb * BN;
     const int wt = (wave / WAVES_N) * WT, wn = (wave % WAVES_N) * WN;
@@ -482,7 +500,7 @@ __device__ __forceinline__ void moe_a4_impl(float* out, const int8_t* xq, const 
     const int v = min(n0 + wrow, N - 1);
     const int n = GLU ? (v >> 5) * 16 + (v & 15) + ((v >> 4) & 1) * I : v;
     const VT* xp = (const VT*)(xq + (size_t)t * (A4 ? K / 2 : K) + xpart * XBA);
-    const VT* qp = (const VT*)(qe + (size_t)n * (K / 2) + wpart * 32);
+    const VT* qp = (const VT*)(qe + (size_t)n * (W2 ? K / 4 : K / 2) + wpart * WGB);
     VT xv[XV], wv[WVN];
     float wscv = 1.f;
     auto load = [&](int g) {
@@ -490,7 +508,7 @@ __device__ __forceinline__ void moe_a4_impl(float* out, const int8_t* xq, const 
         for (int i = 0; i < XV; ++i) xv[i] = xp[g * XGS + i];
 #pragma unroll
         for (int i = 0; i < WVN; ++i) wv[i] = qp[g * WGS + i];
-        wscv = __half2float(se[(size_t)n * G + g]);
+        wscv = __half2float(se[(size_t)n * G + g]) * (W2 ? 0.5f : 1.0f);
     };
     // Il gruppo appena letto in `xv`/`wv` va nello stadio `pb`.
     auto stage = [&](int g, int pb) {
@@ -498,7 +516,14 @@ __device__ __forceinline__ void moe_a4_impl(float* out, const int8_t* xq, const 
         for (int i = 0; i < XV; ++i) ((VT*)&xs[pb][xrow][xpart * XBA])[i] = xv[i];
         if (tid < BM) xgs[pb][tid] = xsc[(size_t)(r0 + min(tid, T - 1)) * G + g];
         VT* d = (VT*)&ws[pb][wrow][wpart * WOB];
-        if constexpr (A4) {
+        if constexpr (W2) {
+            const uint32_t* w2 = (const uint32_t*)wv;
+            uint32_t o[16];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) w2_to_s8(w2[i], &o[4 * i]);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) d[i] = (uint4){o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]};
+        } else if constexpr (A4) {
 #pragma unroll
             for (int i = 0; i < WVN; ++i) d[i] = wv[i];
         } else {
@@ -639,6 +664,25 @@ MOE_A4(moe_w4a8_m32_yh, 32, 2, false, 8, false, true)
 MOE_A4(moe_w4a4_yh, 64, 2, false, MOE_WPE_DN, true, true)
 MOE_A4(moe_w4a4_m128_yh, 128, 4, false, 8, true, true)
 MOE_A4(moe_w4a4_m32_yh, 32, 2, false, 8, true, true)
+
+// MLS2 experts: same grouped GEMM with the 2-bit weights widened to int8 in LDS. The scale is multiplied by 0.5 on
+// load, because the four levels are carried as -3, -1, 1, 3.
+#define MOE_W2(NAME, BM, WT, GLU, WPE, YB)                                                                        \
+    extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(WPE)))                    \
+        NAME(float* out, const int8_t* xq, const float* xsc, const uint8_t* q, const __half* sc, const int* offs,  \
+             const int2* tiles, const int* ntiles, int N, int K) {                                                \
+        moe_a4_impl<BM, WT, GLU, false, YB, true>(out, xq, xsc, q, sc, offs, tiles, ntiles, N, K);                 \
+    }
+
+MOE_W2(moe_w2a8_glu, 64, 2, true, 8, false)
+MOE_W2(moe_w2a8, 64, 2, false, MOE_WPE_DN, false)
+MOE_W2(moe_w2a8_glu_m128, 128, 4, true, 8, false)
+MOE_W2(moe_w2a8_m128, 128, 4, false, 8, false)
+MOE_W2(moe_w2a8_glu_m32, 32, 2, true, 8, false)
+MOE_W2(moe_w2a8_m32, 32, 2, false, 8, false)
+MOE_W2(moe_w2a8_yh, 64, 2, false, MOE_WPE_DN, true)
+MOE_W2(moe_w2a8_m128_yh, 128, 4, false, 8, true)
+MOE_W2(moe_w2a8_m32_yh, 32, 2, false, 8, true)
 
 // xg[r] = xq[perm[r] / slots] (int4 rows of K / 2 bytes) with its K / 128 group scales.
 extern "C" __global__ void __launch_bounds__(128) moe_gather_g4(int8_t* xg, float* sg, const int8_t* xq,

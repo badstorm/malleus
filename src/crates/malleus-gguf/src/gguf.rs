@@ -26,6 +26,7 @@ const GGML_I8: u32 = 24;
 const GGML_I32: u32 = 26;
 const GGML_I64: u32 = 27;
 const GGML_BF16: u32 = 30;
+pub const GGML_MLS2: u32 = 0x4D4C_0002;
 pub const GGML_MLS3: u32 = 0x4D4C_0003;
 pub const GGML_MLS4: u32 = 0x4D4C_0004;
 pub const GGML_MLS8: u32 = 0x4D4C_0008;
@@ -38,6 +39,7 @@ fn dtype_to_ggml(d: DType) -> u32 {
         DType::I8 => GGML_I8,
         DType::I32 => GGML_I32,
         DType::I64 => GGML_I64,
+        DType::Mls2 => GGML_MLS2,
         DType::Mls3 => GGML_MLS3,
         DType::Mls4 => GGML_MLS4,
         DType::Mls8 => GGML_MLS8,
@@ -52,6 +54,7 @@ fn ggml_to_dtype(t: u32) -> Result<DType> {
         GGML_I8 => DType::I8,
         GGML_I32 => DType::I32,
         GGML_I64 => DType::I64,
+        GGML_MLS2 => DType::Mls2,
         GGML_MLS3 => DType::Mls3,
         GGML_MLS4 => DType::Mls4,
         GGML_MLS8 => DType::Mls8,

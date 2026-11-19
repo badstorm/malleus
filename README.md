@@ -57,6 +57,8 @@ against 191.7 tok/s, tg128 5.02 against 4.74), and the MTP head breaks the ~5.8 
   randomized Hadamard rotation, group size 128, GPTQ-calibrated) for decode *and* prompt processing; `convert
   --prefill-int8` adds an **MLS8** (int8 per channel) copy so the prompt is read at 8 bits instead — twice the file,
   better prompts, decode unchanged. The name says which one it is: `-mls4` is one copy, `-mls4-mls8` is both.
+  `--expert-mls2` stores the routed expert gate/up at **2 bits** (with `--mls2-down` the down projection too); it is
+  opt-in and off by default, and [MODELS.md](MODELS.md) has the measurement that keeps it there.
 - **Kernels**: hand-written HIP for gfx1150 and gfx1151 — GEMV for decode, fused W8A8 WMMA GEMMs for prefill, chunked
   Gated DeltaNet, flash-decoding attention, vision tower.
 - **Host**: a single Rust binary (`malleus`); `unsafe` confined to the HIP bindings; no Python at runtime.

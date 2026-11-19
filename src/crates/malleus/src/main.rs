@@ -95,6 +95,13 @@ enum Cmd {
         /// or an inclusive `A-B`
         #[arg(long, default_value = "family")]
         expert_mls3: String,
+        /// MoE layers whose routed gate/up are stored at 2 bit: `family` (Qwen3.8-Flash-Next: every routed expert
+        /// of the main stack), `off`, or an inclusive `A-B`
+        #[arg(long, default_value = "off")]
+        expert_mls2: String,
+        /// Also store the routed down projection at 2 bit instead of 4
+        #[arg(long)]
+        mls2_down: bool,
         /// Also store the hyper-connection mixing as MLS4 for decode, keeping the MLS8 copy for prefill
         #[arg(long)]
         hc_mls4: bool,
@@ -1646,6 +1653,126 @@ fn kernel_test() -> Result<()> {
             println!("T={t:4} {name:16} rel err {:.2e}", rel_err(&b, &a));
         }
     }
+    // MLS2 (2-bit) GEMV/GEMM against a host reference built from the same quantizer: the kernel's own rounding is
+    // the only thing under test, so the weights are generated, rotated and quantized here, then dequantized back.
+    {
+        use malleus_gguf::quant::{self, BLOCK, INT2_GROUP_BYTES, Int2Grid};
+        let (n2, kd2) = (256usize, 1024usize);
+        let signs2 = quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED);
+        let (mut q2, mut sc2, mut wdeq) = (
+            vec![0u8; n2 * kd2 / 4],
+            vec![0u16; n2 * kd2 / BLOCK],
+            vec![0f32; n2 * kd2],
+        );
+        for r in 0..n2 {
+            let mut row: Vec<f32> = (0..kd2).map(|_| rnd()).collect();
+            quant::rotate_row(&mut row, &signs2);
+            for (g, grp) in row.as_chunks::<BLOCK>().0.iter().enumerate() {
+                let (bits, sc) = quant::quantize_group_int2(grp, Int2Grid::E2m1);
+                let at = r * (kd2 / 4) + g * INT2_GROUP_BYTES;
+                q2[at..at + INT2_GROUP_BYTES].copy_from_slice(&bits);
+                sc2[r * (kd2 / BLOCK) + g] = half::f16::from_f32(sc).to_bits();
+                let mut dq = [0f32; BLOCK];
+                quant::dequant_int2(&bits, sc, Int2Grid::E2m1, &mut dq);
+                wdeq[r * kd2 + g * BLOCK..r * kd2 + (g + 1) * BLOCK].copy_from_slice(&dq);
+            }
+        }
+        let (qd2, scd2) = (DeviceBuffer::from_slice(&q2)?, DeviceBuffer::from_slice(&sc2)?);
+        for (t, name) in [(1usize, "gemv_mls2"), (5, "gemm_mls2"), (24, "gemm_mls2")] {
+            let x: Vec<f32> = (0..t * kd2).map(|_| rnd() * 3.0).collect();
+            let mut xr = x.clone();
+            for row in xr.chunks_mut(kd2) {
+                quant::rotate_row(row, &signs2);
+            }
+            let xd = DeviceBuffer::from_slice(&xr)?;
+            let out = DeviceBuffer::zeroed(t * n2 * 4)?;
+            let grid = if t == 1 {
+                (n2.div_ceil(32) as u32, 1, 1)
+            } else {
+                (n2.div_ceil(16) as u32, t.div_ceil(8) as u32, 1)
+            };
+            k.get(name).launch(
+                grid,
+                (256, 1, 1),
+                0,
+                &s,
+                &[
+                    (&out).into(),
+                    (&xd).into(),
+                    (&qd2).into(),
+                    (&scd2).into(),
+                    t.into(),
+                    n2.into(),
+                    kd2.into(),
+                    0i32.into(),
+                ],
+            )?;
+            let mut reference = vec![0f32; t * n2];
+            for a in 0..t {
+                for r in 0..n2 {
+                    reference[a * n2 + r] = (0..kd2).map(|kk| xr[a * kd2 + kk] * wdeq[r * kd2 + kk]).sum();
+                }
+            }
+            let got = out.download::<f32>(t * n2)?;
+            println!("T={t:4} {name:16} rel err {:.2e}", rel_err(&got, &reference));
+            assert!(
+                rel_err(&got, &reference) < 1e-3,
+                "{name} disagree with the host reference"
+            );
+        }
+        // The grouped W2A8 prefill kernel on one expert that owns every row, against the same host reference with
+        // the activation quantized exactly as the kernel sees it.
+        for (t, bm) in [(5usize, 64usize), (24, 64), (130, 64), (130, 128)] {
+            let x: Vec<f32> = (0..t * kd2).map(|_| rnd() * 3.0).collect();
+            let xd = DeviceBuffer::from_slice(&x)?;
+            let (xq, xsc) = (DeviceBuffer::zeroed(t * kd2)?, DeviceBuffer::zeroed(t * kd2 / 128 * 4)?);
+            k.get("rot_quant_i8").launch(
+                ((t * kd2 / 128) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                &s,
+                &[(&xq).into(), (&xsc).into(), (&xd).into(), (&signs).into(), kd2.into()],
+            )?;
+            let nt = t.div_ceil(bm);
+            let tv: Vec<i32> = (0..nt).flat_map(|i| [0i32, (i * bm) as i32]).collect();
+            let (tiles, ntl) = (DeviceBuffer::from_slice(&tv)?, DeviceBuffer::from_slice(&[nt as i32])?);
+            let offs = DeviceBuffer::from_slice(&[0i32, t as i32])?;
+            let out = DeviceBuffer::zeroed(t * n2 * 4)?;
+            let args: [Arg; 10] = [
+                (&out).into(),
+                (&xq).into(),
+                (&xsc).into(),
+                (&qd2).into(),
+                (&scd2).into(),
+                (&offs).into(),
+                (&tiles).into(),
+                (&ntl).into(),
+                n2.into(),
+                kd2.into(),
+            ];
+            k.get(if bm == 128 { "moe_w2a8_m128" } else { "moe_w2a8" }).launch(
+                ((nt * n2.div_ceil(128)) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                &s,
+                &args,
+            )?;
+            let xi: Vec<i8> = xq.download(t * kd2)?;
+            let xs: Vec<f32> = xsc.download(t * kd2 / 128)?;
+            let mut reference = vec![0f32; t * n2];
+            for a in 0..t {
+                for r in 0..n2 {
+                    reference[a * n2 + r] = (0..kd2)
+                        .map(|kk| xi[a * kd2 + kk] as f32 * xs[a * (kd2 / 128) + kk / 128] * wdeq[r * kd2 + kk])
+                        .sum();
+                }
+            }
+            let got = out.download::<f32>(t * n2)?;
+            let err = rel_err(&got, &reference);
+            println!("T={t:4} moe_w2a8(bm={bm:3}) rel err {err:.2e}");
+            assert!(err < 1e-3, "moe_w2a8 disagrees with the host reference");
+        }
+    }
     // The one-wave rotation + quantizer must produce the same bytes as the 128-thread shared-memory one, which is
     // the reference the converter's host rotation agrees with: same arithmetic, same order, so the bytes are equal
     // rather than close.
@@ -1746,6 +1873,8 @@ fn main() -> Result<()> {
             keep_int8_layers,
             mls4_from,
             expert_mls3,
+            expert_mls2,
+            mls2_down,
             hc_mls4,
         } => {
             let mls3_layers = match expert_mls3.as_str() {
@@ -1758,6 +1887,16 @@ fn main() -> Result<()> {
                     malleus_convert::Mls3Layers::Range(a.trim().parse()?, b.trim().parse()?)
                 }
             };
+            let mls2_layers = match expert_mls2.as_str() {
+                "family" => malleus_convert::Mls2Layers::Family,
+                "off" => malleus_convert::Mls2Layers::Off,
+                s => {
+                    let (a, b) = s.split_once('-').ok_or_else(|| {
+                        anyhow::anyhow!("--expert-mls2 `{s}`: expected `family`, `off` or an inclusive `A-B`")
+                    })?;
+                    malleus_convert::Mls2Layers::Range(a.trim().parse()?, b.trim().parse()?)
+                }
+            };
             if no_prefill_int8 {
                 eprintln!("note: --no-prefill-int8 is the default now, the flag does nothing");
             }
@@ -1767,6 +1906,8 @@ fn main() -> Result<()> {
                 keep_int8_layers,
                 mls4_from,
                 mls3_layers,
+                mls2_layers,
+                mls2_down,
                 hc_mls4,
             };
             if out.extension().and_then(|e| e.to_str()) != Some(malleus_gguf::gguf::EXTENSION) {

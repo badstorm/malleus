@@ -500,6 +500,11 @@ fn i8_kernel(t: usize, glu: bool) -> (&'static str, usize, usize) {
 
 pub enum Weights {
     Bf16(DeviceBuffer),
+    /// 2-bit codes with an fp16 scale per group of 128: the routed experts of Qwen3.8-Flash-Next (MLS2).
+    Mls2 {
+        q: DeviceBuffer,
+        sc: DeviceBuffer,
+    },
     Mls4 {
         q: DeviceBuffer,
         sc: DeviceBuffer,
@@ -859,6 +864,10 @@ struct Moe {
     /// stride is silent garbage).
     gu_mls3: bool,
     down_mls3: bool,
+    /// The same two projections at 2 bits. A file never mixes MLS2 with MLS3 on one projection; one flag per
+    /// projection for the same reason as above.
+    gu_mls2: bool,
+    down_mls2: bool,
 }
 
 /// Dense prefill GEMMs on the MLS4 weights with int4 activations (MALLEUS_DENSE_W4A4=1): the int4 WMMA is double
@@ -970,6 +979,9 @@ fn load_moe(
     } else {
         "shared_expert"
     };
+    // A family that stacks its shared expert (Qwen's `shared_expert_gate`) writes the same packing for it: the
+    // converter keeps it on the routed grid, and one stacked buffer has one stride.
+    let shared_matrix = m.shared_gate;
     // Zeroed because the row of the shared expert must be zero when there is no gate to load into it: `into`
     // writes only the first e rows. (An `alloc` plus a `memset` of the whole buffer here erases the router.)
     let mut router = DeviceBuffer::zeroed((e + 1) * h * 2)?;
@@ -1000,7 +1012,7 @@ fn load_moe(
         ];
         // Families that stack the shared expert into the expert matrix (everything but Ling) keep it in its own
         // tensors, but the router addresses it as expert `experts`: the cache assembles that block from the three.
-        let shared = if m.shared_gate {
+        let shared = if shared_matrix {
             Some([
                 l(&format!("{se}.gate_proj.weight")),
                 l(&format!("{se}.gate_proj.weight.scales")),
@@ -1029,7 +1041,7 @@ fn load_moe(
     // Without a shared gate (Ling) the router still gives slot `topk` the expert id E, and the kernels index the
     // stacked matrices by that id: one expert row of zeros is cheaper than teaching every expert kernel that the
     // last slot may be absent, and the shared expert is added by its own Linears anyway.
-    let pad = if m.shared_gate { 0 } else { 1 };
+    let pad = if shared_matrix { 0 } else { 1 };
     let mut stack = |parts: &[(String, usize, usize)],
                      k: usize,
                      int8: bool,
@@ -1046,6 +1058,7 @@ fn load_moe(
             DType::Mls8 => (k, 4),
             DType::Mls4 => (k / 2, g * 2),
             DType::Mls3 => (k / 8 * 3, g * 2),
+            DType::Mls2 => (k / 4, g * 2),
             d => bail!("{d:?} is not a weight format for the stacked experts"),
         };
         let mut q = DeviceBuffer::alloc(rows * qb)?;
@@ -1077,7 +1090,7 @@ fn load_moe(
     // routed ones, so they cannot share the buffer and are loaded as their own Linears.
     let mut gu_parts = vec![(l("experts.gate_up_proj"), e * 2 * i, 0usize)];
     let mut down_parts = vec![(l("experts.down_proj"), e * h, 0usize)];
-    if m.shared_gate {
+    if shared_matrix {
         gu_parts.push((l(&format!("{se}.gate_proj.weight")), i, e * 2 * i));
         gu_parts.push((l(&format!("{se}.up_proj.weight")), i, e * 2 * i + i));
         down_parts.push((l(&format!("{se}.down_proj.weight")), h, e * h));
@@ -1120,7 +1133,9 @@ fn load_moe(
         None => (0.0, 0.0),
     };
     let is_mls3 = |name: &str| src.info(name).is_some_and(|i| i.dtype == DType::Mls3);
+    let is_mls2 = |name: &str| src.info(name).is_some_and(|i| i.dtype == DType::Mls2);
     let (gu_mls3, down_mls3) = (is_mls3(&l("experts.gate_up_proj")), is_mls3(&l("experts.down_proj")));
+    let (gu_mls2, down_mls2) = (is_mls2(&l("experts.gate_up_proj")), is_mls2(&l("experts.down_proj")));
     Ok(Moe {
         router,
         gu,
@@ -1132,6 +1147,8 @@ fn load_moe(
         swiglu,
         gu_mls3,
         down_mls3,
+        gu_mls2,
+        down_mls2,
     })
 }
 
@@ -1482,7 +1499,7 @@ fn permute_hc_up(l: &mut Linear, cnt: usize, hidden: usize) -> Result<bool> {
             permute_hc_rows(q, sc, l.n, k / 2, 2 * (k / malleus_gguf::quant::BLOCK), cnt, hidden)?
         }
         // Hyper-connections only exist in Qwen4Exp, whose mixing is MLS4 or MLS8.
-        Weights::Mls3 { .. } | Weights::Bf16(_) => return Ok(false),
+        Weights::Mls2 { .. } | Weights::Mls3 { .. } | Weights::Bf16(_) => return Ok(false),
     }
     if let Some((q, sc)) = &mut l.prefill {
         permute_hc_rows(q, sc, l.n, k, 4, cnt, hidden)?;
@@ -1499,6 +1516,7 @@ fn mls8_of(l: &Linear) -> Result<(&DeviceBuffer, &DeviceBuffer)> {
         (_, Some((q, sc))) => Ok((q, sc)),
         (Weights::Mls4 { .. }, None) => bail!("MLS4 weights and no MLS8 prefill copy"),
         (Weights::Mls3 { .. }, None) => bail!("MLS3 weights have no MLS8 form"),
+        (Weights::Mls2 { .. }, None) => bail!("MLS2 weights have no MLS8 form"),
         (Weights::Bf16(_), None) => bail!("bf16 weights have no MLS8 form"),
     }
 }
@@ -1830,6 +1848,10 @@ impl Uploader {
                 sc: self.typed(src, &format!("{pn}.scales"), DType::F32, &[n])?,
             },
             DType::BF16 => Weights::Bf16(self.tensor(src, &wn, &[n, k])?),
+            DType::Mls2 => Weights::Mls2 {
+                q: self.typed(src, &wn, DType::Mls2, &[n, k])?,
+                sc: self.typed(src, &format!("{wn}.scales"), DType::F16, &[n, g])?,
+            },
             DType::Mls4 => Weights::Mls4 {
                 q: self.typed(src, &wn, DType::Mls4, &[n, k])?,
                 sc: self.typed(src, &format!("{wn}.scales"), DType::F16, &[n, g])?,
@@ -3195,6 +3217,7 @@ impl Model {
                 (Weights::Mls3 { .. }, None) => {
                     bail!("MLS3 prefill (W3A8) is not wired yet: docs/ling3-engine.md, increment I7")
                 }
+                (Weights::Mls2 { .. }, None) => bail!("MLS2 is a routed-expert format, not a dense prefill weight"),
                 (Weights::Bf16(_), _) => unreachable!(),
             };
             debug_assert_eq!(w4, !row8);
@@ -3273,6 +3296,7 @@ impl Model {
                 (Weights::Mls3 { .. }, None) => {
                     bail!("MLS3 prefill (W3A8) is not wired yet: docs/ling3-engine.md, increment I7")
                 }
+                (Weights::Mls2 { .. }, None) => bail!("MLS2 is a routed-expert format, not a dense prefill weight"),
                 (Weights::Bf16(_), _) => unreachable!(),
             };
             let rot = [xh.into(), x.into(), (&self.signs).into(), w.k.into()];
@@ -3344,6 +3368,8 @@ impl Model {
             // is no fused-rotation variant of them yet (docs/model-ling3-flash.md, § MLS3: da fare).
             (Weights::Mls3 { q, sc }, _, 1) => ("gemv_mls3", q, sc),
             (Weights::Mls3 { q, sc }, _, _) => ("gemm_mls3", q, sc),
+            (Weights::Mls2 { q, sc }, _, 1) => ("gemv_mls2", q, sc),
+            (Weights::Mls2 { q, sc }, _, _) => ("gemm_mls2", q, sc),
             (Weights::Mls8 { q, sc }, _, 1..=GEMV_MAX_T) => (L8[t - 1], q, sc),
             (_, Some((q, sc)), _) => ("gemm_mls8", q, sc),
             (Weights::Mls4 { q, sc }, _, _) => ("gemm_mls4", q, sc),
@@ -5064,7 +5090,7 @@ impl Model {
         // Otherwise the pool is read with slot indices.
         let pool_fits = cache.is_none_or(|c| p <= c.expert_slots());
         let staged = match cache {
-            Some(_) if !pool_fits || (self.fused_ok(t) && !m.gu_mls3 && !m.down_mls3) => {
+            Some(_) if !pool_fits || (self.fused_ok(t) && !m.gu_mls3 && !m.down_mls3 && !m.gu_mls2 && !m.down_mls2) => {
                 let cell = self
                     .expert_stage
                     .as_ref()
@@ -5109,7 +5135,9 @@ impl Model {
             _ => (&ms.ids).into(),
         };
         match &m.pre {
-            Some([(guq, gus), (dq, ds)]) if self.fused_ok(t) && !m.gu_mls3 && !m.down_mls3 => {
+            Some([(guq, gus), (dq, ds)])
+                if self.fused_ok(t) && !m.gu_mls3 && !m.down_mls3 && !m.gu_mls2 && !m.down_mls2 =>
+            {
                 self.quant_row(st, &sc.xh, &sc.xsc, Act::X(&sc.hn), h, t)?;
                 self.k.get("moe_sort").launch(
                     (1, 1, 1),
@@ -5200,10 +5228,12 @@ impl Model {
             // so a long prompt walks the per-pair GEMV path. Correct and slow.
             None if self.fused_ok(t) && !m.gu_mls3 && !m.down_mls3 => {
                 // MLS4 experts without an int8 copy: grouped GEMMs on activations quantized per 128-group, int8
-                // (W4A8) or int4 (W4A4, double-rate WMMA and no widening of the expert nibbles).
+                // (W4A8) or int4 (W4A4, double-rate WMMA and no widening of the expert nibbles). MLS2 experts use
+                // the same grouped GEMM with their codes widened to int8 in LDS (W2A8).
                 // gate/up averages over K = hidden (20 groups of 128), down over K = inter (5). `glu` keeps the
                 // shorter product on int8: about a third of the speed-up and of the argmax cost of doing both.
-                let (a4g, a4d) = (self.moe_w4a4 >= 1, self.moe_w4a4 == 1);
+                let (w2g, w2d) = (m.gu_mls2, m.down_mls2);
+                let (a4g, a4d) = (!w2g && self.moe_w4a4 >= 1, !w2d && self.moe_w4a4 == 1);
                 let rq = |out: &DeviceBuffer, scl: &DeviceBuffer, x: &DeviceBuffer, rows: usize, k: usize, i4| {
                     self.k.get(if i4 { "rot_quant_i4_w" } else { "rot_quant_i8_w" }).launch(
                         ((rows * k / 128) as u32, 1, 1),
@@ -5310,28 +5340,49 @@ impl Model {
                         ],
                     )
                 };
-                let (glu, _) = match (bm == 128, a4g) {
-                    (true, true) => ("moe_w4a4_glu_m128", "moe_w4a4_m128"),
-                    (true, false) => ("moe_w4a8_glu_m128", "moe_w4a8_m128"),
-                    (false, true) => ("moe_w4a4_glu", "moe_w4a4"),
-                    (false, false) => ("moe_w4a8_glu", "moe_w4a8"),
+                let (glu, _) = if w2g {
+                    match bm == 128 {
+                        true => ("moe_w2a8_glu_m128", "moe_w2a8_m128"),
+                        false => ("moe_w2a8_glu", "moe_w2a8"),
+                    }
+                } else {
+                    match (bm == 128, a4g) {
+                        (true, true) => ("moe_w4a4_glu_m128", "moe_w4a4_m128"),
+                        (true, false) => ("moe_w4a8_glu_m128", "moe_w4a8_m128"),
+                        (false, true) => ("moe_w4a4_glu", "moe_w4a4"),
+                        (false, false) => ("moe_w4a8_glu", "moe_w4a8"),
+                    }
                 };
                 grouped(glu, &ms.act, &ms.xg, &ms.xgs, (gu_q, gu_s), 2 * i, h, false)?;
-                let (glu2, _) = match (bm == 128, a4g) {
-                    (true, true) => ("moe_w4a4_glu", "moe_w4a4"),
-                    (true, false) => ("moe_w4a8_glu", "moe_w4a8"),
-                    (false, true) => ("moe_w4a4_glu_m32", "moe_w4a4_m32"),
-                    (false, false) => ("moe_w4a8_glu_m32", "moe_w4a8_m32"),
+                let (glu2, _) = if w2g {
+                    match bm == 128 {
+                        true => ("moe_w2a8_glu", "moe_w2a8"),
+                        false => ("moe_w2a8_glu_m32", "moe_w2a8_m32"),
+                    }
+                } else {
+                    match (bm == 128, a4g) {
+                        (true, true) => ("moe_w4a4_glu", "moe_w4a4"),
+                        (true, false) => ("moe_w4a8_glu", "moe_w4a8"),
+                        (false, true) => ("moe_w4a4_glu_m32", "moe_w4a4_m32"),
+                        (false, false) => ("moe_w4a8_glu_m32", "moe_w4a8_m32"),
+                    }
                 };
                 if split {
                     grouped(glu2, &ms.act, &ms.xg, &ms.xgs, (gu_q, gu_s), 2 * i, h, true)?;
                 }
                 rq(&ms.aq, &ms.aqs, &ms.act, p, i, a4d)?;
-                let (_, dn) = match (bm == 128, a4d) {
-                    (true, true) => ("", "moe_w4a4_m128"),
-                    (true, false) => ("", "moe_w4a8_m128"),
-                    (false, true) => ("", "moe_w4a4"),
-                    (false, false) => ("", "moe_w4a8"),
+                let (_, dn) = if w2d {
+                    match bm == 128 {
+                        true => ("", "moe_w2a8_m128"),
+                        false => ("", "moe_w2a8"),
+                    }
+                } else {
+                    match (bm == 128, a4d) {
+                        (true, true) => ("", "moe_w4a4_m128"),
+                        (true, false) => ("", "moe_w4a8_m128"),
+                        (false, true) => ("", "moe_w4a4"),
+                        (false, false) => ("", "moe_w4a8"),
+                    }
                 };
                 let (yh, dn_h) = (self.moe_y_half, format!("{dn}_yh"));
                 grouped(
@@ -5345,11 +5396,18 @@ impl Model {
                     false,
                 )?;
                 if split {
-                    let (_, dn2) = match (bm == 128, a4d) {
-                        (true, true) => ("", "moe_w4a4"),
-                        (true, false) => ("", "moe_w4a8"),
-                        (false, true) => ("", "moe_w4a4_m32"),
-                        (false, false) => ("", "moe_w4a8_m32"),
+                    let (_, dn2) = if w2d {
+                        match bm == 128 {
+                            true => ("", "moe_w2a8"),
+                            false => ("", "moe_w2a8_m32"),
+                        }
+                    } else {
+                        match (bm == 128, a4d) {
+                            (true, true) => ("", "moe_w4a4"),
+                            (true, false) => ("", "moe_w4a8"),
+                            (false, true) => ("", "moe_w4a4_m32"),
+                            (false, false) => ("", "moe_w4a8_m32"),
+                        }
                     };
                     let dn2_h = format!("{dn2}_yh");
                     grouped(
@@ -5383,7 +5441,10 @@ impl Model {
                 // MLS3 experts want their input rotated once, in a buffer of their own: `gemv4_hl` folds the
                 // rotation into its staging and `mls3_core` does not, and `sc.hn` is still needed unrotated by
                 // the shared expert of the same layer.
-                let gate_in = if m.gu_mls3 {
+                // MLS2 and MLS3 take already-rotated activations; MLS4 folds the rotation into its staging and
+                // takes the signs instead. `sc.xr` is free here: `sc.hn` is still needed unrotated by the shared
+                // expert of the same layer.
+                let gate_in = if m.gu_mls3 || m.gu_mls2 {
                     self.k.get("hadamard128").launch(
                         ((t * h / 128) as u32, 1, 1),
                         (128, 1, 1),
@@ -5395,8 +5456,6 @@ impl Model {
                 } else {
                     &sc.hn
                 };
-                // The two kernels differ by one parameter: MLS4 folds the input rotation into its staging and so
-                // takes the signs, MLS3 gets them rotated by `hadamard128` above.
                 let mut args = vec![
                     (&ms.gu).into(),
                     (gate_in).into(),
@@ -5407,12 +5466,23 @@ impl Model {
                     (2 * i).into(),
                     h.into(),
                 ];
-                if !m.gu_mls3 {
+                if !m.gu_mls3 && !m.gu_mls2 {
                     args.push((&self.signs).into());
                 }
-                self.k
-                    .get(if m.gu_mls3 { "moe_gate_up3" } else { "moe_gate_up" })
-                    .launch(((2 * i).div_ceil(32) as u32, p as u32, 1), (256, 1, 1), 0, st, &args)?;
+                let gate_kernel = if m.gu_mls2 {
+                    "moe_gate_up2"
+                } else if m.gu_mls3 {
+                    "moe_gate_up3"
+                } else {
+                    "moe_gate_up"
+                };
+                self.k.get(gate_kernel).launch(
+                    ((2 * i).div_ceil(32) as u32, p as u32, 1),
+                    (256, 1, 1),
+                    0,
+                    st,
+                    &args,
+                )?;
                 self.k.get("moe_act").launch(
                     ((p * i / 128) as u32, 1, 1),
                     (128, 1, 1),
@@ -5426,7 +5496,14 @@ impl Model {
                         m.swiglu.0.into(),
                     ],
                 )?;
-                self.k.get(if m.down_mls3 { "moe_down3" } else { "moe_down" }).launch(
+                let down_kernel = if m.down_mls2 {
+                    "moe_down2"
+                } else if m.down_mls3 {
+                    "moe_down3"
+                } else {
+                    "moe_down"
+                };
+                self.k.get(down_kernel).launch(
                     (h.div_ceil(32) as u32, t as u32, 1),
                     (256, 1, 1),
                     0,
