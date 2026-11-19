@@ -682,6 +682,8 @@ enum Phase {
     Prefill,
     /// One token (or one verify round) per step.
     Decode,
+    /// Finished during a batched step: the scheduler reports it and frees the slot.
+    Finished,
 }
 
 /// The outcome of one step: the request runs on, or it is over (finished, cancelled, or out of context).
@@ -1036,6 +1038,58 @@ impl Worker {
         Ok(Progress::More)
     }
 
+    /// One decode step for every session that is decoding, in one pass over the weights (issue #35): the model runs
+    /// `Model::decode_batch`, then each session advances its own sampler, cache and events. A finished request is
+    /// marked `Phase::Finished`, so the caller drains the marks and never has to keep indices across a removal.
+    fn decode_batch_step(&mut self, active: &mut [Active]) -> Result<()> {
+        let idxs: Vec<usize> = (0..active.len())
+            .filter(|&i| active[i].phase == Phase::Decode)
+            .collect();
+        if idxs.is_empty() {
+            return Ok(());
+        }
+        let mut order: Vec<usize> = Vec::with_capacity(idxs.len());
+        let logits = {
+            // One run per session, in slot order: the projections are row independent, so the run order only has to
+            // be the same as `order`.
+            let wanted: Vec<(usize, usize, u32)> = idxs.iter().map(|&i| (i, active[i].slot, active[i].tok)).collect();
+            let mut runs: Vec<(&mut Session, u32)> = Vec::with_capacity(wanted.len());
+            for (si, slot) in self.slots.iter_mut().enumerate() {
+                if let Some(&(ai, _, tok)) = wanted.iter().find(|(_, s, _)| *s == si) {
+                    order.push(ai);
+                    runs.push((&mut slot.sess, tok));
+                }
+            }
+            self.model.decode_batch(&mut runs)?
+        };
+        for (pos, &ai) in order.iter().enumerate() {
+            let slot = active[ai].slot;
+            let act = &mut active[ai];
+            if act.n >= act.max_tokens || self.slots[slot].sess.len + 1 > act.ctx {
+                act.phase = Phase::Finished;
+                continue;
+            }
+            let (tok, top) = (act.tok, act.top.take());
+            if !act.emit(tok, top) {
+                act.phase = Phase::Finished;
+                continue;
+            }
+            let Slot { cached, .. } = &mut self.slots[slot];
+            let pen = penalized(&logits[pos], &act.req.sampling, cached, &[]);
+            cached.push(tok);
+            let row = pen.as_deref().unwrap_or(&logits[pos]);
+            let next = sample(row, &act.req.sampling, &mut || act.rng.next_f32());
+            act.top = if act.req.logprobs {
+                Some(token_probs(row, next, act.req.top_logprobs))
+            } else {
+                None
+            };
+            act.pend = vec![next];
+            act.tok = next;
+        }
+        Ok(())
+    }
+
     /// Runs one decode step: one token, or one verify round when the MTP head is drafting.
     fn decode_step(&mut self, act: &mut Active) -> Result<Progress> {
         let (drafts, draft_pmin, lookup) = (self.drafts, self.draft_pmin, self.lookup);
@@ -1386,12 +1440,12 @@ impl Engine {
                 // slot for the next round, so a queued request joins without waiting for the others to drain.
                 let mut i = 0;
                 while i < active.len() {
+                    if active[i].phase != Phase::Prefill {
+                        i += 1;
+                        continue;
+                    }
                     let w = worker.as_mut().expect("a worker is loaded before serving");
-                    let step = match active[i].phase {
-                        Phase::Prefill => w.prefill_step(&mut active[i]),
-                        Phase::Decode => w.decode_step(&mut active[i]),
-                    };
-                    match step {
+                    match w.prefill_step(&mut active[i]) {
                         Ok(Progress::More) => i += 1,
                         Ok(Progress::Done) => {
                             let act = active.remove(i);
@@ -1403,6 +1457,64 @@ impl Engine {
                                 let _ = w.slots[act.slot].reset(&w.model);
                             }
                             let _ = act.req.events.send(Event::Error(format!("{e:#}")));
+                        }
+                    }
+                }
+                // The decoding sessions share one pass over the weights when the model supports it; otherwise they
+                // take turns, one step each per round (v1 of #33).
+                let batchable = active.iter().any(|a| a.phase == Phase::Decode)
+                    && worker.as_ref().is_some_and(|w| w.model.can_batch());
+                if batchable {
+                    let w = worker.as_mut().expect("a worker is loaded before serving");
+                    match w.decode_batch_step(&mut active) {
+                        Ok(()) => {
+                            let mut i = 0;
+                            while i < active.len() {
+                                if active[i].phase == Phase::Finished {
+                                    let act = active.remove(i);
+                                    let _ = act.req.events.send(Event::Done(act.finish()));
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let message = format!("{e:#}");
+                            let mut i = 0;
+                            while i < active.len() {
+                                if active[i].phase != Phase::Decode {
+                                    i += 1;
+                                    continue;
+                                }
+                                let act = active.remove(i);
+                                if let Some(w) = worker.as_mut() {
+                                    let _ = w.slots[act.slot].reset(&w.model);
+                                }
+                                let _ = act.req.events.send(Event::Error(message.clone()));
+                            }
+                        }
+                    }
+                } else {
+                    let mut i = 0;
+                    while i < active.len() {
+                        if active[i].phase != Phase::Decode {
+                            i += 1;
+                            continue;
+                        }
+                        let w = worker.as_mut().expect("a worker is loaded before serving");
+                        match w.decode_step(&mut active[i]) {
+                            Ok(Progress::More) => i += 1,
+                            Ok(Progress::Done) => {
+                                let act = active.remove(i);
+                                let _ = act.req.events.send(Event::Done(act.finish()));
+                            }
+                            Err(e) => {
+                                let act = active.remove(i);
+                                if let Some(w) = worker.as_mut() {
+                                    let _ = w.slots[act.slot].reset(&w.model);
+                                }
+                                let _ = act.req.events.send(Event::Error(format!("{e:#}")));
+                            }
                         }
                     }
                 }

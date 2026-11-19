@@ -2137,6 +2137,25 @@ fn copy_state_opt(dst: &mut Option<DeviceBuffer>, src: &Option<DeviceBuffer>, st
 }
 
 /// Recurrent and attention state a stack of layers reads and updates.
+/// One row-run of a batched forward: consecutive scratch rows that belong to one session, with that session's
+/// state.
+struct Run<'a> {
+    ls: &'a LayerStates<'a>,
+    /// Row of the batch the run starts at: the stateful kernels are launched with this offset, because every
+    /// intermediate buffer packs its rows at the tensor's own width (which changes with the mixer).
+    off: usize,
+    rows: usize,
+    /// Address of this run's KV position (i32 on the device): the attention kernels read it from memory instead of a
+    /// launch immediate, so a batch cannot share the single one `upload_step` writes.
+    len_dev: u64,
+}
+
+/// The runs of one batched forward. One run per session for a decode step; a run may be longer (a prefill piece, a
+/// verify chain) once the callers use it.
+struct Batch<'a> {
+    runs: Vec<Run<'a>>,
+}
+
 struct LayerStates<'a> {
     kv: &'a [(DeviceBuffer, DeviceBuffer)],
     conv: &'a [DeviceBuffer],
@@ -2232,8 +2251,8 @@ struct Scratch {
     mla_lat: Option<DeviceBuffer>,
 }
 
-/// Hyper-connection buffers: stream state, normalized streams, low-rank down/gate, up, injection weights, the
-/// output of a mixer or FFN, and the PLE n-gram embedding.
+/// Hyper-connection buffers: stream state and its norm, the down/inject/up products of the mixer, the output of a
+/// mixer or FFN, and the PLE n-gram embedding.
 struct HcScratch {
     hc: DeviceBuffer,
     hcn: DeviceBuffer,
@@ -4240,6 +4259,113 @@ impl Model {
         Ok(v[0] as u32)
     }
 
+    /// Whether this model can run one token for several sessions in one pass over the weights: a flat model (no
+    /// MoE, hyper-connections, PLE, indexer, KDA or MLA) and no MTP head, whose chain is per session.
+    pub fn can_batch(&self) -> bool {
+        let c = &self.cfg;
+        c.moe.is_none()
+            && c.hc.is_none()
+            && c.ple.is_none()
+            && c.indexer.is_none()
+            && c.mla.is_none()
+            && self.mtp.is_none()
+            && c.kind.iter().all(|k| matches!(k, MixerKind::Attn | MixerKind::Delta))
+    }
+
+    /// One decode step for several sessions in one pass over the weights: the projections and the LM head read the
+    /// weights once for all the rows, while the attention and the DeltaNet recurrence run per session on that
+    /// session's own KV and length. Returns the logits row of every session, in the order given.
+    pub fn decode_batch(&self, runs: &mut [(&mut Session, u32)]) -> Result<Vec<Vec<f32>>> {
+        let c = &self.cfg;
+        let n = runs.len();
+        ensure!(n >= 1 && self.can_batch(), "this model does not batch");
+        ensure!(runs.iter().all(|(s, _)| s.len < s.max_ctx), "context full");
+        let st = &self.stream;
+        let mut sc = self.scratch(n.max(16))?;
+        let ids: Vec<i32> = runs.iter().map(|(_, t)| *t as i32).collect();
+        let pos: Vec<i32> = runs.iter().flat_map(|(s, _)| [s.next_pos as i32; 3]).collect();
+        sc.upload_step(0, &ids, &pos)?;
+        self.k.get("embed_bf16").launch(
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&sc.x).into(), (&self.embed).into(), (&sc.ids).into(), c.hidden.into()],
+        )?;
+        let lens: Vec<DeviceBuffer> = runs
+            .iter()
+            .map(|(s, _)| -> Result<DeviceBuffer> { Ok(DeviceBuffer::from_slice(&[s.len as i32])?) })
+            .collect::<Result<_>>()?;
+        let states: Vec<LayerStates> = runs
+            .iter()
+            .map(|(s, _)| LayerStates {
+                kv: &s.kv,
+                conv: &s.conv,
+                rec: &s.rec,
+                len: s.len,
+                max_ctx: s.max_ctx,
+                attn_part: &s.attn_part,
+                mla_part: None,
+                conv_snaps: None,
+                dn: (!s.dn_rec.is_empty()).then_some((&s.dn_rec[..], s.dn_np, s.dn_par, false)),
+                ple_state: None,
+                ple_snap: None,
+                idx: None,
+            })
+            .collect();
+        let batch = Batch {
+            runs: states
+                .iter()
+                .zip(&lens)
+                .enumerate()
+                .map(|(i, (ls, len))| Run {
+                    ls,
+                    off: i,
+                    rows: 1,
+                    len_dev: len.addr(),
+                })
+                .collect(),
+        };
+        let empty: [Scratch; 0] = [];
+        self.run_layers_from(
+            &self.layers,
+            &states[0],
+            Some((&batch, &empty)),
+            &sc,
+            n,
+            st,
+            0,
+            (0, 0),
+            true,
+        )?;
+        let norm = self.norm.as_ref().context("no final norm")?;
+        let normed = f32s(n * c.hidden)?;
+        let mut last = f32s(n * c.hidden)?;
+        last.copy_from(0, &sc.x, 0, n * c.hidden * 4, st)?;
+        self.rmsnorm(st, &normed, &last, norm, n, c.hidden)?;
+        let logits = f32s(n * c.vocab)?;
+        self.gemm(
+            st,
+            &sc.xr,
+            &sc.xh,
+            &sc.xsc,
+            &logits,
+            Act::X(&normed),
+            &self.lm_head,
+            n,
+            false,
+        )?;
+        st.synchronize()?;
+        let flat: Vec<f32> = logits.download(n * c.vocab)?;
+        for (s, _) in runs.iter_mut() {
+            s.len += 1;
+            s.next_pos += 1;
+            s.dn_np = 0;
+            s.snap_t = 0;
+        }
+        Ok((0..n).map(|i| flat[i * c.vocab..(i + 1) * c.vocab].to_vec()).collect())
+    }
+
     /// Speculative verify: runs 2..=GEMV_MAX_T tokens on the decode weights, keeping the DeltaNet state after each
     /// token so `rollback` can drop the rejected tail. Returns the logits of every token.
     pub fn forward_verify(&self, sess: &mut Session, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -4665,7 +4791,7 @@ impl Model {
             (Some(ng), Some(pc)) => {
                 let split = pc.layer;
                 let a0 = c.full_attn[..split].iter().filter(|f| **f).count();
-                self.run_layers_from(&self.layers[..split], &ls, &sc, t, st, 0, (0, 0), false)?;
+                self.run_layers_from(&self.layers[..split], &ls, None, &sc, t, st, 0, (0, 0), false)?;
                 let te = std::time::Instant::now();
                 let e = ng.embed(&ng_ctx, tokens)?;
                 if std::env::var_os("MALLEUS_TIMING").is_some() {
@@ -4676,7 +4802,17 @@ impl Model {
                     .context("no hyper-connection scratch")?
                     .ple_e
                     .upload(&e)?;
-                self.run_layers_from(&self.layers[split..], &ls, &sc, t, st, split, (a0, split - a0), true)?;
+                self.run_layers_from(
+                    &self.layers[split..],
+                    &ls,
+                    None,
+                    &sc,
+                    t,
+                    st,
+                    split,
+                    (a0, split - a0),
+                    true,
+                )?;
             }
             _ => self.run_layers(&self.layers, &ls, &sc, t, st, 0)?,
         }
@@ -5343,6 +5479,501 @@ impl Model {
     /// Runs `layers`, the first of which is layer `base` of the model: the index only names the layers in the
     /// routing trace (`MALLEUS_TRACE_ROUTE`), so that the MTP head (passed as layer `cfg.layers`) is not confused
     /// with layer 0.
+    /// The attention of one run of rows: the run's own KV cache, written at the run's own length, and its own
+    /// state. `q_norm`/`k_norm`/`indexer` belong to the layer, `proj_ready` says the projections already wrote the
+    /// indexer's query into the scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn attend(
+        &self,
+        ls: &LayerStates,
+        sc: &Scratch,
+        t: usize,
+        st: &Stream,
+        li: usize,
+        q_norm: &DeviceBuffer,
+        k_norm: &DeviceBuffer,
+        indexer: Option<&Indexer>,
+        proj_ready: bool,
+        // Row of the batch this run starts at. Every buffer here packs its rows at the tensor's own width, so the
+        // offset is `row * width` of the tensor the layer writes, not of the scratch allocation.
+        r0: usize,
+        // The KV position the kernels read (the run's own, on the device).
+        len_dev: Arg,
+        // Row widths in elements of this layer's tensors: the q projection (wider than the head layout, it carries
+        // the gate), the k/v projections, and the normed q / attention output.
+        qin: usize,
+        kvw: usize,
+        qout: usize,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let (kc, vc) = &ls.kv[li];
+        let qw = qout;
+        let kw = kvw;
+        // `w` is the width in elements of the tensor this layer writes: rows are packed at that width, and the
+        // address arithmetic is in bytes.
+        let rowof = |b: &DeviceBuffer, w: usize| -> Arg { Arg::U64(b.addr() + (r0 * w * 4) as u64) };
+        let [_, sh, sw] = c.mrope_section;
+        let ctx = kv_ctx(ls.max_ctx);
+        let kv_bytes = ctx * c.n_kv * c.head_dim * 2 + 64;
+        let vr_arg = if c.indexer.is_some() {
+            Arg::U64(vc.addr() + kv_bytes as u64)
+        } else {
+            Arg::U64(0)
+        };
+        // `MALLEUS_ATTN_MASS`: where the attention kernel writes the (max, sum) of every tile, and the
+        // distance between sampled rows. Null (no cost) when the diagnostics are off.
+        let mass_args = match &self.attn_mass {
+            Some((b, stride, tiles)) => (Arg::from(b), *stride, *tiles),
+            None => (Arg::U64(0), 0usize, 0usize),
+        };
+        let qin_arg = rowof(&sc.big0, qin);
+        self.k.get("attn_prep").launch(
+            (t as u32, (c.n_heads + c.n_kv) as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                rowof(&sc.small2, qw),
+                kc.into(),
+                vc.into(),
+                qin_arg,
+                rowof(&sc.small0, kw),
+                rowof(&sc.small1, kw),
+                q_norm.into(),
+                k_norm.into(),
+                rowof(&sc.pos, 3),
+                len_dev,
+                c.n_heads.into(),
+                c.n_kv.into(),
+                c.eps.into(),
+                c.rope_theta.into(),
+                c.rot_dim.into(),
+                sh.into(),
+                sw.into(),
+                ctx.into(),
+                vr_arg,
+                self.rope_invf.as_ref().map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
+            ],
+        )?;
+        // Diagnostics `MALLEUS_HIDDEN_DUMP=<dir>` (#10): for every layer, the layer input (`sc.hn`) and the
+        // K del chunk appena scritto. Sono le due rappresentazioni da cui un indexer dovrebbe stimare
+        // quanto un blocco conta: servono a provare se la sensibilita' e' imparabile.
+        if let Some(dir) = ENV_HIDDEN_DUMP.as_deref() {
+            st.synchronize()?;
+            let hidden = c.hidden;
+            let kvw = c.n_kv * c.head_dim;
+            let hn: Vec<f32> = sc.hn.download(t * hidden)?;
+            let kk: Vec<u16> = kc.download_at(ls.len * kvw * 2, t * kvw)?;
+            let mut b = Vec::with_capacity(hn.len() * 4);
+            for v in &hn {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(format!("{dir}/hn-{li}-{}x{t}.f32", ls.len), &b)?;
+            let mut b = Vec::with_capacity(kk.len() * 2);
+            for v in &kk {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(format!("{dir}/k-{li}-{}x{t}.f16", ls.len), &b)?;
+        }
+        let mut sel_args = [Arg::U64(0), Arg::U64(0), Arg::U64(0)];
+        let (mut words, mut ratio) = (0usize, 1usize);
+        if let (Some(ix), Some(is)) = (indexer, &ls.idx) {
+            self.indexer(st, sc, ix, is, li, ls.len, t, proj_ready)?;
+            sel_args = is.sel_args();
+            if let Some((_, _, _, w)) = is.sel {
+                words = w;
+            }
+            ratio = c.indexer.as_ref().map_or(1, |ic| ic.ratio);
+        }
+        let scale = 1.0 / (c.head_dim as f32).sqrt() * yarn_mscale();
+        let gather = match (ls.idx.as_ref(), &c.indexer) {
+            (Some(is), Some(ic))
+                if t >= ATTN_WMMA_MIN
+                    // Below ~5x the budget the masked WMMA kernel is as fast. `MALLEUS_GATHER_MIN` is
+                    // that factor, in units of the indexer budget, so the crossover can be measured
+                    // instead of assumed.
+                    && ls.len + t
+                        >= std::env::var("MALLEUS_GATHER_MIN")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(5)
+                            * ic.budget
+                    && is.sel.is_some()
+                    && is.list.is_some()
+                    && std::env::var("MALLEUS_ATTN_GATHER").map_or(true, |v| v != "0") =>
+            {
+                Some((is, ic))
+            }
+            _ => None,
+        };
+        if let Some((is, ic)) = gather {
+            // Queries whose complete blocks fit the budget attend densely (WMMA kernel); the others
+            // gather their selected blocks and tail.
+            let l = ic.budget / ic.ratio;
+            let nd = ((l + 1) * ic.ratio - 1).saturating_sub(ls.len).min(t);
+            let row = c.n_heads * c.head_dim * 4;
+            if nd > 0 {
+                self.k.get("attention_wmma").launch(
+                    ((nd.div_ceil(64) * c.n_heads) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    st,
+                    &[
+                        rowof(&sc.small3, qw),
+                        rowof(&sc.small2, qw),
+                        kc.into(),
+                        vc.into(),
+                        nd.into(),
+                        ls.len.into(),
+                        c.n_heads.into(),
+                        c.n_kv.into(),
+                        scale.into(),
+                        ctx.into(),
+                        Arg::U64(0),
+                        Arg::U64(0),
+                        0usize.into(),
+                        1usize.into(),
+                        mass_args.0,
+                        mass_args.1.into(),
+                        mass_args.2.into(),
+                    ],
+                )?;
+            }
+            if nd < t {
+                let ns = t - nd;
+                let (_, sel, _, w) = is.sel.context("selection")?;
+                let (list, lrows) = is.list.context("block lists")?;
+                let cnt = Arg::U64(list.addr() + (lrows * l * 4) as u64);
+                self.k.get("idx_compact").launch(
+                    (ns as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    st,
+                    &[
+                        list.into(),
+                        cnt,
+                        Arg::U64(sel.addr() + (nd * w * 4) as u64),
+                        w.into(),
+                        l.into(),
+                    ],
+                )?;
+                // Three shapes, measured on the same 25 574-token prompt (2026-11-14, gfx1151): the
+                // union of four query lists 2 940 ms, one query per block with two waves 2 520-3 034,
+                // one query per block with four waves (`attention_gather_q1`) 1 892-1 958. The union
+                // was 6-9% faster than the per-query kernel on gfx1150 at 12/24K (2026-11-09), so it
+                // stays the default there; on gfx1151 the extra CUs make the narrower block win.
+                // MALLEUS_ATTN_GATHER=1 selects the per-query kernel, MALLEUS_GATHER_Q1 overrides
+                // the architecture default in either direction.
+                let per = std::env::var("MALLEUS_ATTN_GATHER").is_ok_and(|v| v == "1");
+                let q1 = std::env::var("MALLEUS_GATHER_Q1").map_or(!per && self.k.arch == "gfx1151", |v| v == "1");
+                let share = !q1 && !per && 4 * l <= GATHER_UNION_MAX;
+                self.k
+                    .get(if q1 {
+                        "attention_gather_q1"
+                    } else if share {
+                        "attention_gather_u"
+                    } else {
+                        "attention_gather"
+                    })
+                    .launch(
+                        (if q1 { ns as u32 } else { ns.div_ceil(4) as u32 }, c.n_kv as u32, 1),
+                        (if q1 { 128 } else { 256 }, 1, 1),
+                        0,
+                        st,
+                        &[
+                            Arg::U64(sc.small3.addr() + (nd * row + r0 * qw) as u64),
+                            Arg::U64(sc.small2.addr() + (nd * row + r0 * qw) as u64),
+                            kc.into(),
+                            vr_arg,
+                            list.into(),
+                            cnt,
+                            ns.into(),
+                            (ls.len + nd).into(),
+                            ctx.into(),
+                            c.n_heads.into(),
+                            c.n_kv.into(),
+                            l.into(),
+                            ic.ratio.into(),
+                            scale.into(),
+                        ],
+                    )?;
+            }
+        } else if t >= ATTN_WMMA_MIN {
+            self.k.get("attention_wmma").launch(
+                ((t.div_ceil(64) * c.n_heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    rowof(&sc.small3, qw),
+                    rowof(&sc.small2, qw),
+                    kc.into(),
+                    vc.into(),
+                    t.into(),
+                    ls.len.into(),
+                    c.n_heads.into(),
+                    c.n_kv.into(),
+                    scale.into(),
+                    ctx.into(),
+                    sel_args[0],
+                    sel_args[1],
+                    words.into(),
+                    ratio.into(),
+                    mass_args.0,
+                    mass_args.1.into(),
+                    mass_args.2.into(),
+                ],
+            )?;
+        } else if let (Some(is), Some(ic)) = (ls.idx.as_ref().filter(|is| is.sel.is_some()), &c.indexer)
+            && let Some((list, lrows)) = is.list
+            && std::env::var("MALLEUS_ATTN_SEL").map_or(true, |v| v != "0")
+        {
+            // Sparse decode / verify: only the listed blocks and the tail (~budget keys per query).
+            let (_, sel, _, w) = is.sel.context("selection")?;
+            let l = ic.budget / ic.ratio;
+            let cnt = Arg::U64(list.addr() + (lrows * l * 4) as u64);
+            self.k.get("idx_compact").launch(
+                (t as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[list.into(), cnt, sel.into(), w.into(), l.into()],
+            )?;
+            let nsplit = (l * ic.ratio + ic.ratio).div_ceil(ATTN_SPLIT);
+            self.k.get("attention_sel").launch(
+                ((t * c.n_heads) as u32, nsplit as u32, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    ls.attn_part.into(),
+                    rowof(&sc.small2, qw),
+                    kc.into(),
+                    vc.into(),
+                    list.into(),
+                    cnt,
+                    len_dev,
+                    c.n_heads.into(),
+                    c.n_kv.into(),
+                    scale.into(),
+                    ctx.into(),
+                    nsplit.into(),
+                    ic.ratio.into(),
+                    l.into(),
+                    vr_arg,
+                ],
+            )?;
+            self.k.get("attention_combine").launch(
+                ((t * c.n_heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[rowof(&sc.small3, qw), ls.attn_part.into(), nsplit.into()],
+            )?;
+        } else {
+            let nsplit = (ls.len + t).div_ceil(ATTN_SPLIT);
+            self.k.get("attention_split").launch(
+                ((t * c.n_heads) as u32, nsplit as u32, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    ls.attn_part.into(),
+                    rowof(&sc.small2, qw),
+                    kc.into(),
+                    vc.into(),
+                    len_dev,
+                    c.n_heads.into(),
+                    c.n_kv.into(),
+                    scale.into(),
+                    ctx.into(),
+                    nsplit.into(),
+                    sel_args[0],
+                    words.into(),
+                    ratio.into(),
+                ],
+            )?;
+            self.k.get("attention_combine").launch(
+                ((t * c.n_heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[rowof(&sc.small3, qw), ls.attn_part.into(), nsplit.into()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The DeltaNet recurrence of one run of rows: the run's conv and recurrent state, its own length.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_state(
+        &self,
+        ls: &LayerStates,
+        sc: &Scratch,
+        t: usize,
+        st: &Stream,
+        di: usize,
+        conv: &DeviceBuffer,
+        a_log: &DeviceBuffer,
+        dt_bias: &DeviceBuffer,
+        fused: bool,
+        ab_merged: bool,
+        // Row of the batch this run starts at, at the width of the tensor the layer writes (see `attend`).
+        r0: usize,
+        // Row widths in elements: the qkv projection (which the conv reads), the z / value layout (what the scan
+        // writes) and one gate head.
+        wqkv: usize,
+        wval: usize,
+        wn: usize,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let wq = wqkv;
+        let wab = if ab_merged { 2 * wn } else { wn };
+        // `w` is the width in elements of the tensor this layer writes: rows are packed at that width, and the
+        // address arithmetic is in bytes.
+        let rowof = |b: &DeviceBuffer, w: usize| -> Arg { Arg::U64(b.addr() + (r0 * w * 4) as u64) };
+        let conv_state = &ls.conv[di];
+        let rec_state = &ls.rec[di];
+        let conv_snap: Arg = ls.conv_snaps.map_or(Arg::U64(0), |cs| (&cs[di]).into());
+        let (pin, np, pout): (Arg, usize, Arg) = match ls.dn {
+            Some((recs, np, par, record)) => (
+                (&recs[di][par]).into(),
+                np,
+                if record {
+                    (&recs[di][par ^ 1]).into()
+                } else {
+                    Arg::U64(0)
+                },
+            ),
+            None => (Arg::U64(0), 0, Arg::U64(0)),
+        };
+        let cd = c.lin_qkv_dim();
+        self.k.get("conv_qk_norm").launch(
+            ((t * cd / 128).div_ceil(8) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                rowof(&sc.big1, wq),
+                rowof(&sc.big0, wq),
+                conv.into(),
+                conv_state.into(),
+                t.into(),
+                cd.into(),
+                c.lin_nk.into(),
+            ],
+        )?;
+        self.ew(
+            st,
+            "conv_state_save",
+            cd,
+            &[rowof(&sc.big0, wq), conv_state.into(), t.into(), cd.into(), conv_snap],
+        )?;
+        let (beta, g) = (rowof(&sc.big2, wn), rowof(&sc.small3, wn));
+        self.ew(
+            st,
+            "deltanet_gates",
+            t * c.lin_nv,
+            &[
+                beta,
+                g,
+                rowof(&sc.small1, wab),
+                if fused || ab_merged {
+                    rowof(&sc.small1, wab)
+                } else {
+                    rowof(&sc.small2, wn)
+                },
+                a_log.into(),
+                dt_bias.into(),
+                t.into(),
+                c.lin_nv.into(),
+                if fused {
+                    128
+                } else if ab_merged {
+                    2 * c.lin_nv
+                } else {
+                    c.lin_nv
+                }
+                .into(),
+                if fused || ab_merged { c.lin_nv } else { 0 }.into(),
+            ],
+        )?;
+        let scan = |t: usize, pout: Arg| -> Result<()> {
+            self.k.get("deltanet_scan").launch(
+                ((c.lin_nv * 8) as u32, 1, 1),
+                (32, 1, 1),
+                0,
+                st,
+                &[
+                    // The scan writes one row of `nv * 128` per token, not the qkv width.
+                    rowof(&sc.big0, wval),
+                    rowof(&sc.big1, wq),
+                    beta,
+                    g,
+                    rec_state.into(),
+                    t.into(),
+                    c.lin_nv.into(),
+                    c.lin_nk.into(),
+                    pin,
+                    np.into(),
+                    pout,
+                ],
+            )?;
+            Ok(())
+        };
+        if t >= DN_CHUNK && std::env::var_os("MALLEUS_DN_SCAN").is_none() {
+            if np > 0 {
+                scan(0, Arg::U64(0))?;
+            }
+            ensure!(
+                c.lin_dk == 128 && c.lin_dv == 128,
+                "chunked DeltaNet needs 128-wide heads"
+            );
+            let d = &sc.dn;
+            self.k.get("deltanet_chunk_prep").launch(
+                ((t.div_ceil(DN_CHUNK) * c.lin_nv) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&d[0]).into(),
+                    (&d[1]).into(),
+                    (&d[2]).into(),
+                    (&d[3]).into(),
+                    (&d[4]).into(),
+                    (&d[5]).into(),
+                    rowof(&sc.big1, wq),
+                    beta,
+                    g,
+                    t.into(),
+                    c.lin_nv.into(),
+                    c.lin_nk.into(),
+                ],
+            )?;
+            self.k.get("deltanet_chunk_scan").launch(
+                (c.lin_nv as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    rowof(&sc.big0, wq),
+                    rec_state.into(),
+                    (&d[0]).into(),
+                    (&d[1]).into(),
+                    (&d[2]).into(),
+                    (&d[3]).into(),
+                    (&d[4]).into(),
+                    (&d[5]).into(),
+                    t.into(),
+                    c.lin_nv.into(),
+                ],
+            )?;
+        } else {
+            scan(t, pout)?;
+        }
+        Ok(())
+    }
+
     fn run_layers(
         &self,
         layers: &[Layer],
@@ -5352,7 +5983,7 @@ impl Model {
         st: &Stream,
         base: usize,
     ) -> Result<()> {
-        self.run_layers_from(layers, ls, sc, t, st, base, (0, 0), true)
+        self.run_layers_from(layers, ls, None, sc, t, st, base, (0, 0), true)
     }
 
     /// Runs `layers`, whose first attention / DeltaNet layers use states `first` of `ls`; `all` when they reach the
@@ -5362,6 +5993,7 @@ impl Model {
         &self,
         layers: &[Layer],
         ls: &LayerStates,
+        batch: Option<(&Batch, &[Scratch])>,
         sc: &Scratch,
         t: usize,
         st: &Stream,
@@ -5788,7 +6420,6 @@ impl Model {
                     indexer,
                     dec,
                 } => {
-                    let (kc, vc) = &ls.kv[ai];
                     let li = ai;
                     ai += 1;
                     let mut proj_ready = false;
@@ -5807,294 +6438,44 @@ impl Model {
                             self.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sc.small1, Act::Same(&sc.hn), v, t, false)?;
                         }
                     }
-                    let [_, sh, sw] = c.mrope_section;
-                    let ctx = kv_ctx(ls.max_ctx);
-                    let kv_bytes = ctx * c.n_kv * c.head_dim * 2 + 64;
-                    let vr_arg = if c.indexer.is_some() {
-                        Arg::U64(vc.addr() + kv_bytes as u64)
-                    } else {
-                        Arg::U64(0)
-                    };
-                    // `MALLEUS_ATTN_MASS`: where the attention kernel writes the (max, sum) of every tile, and the
-                    // distance between sampled rows. Null (no cost) when the diagnostics are off.
-                    let mass_args = match &self.attn_mass {
-                        Some((b, stride, tiles)) => (Arg::from(b), *stride, *tiles),
-                        None => (Arg::U64(0), 0usize, 0usize),
-                    };
-                    self.k.get("attn_prep").launch(
-                        (t as u32, (c.n_heads + c.n_kv) as u32, 1),
-                        (256, 1, 1),
-                        0,
-                        st,
-                        &[
-                            (&sc.small2).into(),
-                            kc.into(),
-                            vc.into(),
-                            (&sc.big0).into(),
-                            (&sc.small0).into(),
-                            (&sc.small1).into(),
-                            q_norm.into(),
-                            k_norm.into(),
-                            (&sc.pos).into(),
+                    match batch {
+                        None => self.attend(
+                            ls,
+                            sc,
+                            t,
+                            st,
+                            li,
+                            q_norm,
+                            k_norm,
+                            indexer.as_ref(),
+                            proj_ready,
+                            0,
                             (&sc.len_dev).into(),
-                            c.n_heads.into(),
-                            c.n_kv.into(),
-                            c.eps.into(),
-                            c.rope_theta.into(),
-                            c.rot_dim.into(),
-                            sh.into(),
-                            sw.into(),
-                            ctx.into(),
-                            vr_arg,
-                            self.rope_invf.as_ref().map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
-                        ],
-                    )?;
-                    // Diagnostics `MALLEUS_HIDDEN_DUMP=<dir>` (#10): for every layer, the layer input (`sc.hn`) and the
-                    // K del chunk appena scritto. Sono le due rappresentazioni da cui un indexer dovrebbe stimare
-                    // quanto un blocco conta: servono a provare se la sensibilita' e' imparabile.
-                    if let Some(dir) = ENV_HIDDEN_DUMP.as_deref() {
-                        st.synchronize()?;
-                        let hidden = c.hidden;
-                        let kvw = c.n_kv * c.head_dim;
-                        let hn: Vec<f32> = sc.hn.download(t * hidden)?;
-                        let kk: Vec<u16> = kc.download_at(ls.len * kvw * 2, t * kvw)?;
-                        let mut b = Vec::with_capacity(hn.len() * 4);
-                        for v in &hn {
-                            b.extend_from_slice(&v.to_le_bytes());
-                        }
-                        std::fs::write(format!("{dir}/hn-{li}-{}x{t}.f32", ls.len), &b)?;
-                        let mut b = Vec::with_capacity(kk.len() * 2);
-                        for v in &kk {
-                            b.extend_from_slice(&v.to_le_bytes());
-                        }
-                        std::fs::write(format!("{dir}/k-{li}-{}x{t}.f16", ls.len), &b)?;
-                    }
-                    let mut sel_args = [Arg::U64(0), Arg::U64(0), Arg::U64(0)];
-                    let (mut words, mut ratio) = (0usize, 1usize);
-                    if let (Some(ix), Some(is)) = (indexer, &ls.idx) {
-                        self.indexer(st, sc, ix, is, li, ls.len, t, proj_ready)?;
-                        sel_args = is.sel_args();
-                        if let Some((_, _, _, w)) = is.sel {
-                            words = w;
-                        }
-                        ratio = c.indexer.as_ref().map_or(1, |ic| ic.ratio);
-                    }
-                    let scale = 1.0 / (c.head_dim as f32).sqrt() * yarn_mscale();
-                    let gather = match (ls.idx.as_ref(), &c.indexer) {
-                        (Some(is), Some(ic))
-                            if t >= ATTN_WMMA_MIN
-                                // Below ~5x the budget the masked WMMA kernel is as fast. `MALLEUS_GATHER_MIN` is
-                                // that factor, in units of the indexer budget, so the crossover can be measured
-                                // instead of assumed.
-                                && ls.len + t
-                                    >= std::env::var("MALLEUS_GATHER_MIN")
-                                        .ok()
-                                        .and_then(|v| v.parse::<usize>().ok())
-                                        .unwrap_or(5)
-                                        * ic.budget
-                                && is.sel.is_some()
-                                && is.list.is_some()
-                                && std::env::var("MALLEUS_ATTN_GATHER").map_or(true, |v| v != "0") =>
-                        {
-                            Some((is, ic))
-                        }
-                        _ => None,
-                    };
-                    if let Some((is, ic)) = gather {
-                        // Queries whose complete blocks fit the budget attend densely (WMMA kernel); the others
-                        // gather their selected blocks and tail.
-                        let l = ic.budget / ic.ratio;
-                        let nd = ((l + 1) * ic.ratio - 1).saturating_sub(ls.len).min(t);
-                        let row = c.n_heads * c.head_dim * 4;
-                        if nd > 0 {
-                            self.k.get("attention_wmma").launch(
-                                ((nd.div_ceil(64) * c.n_heads) as u32, 1, 1),
-                                (256, 1, 1),
-                                0,
-                                st,
-                                &[
-                                    (&sc.small3).into(),
-                                    (&sc.small2).into(),
-                                    kc.into(),
-                                    vc.into(),
-                                    nd.into(),
-                                    ls.len.into(),
-                                    c.n_heads.into(),
-                                    c.n_kv.into(),
-                                    scale.into(),
-                                    ctx.into(),
-                                    Arg::U64(0),
-                                    Arg::U64(0),
-                                    0usize.into(),
-                                    1usize.into(),
-                                    mass_args.0,
-                                    mass_args.1.into(),
-                                    mass_args.2.into(),
-                                ],
-                            )?;
-                        }
-                        if nd < t {
-                            let ns = t - nd;
-                            let (_, sel, _, w) = is.sel.context("selection")?;
-                            let (list, lrows) = is.list.context("block lists")?;
-                            let cnt = Arg::U64(list.addr() + (lrows * l * 4) as u64);
-                            self.k.get("idx_compact").launch(
-                                (ns as u32, 1, 1),
-                                (256, 1, 1),
-                                0,
-                                st,
-                                &[
-                                    list.into(),
-                                    cnt,
-                                    Arg::U64(sel.addr() + (nd * w * 4) as u64),
-                                    w.into(),
-                                    l.into(),
-                                ],
-                            )?;
-                            // Three shapes, measured on the same 25 574-token prompt (2026-11-14, gfx1151): the
-                            // union of four query lists 2 940 ms, one query per block with two waves 2 520-3 034,
-                            // one query per block with four waves (`attention_gather_q1`) 1 892-1 958. The union
-                            // was 6-9% faster than the per-query kernel on gfx1150 at 12/24K (2026-11-09), so it
-                            // stays the default there; on gfx1151 the extra CUs make the narrower block win.
-                            // MALLEUS_ATTN_GATHER=1 selects the per-query kernel, MALLEUS_GATHER_Q1 overrides
-                            // the architecture default in either direction.
-                            let per = std::env::var("MALLEUS_ATTN_GATHER").is_ok_and(|v| v == "1");
-                            let q1 = std::env::var("MALLEUS_GATHER_Q1")
-                                .map_or(!per && self.k.arch == "gfx1151", |v| v == "1");
-                            let share = !q1 && !per && 4 * l <= GATHER_UNION_MAX;
-                            self.k
-                                .get(if q1 {
-                                    "attention_gather_q1"
-                                } else if share {
-                                    "attention_gather_u"
-                                } else {
-                                    "attention_gather"
-                                })
-                                .launch(
-                                    (if q1 { ns as u32 } else { ns.div_ceil(4) as u32 }, c.n_kv as u32, 1),
-                                    (if q1 { 128 } else { 256 }, 1, 1),
-                                    0,
+                            q.n,
+                            k.n,
+                            o.k,
+                        )?,
+                        Some((b, scs)) => {
+                            let _ = scs;
+                            for run in b.runs.iter() {
+                                self.attend(
+                                    run.ls,
+                                    sc,
+                                    run.rows,
                                     st,
-                                    &[
-                                        Arg::U64(sc.small3.addr() + (nd * row) as u64),
-                                        Arg::U64(sc.small2.addr() + (nd * row) as u64),
-                                        kc.into(),
-                                        vr_arg,
-                                        list.into(),
-                                        cnt,
-                                        ns.into(),
-                                        (ls.len + nd).into(),
-                                        ctx.into(),
-                                        c.n_heads.into(),
-                                        c.n_kv.into(),
-                                        l.into(),
-                                        ic.ratio.into(),
-                                        scale.into(),
-                                    ],
+                                    li,
+                                    q_norm,
+                                    k_norm,
+                                    indexer.as_ref(),
+                                    proj_ready,
+                                    run.off,
+                                    Arg::U64(run.len_dev),
+                                    q.n,
+                                    k.n,
+                                    o.k,
                                 )?;
+                            }
                         }
-                    } else if t >= ATTN_WMMA_MIN {
-                        self.k.get("attention_wmma").launch(
-                            ((t.div_ceil(64) * c.n_heads) as u32, 1, 1),
-                            (256, 1, 1),
-                            0,
-                            st,
-                            &[
-                                (&sc.small3).into(),
-                                (&sc.small2).into(),
-                                kc.into(),
-                                vc.into(),
-                                t.into(),
-                                ls.len.into(),
-                                c.n_heads.into(),
-                                c.n_kv.into(),
-                                scale.into(),
-                                ctx.into(),
-                                sel_args[0],
-                                sel_args[1],
-                                words.into(),
-                                ratio.into(),
-                                mass_args.0,
-                                mass_args.1.into(),
-                                mass_args.2.into(),
-                            ],
-                        )?;
-                    } else if let (Some(is), Some(ic)) = (ls.idx.as_ref().filter(|is| is.sel.is_some()), &c.indexer)
-                        && let Some((list, lrows)) = is.list
-                        && std::env::var("MALLEUS_ATTN_SEL").map_or(true, |v| v != "0")
-                    {
-                        // Sparse decode / verify: only the listed blocks and the tail (~budget keys per query).
-                        let (_, sel, _, w) = is.sel.context("selection")?;
-                        let l = ic.budget / ic.ratio;
-                        let cnt = Arg::U64(list.addr() + (lrows * l * 4) as u64);
-                        self.k.get("idx_compact").launch(
-                            (t as u32, 1, 1),
-                            (256, 1, 1),
-                            0,
-                            st,
-                            &[list.into(), cnt, sel.into(), w.into(), l.into()],
-                        )?;
-                        let nsplit = (l * ic.ratio + ic.ratio).div_ceil(ATTN_SPLIT);
-                        self.k.get("attention_sel").launch(
-                            ((t * c.n_heads) as u32, nsplit as u32, 1),
-                            (256, 1, 1),
-                            0,
-                            st,
-                            &[
-                                ls.attn_part.into(),
-                                (&sc.small2).into(),
-                                kc.into(),
-                                vc.into(),
-                                list.into(),
-                                cnt,
-                                (&sc.len_dev).into(),
-                                c.n_heads.into(),
-                                c.n_kv.into(),
-                                scale.into(),
-                                ctx.into(),
-                                nsplit.into(),
-                                ic.ratio.into(),
-                                l.into(),
-                                vr_arg,
-                            ],
-                        )?;
-                        self.k.get("attention_combine").launch(
-                            ((t * c.n_heads) as u32, 1, 1),
-                            (256, 1, 1),
-                            0,
-                            st,
-                            &[(&sc.small3).into(), ls.attn_part.into(), nsplit.into()],
-                        )?;
-                    } else {
-                        let nsplit = (ls.len + t).div_ceil(ATTN_SPLIT);
-                        self.k.get("attention_split").launch(
-                            ((t * c.n_heads) as u32, nsplit as u32, 1),
-                            (256, 1, 1),
-                            0,
-                            st,
-                            &[
-                                ls.attn_part.into(),
-                                (&sc.small2).into(),
-                                kc.into(),
-                                vc.into(),
-                                (&sc.len_dev).into(),
-                                c.n_heads.into(),
-                                c.n_kv.into(),
-                                scale.into(),
-                                ctx.into(),
-                                nsplit.into(),
-                                sel_args[0],
-                                words.into(),
-                                ratio.into(),
-                            ],
-                        )?;
-                        self.k.get("attention_combine").launch(
-                            ((t * c.n_heads) as u32, 1, 1),
-                            (256, 1, 1),
-                            0,
-                            st,
-                            &[(&sc.small3).into(), ls.attn_part.into(), nsplit.into()],
-                        )?;
                     }
                     if self.row8(o, t) {
                         let act = Act::AttnGate(&sc.small3, &sc.big0);
@@ -6122,23 +6503,8 @@ impl Model {
                     dec,
                     ab,
                 } => {
-                    let conv_state = &ls.conv[di];
-                    let rec_state = &ls.rec[di];
-                    let conv_snap: Arg = ls.conv_snaps.map_or(Arg::U64(0), |cs| (&cs[di]).into());
-                    let (pin, np, pout): (Arg, usize, Arg) = match ls.dn {
-                        Some((recs, np, par, record)) => (
-                            (&recs[di][par]).into(),
-                            np,
-                            if record {
-                                (&recs[di][par ^ 1]).into()
-                            } else {
-                                Arg::U64(0)
-                            },
-                        ),
-                        None => (Arg::U64(0), 0, Arg::U64(0)),
-                    };
+                    let di_now = di;
                     di += 1;
-                    let cd = c.lin_qkv_dim();
                     let ab_merged = !fused && t <= GEMV_MAX_T && dec.is_some() && ab.is_some();
                     match (&layer.fin, dec) {
                         (Some(f), _) if fused => {
@@ -6163,123 +6529,19 @@ impl Model {
                             self.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sc.small2, Act::Same(&sc.hn), b, t, false)?;
                         }
                     }
-                    self.k.get("conv_qk_norm").launch(
-                        ((t * cd / 128).div_ceil(8) as u32, 1, 1),
-                        (256, 1, 1),
-                        0,
-                        st,
-                        &[
-                            (&sc.big1).into(),
-                            (&sc.big0).into(),
-                            conv.into(),
-                            conv_state.into(),
-                            t.into(),
-                            cd.into(),
-                            c.lin_nk.into(),
-                        ],
-                    )?;
-                    self.ew(
-                        st,
-                        "conv_state_save",
-                        cd,
-                        &[(&sc.big0).into(), conv_state.into(), t.into(), cd.into(), conv_snap],
-                    )?;
-                    let (beta, g) = (&sc.big2, &sc.small3);
-                    self.ew(
-                        st,
-                        "deltanet_gates",
-                        t * c.lin_nv,
-                        &[
-                            beta.into(),
-                            g.into(),
-                            (&sc.small1).into(),
-                            if fused || ab_merged { &sc.small1 } else { &sc.small2 }.into(),
-                            a_log.into(),
-                            dt_bias.into(),
-                            t.into(),
-                            c.lin_nv.into(),
-                            if fused {
-                                128
-                            } else if ab_merged {
-                                2 * c.lin_nv
-                            } else {
-                                c.lin_nv
+                    match batch {
+                        None => self.delta_state(
+                            ls, sc, t, st, di_now, conv, a_log, dt_bias, fused, ab_merged, 0, qkv.n, z.n, c.lin_nv,
+                        )?,
+                        Some((b, scs)) => {
+                            let _ = scs;
+                            for run in b.runs.iter() {
+                                self.delta_state(
+                                    run.ls, sc, run.rows, st, di_now, conv, a_log, dt_bias, fused, ab_merged, run.off,
+                                    qkv.n, z.n, c.lin_nv,
+                                )?;
                             }
-                            .into(),
-                            if fused || ab_merged { c.lin_nv } else { 0 }.into(),
-                        ],
-                    )?;
-                    let scan = |t: usize, pout: Arg| -> Result<()> {
-                        self.k.get("deltanet_scan").launch(
-                            ((c.lin_nv * 8) as u32, 1, 1),
-                            (32, 1, 1),
-                            0,
-                            st,
-                            &[
-                                (&sc.big0).into(),
-                                (&sc.big1).into(),
-                                beta.into(),
-                                g.into(),
-                                rec_state.into(),
-                                t.into(),
-                                c.lin_nv.into(),
-                                c.lin_nk.into(),
-                                pin,
-                                np.into(),
-                                pout,
-                            ],
-                        )?;
-                        Ok(())
-                    };
-                    if t >= DN_CHUNK && std::env::var_os("MALLEUS_DN_SCAN").is_none() {
-                        if np > 0 {
-                            scan(0, Arg::U64(0))?;
                         }
-                        ensure!(
-                            c.lin_dk == 128 && c.lin_dv == 128,
-                            "chunked DeltaNet needs 128-wide heads"
-                        );
-                        let d = &sc.dn;
-                        self.k.get("deltanet_chunk_prep").launch(
-                            ((t.div_ceil(DN_CHUNK) * c.lin_nv) as u32, 1, 1),
-                            (256, 1, 1),
-                            0,
-                            st,
-                            &[
-                                (&d[0]).into(),
-                                (&d[1]).into(),
-                                (&d[2]).into(),
-                                (&d[3]).into(),
-                                (&d[4]).into(),
-                                (&d[5]).into(),
-                                (&sc.big1).into(),
-                                beta.into(),
-                                g.into(),
-                                t.into(),
-                                c.lin_nv.into(),
-                                c.lin_nk.into(),
-                            ],
-                        )?;
-                        self.k.get("deltanet_chunk_scan").launch(
-                            (c.lin_nv as u32, 1, 1),
-                            (256, 1, 1),
-                            0,
-                            st,
-                            &[
-                                (&sc.big0).into(),
-                                rec_state.into(),
-                                (&d[0]).into(),
-                                (&d[1]).into(),
-                                (&d[2]).into(),
-                                (&d[3]).into(),
-                                (&d[4]).into(),
-                                (&d[5]).into(),
-                                t.into(),
-                                c.lin_nv.into(),
-                            ],
-                        )?;
-                    } else {
-                        scan(t, pout)?;
                     }
                     if self.row8(out, t) {
                         let act = Act::GatedNorm(&sc.big0, &sc.small0, norm);
