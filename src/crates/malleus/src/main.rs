@@ -6,7 +6,7 @@ use malleus_gguf::gguf::Gguf;
 use malleus_gguf::safetensors::SafeTensors;
 use malleus_model::kernels::{Kernels, select_device};
 use malleus_model::vision::{VisionConfig, VisionModel};
-use malleus_model::{Config, GEMV_MAX_T, LoadOptions, Model, Session, dense_w4a4};
+use malleus_model::{Config, Family, GEMV_MAX_T, LoadOptions, Model, Session, dense_w4a4};
 use malleus_sched::{Catalog, ModelSpec};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -280,7 +280,7 @@ fn open_converted(path: &Path) -> Result<Gguf> {
     let g = Gguf::open(path)?;
     let arch = g.malleus_arch()?;
     anyhow::ensure!(
-        matches!(arch, "qwen35" | "qwen4exp" | "ling3"),
+        matches!(arch, "qwen35" | "qwen4exp" | "ling3" | "hy4"),
         "unsupported model family `{arch}`"
     );
     Ok(g)
@@ -305,7 +305,7 @@ fn preflight(path: &Path, ctx: usize, chunk: Option<usize>) -> Result<()> {
         let weights = malleus_model::memplan::weights_on_device(&g, prefill_int8);
         tables = malleus_model::memplan::tables_on_disk(&g);
         eprintln!(
-            "memory: {:.1} GiB of the {:.1} GiB file go on the device (the n-gram table stays on disk)",
+            "memory: {:.1} GiB of the {:.1} GiB file go on the device (the hashed tables stay on disk)",
             weights as f64 / (1u64 << 30) as f64,
             std::fs::metadata(path)?.len() as f64 / (1u64 << 30) as f64
         );
@@ -358,6 +358,10 @@ fn load_model(path: &Path) -> Result<Model> {
     let prefill_int8 = std::env::var("MALLEUS_PREFILL_WEIGHTS").map_or(true, |v| v != "none");
     let with_vision = std::env::var("MALLEUS_VISION").map(|v| v != "0").unwrap_or(true);
     let load_vision = |m: &mut Model, src: &dyn malleus_gguf::TensorSource, cfg_json: &str| -> Result<()> {
+        // Hy4-flash has a tower of its own (issue #40, loaded with the image path).
+        if m.cfg.family == Family::Hy4 {
+            return Ok(());
+        }
         if let Some(vc) = VisionConfig::from_json(cfg_json)?
             && with_vision
             && src.info("model.visual.patch_embed.proj.weight").is_some()

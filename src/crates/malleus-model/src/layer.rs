@@ -376,6 +376,10 @@ pub(crate) fn load_layer(
 ) -> Result<Layer> {
     let l = |s: &str| format!("{pre}{s}");
     let mut mixer = match kind {
+        // Hy4's layers are not built here: its weights live in `crate::hy4::Weights::load` (issue #40).
+        MixerKind::Hy4Indexed | MixerKind::Hy4Sliding => {
+            bail!("hy4 layers are loaded by crate::hy4, not by the shared loader")
+        }
         MixerKind::Attn => {
             let qd = c.n_heads * c.head_dim;
             let kvd = c.n_kv * c.head_dim;

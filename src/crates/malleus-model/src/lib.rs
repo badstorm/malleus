@@ -4,6 +4,7 @@ pub mod config;
 pub mod dflash;
 pub mod engine;
 pub mod expert_cache;
+pub mod hy4;
 pub mod image_pre;
 pub mod kernels;
 pub mod layer;

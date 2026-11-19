@@ -54,6 +54,69 @@ pub struct Config {
     pub dense_ffn: usize,
     /// Per-layer SwiGLU clamp of Ling-3.0-flash, routed and shared (0 = no clamp). ADR 0004.
     pub swiglu: Option<Swiglu>,
+    /// Hy4-flash geometry: iHC, the two attention shapes, the compressed indexer, the latent MoE and Engram.
+    pub hy4: Option<Hy4Config>,
+}
+
+/// Hy4-flash (`hy_v4_flash`, issue #40). The two attention shapes and the two RoPE bases are per layer type, so
+/// they live here rather than in `Config`; `Config` keeps only what the shared graph reads.
+#[derive(Clone, Debug)]
+pub struct Hy4Config {
+    /// Streams (`hc_mult`) and the magnitude of the iHC post-gate.
+    pub hc_mult: usize,
+    pub hc_magnitude: f32,
+    pub hc_eps: f32,
+    /// `gated_mla`: elementwise output gate, and the learned sink logit per head.
+    pub sink: bool,
+    pub q_lora: usize,
+    pub kv_lora: usize,
+    /// Global (indexed) layers: heads, and the 192 nope / 64 rope / 256 value split.
+    pub heads: usize,
+    pub nope: usize,
+    pub rope: usize,
+    pub v: usize,
+    /// Local (sliding) layers: their own width, and how many keys they see.
+    pub swa_heads: usize,
+    pub swa_nope: usize,
+    pub swa_rope: usize,
+    pub swa_v: usize,
+    pub window: usize,
+    /// RoPE base per layer type: the global one is the long-context base.
+    pub theta_indexed: f32,
+    pub theta_sliding: f32,
+    pub mrope_section: [usize; 3],
+    /// Compressed indexer: tokens per pooled group, the recall budget, and the scoring heads and width.
+    pub index_pool: usize,
+    pub index_topk: usize,
+    pub index_heads: usize,
+    pub index_dim: usize,
+    /// Width the routed experts run in (`routed_expert_hidden_size`), and the SwiGLU clamp of their activation.
+    pub latent: usize,
+    pub swiglu_limit: f32,
+    pub routed_scaling: f32,
+    /// Per-layer FFN kind (`mlp_layer_types`): true where the FFN is a latent MoE, false for the dense layer.
+    pub sparse: Vec<bool>,
+    /// Engram memories, when the checkpoint carries them.
+    pub engram: Option<Hy4Engram>,
+}
+
+/// The hashed n-gram memory of Hy4: which layers carry it and the shape of the hashes.
+#[derive(Clone, Debug)]
+pub struct Hy4Engram {
+    /// 0-based layer indices.
+    pub layers: Vec<usize>,
+    /// Hash heads per n-gram order (2..=max_ngram), the width of each row, and the head width.
+    pub heads: usize,
+    pub embed: usize,
+    pub max_ngram: usize,
+    pub pad: u32,
+    /// Size of the frozen normalized-vocabulary map the hashes go through.
+    pub lookup: usize,
+    pub seed: u64,
+    /// fp8 (e4m3) round trip of the looked-up rows, as the memory was trained.
+    pub fp8: bool,
+    /// Per layer (same order as `layers`), the hash-head vocabulary sizes by n-gram order.
+    pub head_vocab_sizes: Vec<Vec<Vec<usize>>>,
 }
 
 /// The graphs Malleus knows. `Ling3` is the one with different mixers (KDA and MLA), see ADR 0005.
@@ -62,6 +125,9 @@ pub enum Family {
     Qwen35,
     Qwen4Exp,
     Ling3,
+    /// Hy4-flash (`hy_v4_flash`): iHC streams, gated MLA with a learned sink, hybrid indexed/sliding attention,
+    /// latent MoE and the Engram n-gram memories. Issue #40.
+    Hy4,
 }
 
 impl Family {
@@ -70,6 +136,7 @@ impl Family {
             "qwen3_5" | "qwen3_5_moe" => Family::Qwen35,
             "qwen4_exp" => Family::Qwen4Exp,
             "bailing_hybrid" => Family::Ling3,
+            "hy_v4_flash" => Family::Hy4,
             _ => return None,
         })
     }
@@ -86,6 +153,10 @@ pub enum MixerKind {
     Kda,
     /// Multi-head latent attention (Ling): the cache holds a 512-wide latent plus 64 rotated dims.
     Mla,
+    /// Hy4's global layer: gated MLA plus the compressed indexer that recalls groups of `index_pool` tokens.
+    Hy4Indexed,
+    /// Hy4's local layer: gated MLA over the last `window` tokens, with its own (wider) head geometry.
+    Hy4Sliding,
 }
 
 /// MLA geometry, from `kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim` and `v_head_dim`.
@@ -185,6 +256,9 @@ impl Config {
         let family = Family::from_model_type(cfg["model_type"].as_str().unwrap_or(""))
             .or_else(|| Family::from_model_type(cfg["text_config"]["model_type"].as_str().unwrap_or("")))
             .context("config: unknown or missing model_type")?;
+        if family == Family::Hy4 {
+            return crate::hy4::config(&cfg, generation_config);
+        }
         let ling = family == Family::Ling3;
         let t = if ling { &cfg } else { &cfg["text_config"] };
         let u = |k: &str| {
@@ -307,6 +381,7 @@ impl Config {
             mrope,
             dense_ffn: if ling { u("first_k_dense_replace")? } else { 0 },
             swiglu,
+            hy4: None,
         };
         c.validate()?;
         Ok(c)
@@ -317,6 +392,9 @@ impl Config {
             self.full_attn.len() == self.n_layers && self.kind.len() == self.n_layers,
             "layer types length mismatch"
         );
+        if self.family == Family::Hy4 {
+            return crate::hy4::validate(self);
+        }
         ensure!(self.conv_k == 4, "reference kernels require conv kernel 4");
         ensure!(
             self.n_heads.is_multiple_of(self.n_kv) && self.lin_nv.is_multiple_of(self.lin_nk),
