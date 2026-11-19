@@ -192,6 +192,10 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
     ("mls3", &["gemv_mls3", "gemm_mls3", "moe_gate_up3", "moe_down3"]),
     ("kda", &["kda_scan", "kda_conv_norm"]),
     (
+        "hy4",
+        &["ihc_pre", "ihc_res", "ihc_head", "hy4_rope", "hy4_attn", "hy4_cast_f32"],
+    ),
+    (
         "mla",
         &[
             "mla_cache_write",

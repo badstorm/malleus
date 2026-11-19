@@ -512,7 +512,8 @@ fn load_layer(up: &mut Uploader, src: &dyn TensorSource, c: &Config, h: &Hy4Conf
         o: up.linear(src, &p("self_attn.o_proj"), c.hidden, od)?,
         gate: up.linear(src, &p("self_attn.linear_gate"), od, c.hidden)?,
         q_a_norm: up.norm(src, &p("self_attn.q_a_layernorm.weight"), h.q_lora, false)?,
-        kv_a_norm: up.norm(src, &p("self_attn.kv_a_layernorm.weight"), h.kv_lora, false)?,
+        // `mla_cache_write` multiplies by this weight directly and reads it as f32, so it goes up raw in f32.
+        kv_a_norm: up.norm_f32(src, &p("self_attn.kv_a_layernorm.weight"), h.kv_lora)?,
         post_norm: up.norm(src, &p("self_attn.post_proj_norm.weight"), c.hidden, false)?,
         sink: match h.sink {
             true => Some(up.typed(src, &p("self_attn.learnable_sink_param"), DType::F32, &[heads])?),
@@ -665,6 +666,384 @@ pub(crate) fn session_bytes(c: &Config, ctx: usize) -> u64 {
     let per_token = h.kv_lora as u64 + h.rope as u64;
     let layers = c.n_layers as u64;
     (ctx as u64).div_ceil(32) * 32 * per_token * 2 * layers
+}
+
+/// Hy4's session: the latent and the rotated dims per layer (fp16), no conv or recurrent state.
+pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Result<crate::session::Session> {
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let mut s = crate::session::Session {
+        max_ctx,
+        len: 0,
+        next_pos: 0,
+        kv: Vec::with_capacity(c.n_layers),
+        conv: Vec::new(),
+        rec: Vec::new(),
+        attn_part: crate::session::f32s(1)?,
+        mla_part: None,
+        conv_snap: Vec::new(),
+        dn_rec: Vec::new(),
+        dn_np: 0,
+        dn_par: 0,
+        snap_t: 0,
+        mtp_kv: Vec::new(),
+        mtp_len: 0,
+        mtp_h: None,
+        mtp_pos: Vec::new(),
+        mtp_out: None,
+        mtp_out_pos: [0; 3],
+        mtp_chain: 0,
+        ple_state: None,
+        ngram_ctx: Vec::new(),
+        idx_kb: Vec::new(),
+        idx_tk: Vec::new(),
+        idx_tp: Vec::new(),
+        idx_scores: None,
+        idx_sel: None,
+        idx_sel_cache: Vec::new(),
+        idx_cache_len: 0,
+        mtp_idx: None,
+        idx_list: None,
+        ple_snap: None,
+        ngram_prev: Vec::new(),
+    };
+    let n = crate::weights::kv_ctx(max_ctx);
+    for _ in 0..c.n_layers {
+        s.kv.push((
+            DeviceBuffer::zeroed(n * h.kv_lora * 2)?,
+            DeviceBuffer::zeroed(n * h.rope * 2)?,
+        ));
+    }
+    Ok(s)
+}
+
+/// One forward of the text graph. The first slice: iHC, the gated MLA with its sink (dense, the indexer comes
+/// later), the dense FFN of layer 0 and the head. The latent MoE and the Engram memories are not wired yet.
+pub(crate) fn forward(
+    model: &crate::engine::Model,
+    sess: &mut crate::session::Session,
+    tokens: &[u32],
+    positions: Option<&[[i32; 3]]>,
+    n_logits: usize,
+) -> Result<Vec<f32>> {
+    use crate::engine::Act;
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let w = model.hy4.as_ref().context("no hy4 weights")?;
+    let t = tokens.len();
+    ensure!(t > 0 && n_logits >= 1 && n_logits <= t, "bad hy4 step");
+    ensure!(
+        sess.len + t <= sess.max_ctx,
+        "context full ({} + {} > {})",
+        sess.len,
+        t,
+        sess.max_ctx
+    );
+    let st = &model.stream;
+    let mut sc = model.scratch(t)?;
+    let ids: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
+    let pos: Vec<i32> = match positions {
+        Some(p) => p.iter().flatten().copied().collect(),
+        None => (0..t).flat_map(|i| [(sess.next_pos + i as i64) as i32; 3]).collect(),
+    };
+    let max_pos = pos.iter().copied().max().unwrap_or(0) as i64;
+    sc.upload_step(sess.len as i32, &ids, &pos)?;
+    model.k.get("embed_bf16").launch(
+        (t as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&sc.x).into(), (&model.embed).into(), (&sc.ids).into(), c.hidden.into()],
+    )?;
+    // The streams are the embedding repeated `hc_mult` times.
+    let sd = h.hc_mult * c.hidden;
+    let streams = crate::session::f32s(t * sd)?;
+    model.ew(
+        st,
+        "hc_expand",
+        t * sd,
+        &[
+            (&streams).into(),
+            (&sc.x).into(),
+            t.into(),
+            h.hc_mult.into(),
+            c.hidden.into(),
+        ],
+    )?;
+    let (hidden, hc, eps) = (c.hidden, h.hc_mult, c.hy4.as_ref().unwrap().hc_eps);
+    let hc_shared = (2 * hc * 4 + 256 * 4) as u32;
+    let layers = std::env::var("MALLEUS_HY4_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(w.layers.len())
+        .min(w.layers.len());
+    let trace = std::env::var("MALLEUS_HY4_TRACE").is_ok();
+    let dump = |name: &str, li: usize, buf: &DeviceBuffer, n: usize| -> Result<()> {
+        if !trace {
+            return Ok(());
+        }
+        st.synchronize()?;
+        let v: Vec<f32> = buf.download(n)?;
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let dir = std::env::var("MALLEUS_DUMP_DIR").context("MALLEUS_HY4_TRACE needs MALLEUS_DUMP_DIR")?;
+        std::fs::write(std::path::Path::new(&dir).join(format!("T{li}_{name}.f32")), bytes)?;
+        Ok(())
+    };
+    let post = crate::session::f32s(t * hc)?;
+    let hn = crate::session::f32s(t * hidden)?;
+    let hn2 = crate::session::f32s(t * hidden)?;
+    let qd = h.heads * (h.nope + h.rope);
+    let kvd = h.heads * (h.nope + h.v);
+    let q = crate::session::f32s(t * qd)?;
+    let qa = crate::session::f32s(t * h.q_lora)?;
+    let kva = crate::session::f32s(t * (h.kv_lora + h.rope))?;
+    let gate = crate::session::f32s(t * h.heads * h.v)?;
+    let attn_out = crate::session::f32s(t * h.heads * h.v)?;
+    let o = crate::session::f32s(t * hidden)?;
+    let nk = sess.len + t;
+    ensure!(nk <= 4096, "the first hy4 pass scores at most 4096 keys");
+    let lat = crate::session::f32s(nk * h.kv_lora)?;
+    let crot = crate::session::f32s(nk * h.rope)?;
+    let kvb = crate::session::f32s(nk * kvd)?;
+    for (li, layer) in w.layers.iter().take(layers).enumerate() {
+        ensure!(
+            layer.engram.is_none() && matches!(layer.ffn, Ffn::Dense { .. }),
+            "hy4 layer {li}: the Engram and latent-MoE layers land in the next increment"
+        );
+        let a = &layer.attn;
+        let (ckv, ckrot) = &sess.kv[li];
+        // iHC pre-mix of the mixer, its norm, and the MLA projections.
+        model.k.get("ihc_pre").launch(
+            (t as u32, 1, 1),
+            (256, 1, 1),
+            hc_shared,
+            st,
+            &[
+                (&hn).into(),
+                (&post).into(),
+                (&streams).into(),
+                (&layer.attn_hc.f).into(),
+                (&layer.attn_hc.base).into(),
+                (&layer.attn_hc.scale).into(),
+                t.into(),
+                hc.into(),
+                hidden.into(),
+                h.hc_magnitude.into(),
+                eps.into(),
+            ],
+        )?;
+        dump("ihc_pre", li, &hn, t * hidden)?;
+        dump("ihc_post", li, &post, t * hc)?;
+        dump("ihc_out", li, &hn, t * hidden)?;
+        model.rmsnorm(st, &hn2, &hn, &layer.in_norm, t, hidden)?;
+        dump("in_norm", li, &hn2, t * hidden)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &qa, Act::X(&hn2), &a.q_a, t, false)?;
+        model.rmsnorm(st, &hn, &qa, &a.q_a_norm, t, h.q_lora)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &q, Act::X(&hn), &a.q_b, t, false)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &kva, Act::X(&hn2), &a.kv_a, t, false)?;
+        dump("q", li, &q, t * qd)?;
+        model.k.get("hy4_rope").launch(
+            ((t * (h.heads + 1) * (h.rope / 2)).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&q).into(),
+                (&kva).into(),
+                (&sc.pos).into(),
+                t.into(),
+                h.heads.into(),
+                h.nope.into(),
+                h.kv_lora.into(),
+                h.rope.into(),
+                h.mrope_section[1].into(),
+                h.mrope_section[2].into(),
+                c.rope_theta.into(),
+            ],
+        )?;
+        model.k.get("mla_cache_write").launch(
+            ((t * (h.kv_lora + h.rope)).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                ckv.into(),
+                ckrot.into(),
+                (&kva).into(),
+                (&a.kv_a_norm).into(),
+                eps.into(),
+                sess.len.into(),
+                t.into(),
+                h.kv_lora.into(),
+                h.rope.into(),
+            ],
+        )?;
+        // Expand the cache into K/V (the non-absorbed path: correct first, absorbed later).
+        model.ew(
+            st,
+            "hy4_cast_f32",
+            nk * h.kv_lora,
+            &[(&lat).into(), ckv.into(), (nk * h.kv_lora).into()],
+        )?;
+        model.ew(
+            st,
+            "hy4_cast_f32",
+            nk * h.rope,
+            &[(&crot).into(), ckrot.into(), (nk * h.rope).into()],
+        )?;
+        dump("lat", li, &lat, nk * h.kv_lora)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &kvb, Act::X(&lat), &a.kv_b, nk, false)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &gate, Act::X(&hn2), &a.gate, t, false)?;
+        dump("gate", li, &gate, t * h.heads * h.v)?;
+        let sink = a.sink.as_ref().context("hy4 gated MLA needs the learned sink")?;
+        model.k.get("hy4_attn").launch(
+            (a.heads as u32, t as u32, 1),
+            (256, 1, 1),
+            (4096 * 4 + 256 * 4) as u32,
+            st,
+            &[
+                (&attn_out).into(),
+                (&q).into(),
+                (&kvb).into(),
+                (&crot).into(),
+                sink.into(),
+                (&gate).into(),
+                sess.len.into(),
+                a.heads.into(),
+                a.nope.into(),
+                a.rope.into(),
+                a.v.into(),
+                (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+            ],
+        )?;
+        dump("attn_raw", li, &attn_out, t * h.heads * h.v)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&attn_out), &a.o, t, false)?;
+        model.rmsnorm(st, &hn, &o, &a.post_norm, t, hidden)?;
+        dump("attn", li, &hn, t * hidden)?;
+        model.k.get("ihc_res").launch(
+            ((t * sd).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&streams).into(),
+                (&hn).into(),
+                (&post).into(),
+                (&streams).into(),
+                (t * sd).into(),
+                hc.into(),
+                hidden.into(),
+            ],
+        )?;
+        dump("streams_attn", li, &streams, t * sd)?;
+        // FFN: iHC pre-mix, pre-norm, the dense SwiGLU and its sandwich norm, then the residual.
+        model.k.get("ihc_pre").launch(
+            (t as u32, 1, 1),
+            (256, 1, 1),
+            hc_shared,
+            st,
+            &[
+                (&hn).into(),
+                (&post).into(),
+                (&streams).into(),
+                (&layer.ffn_hc.f).into(),
+                (&layer.ffn_hc.base).into(),
+                (&layer.ffn_hc.scale).into(),
+                t.into(),
+                hc.into(),
+                hidden.into(),
+                h.hc_magnitude.into(),
+                eps.into(),
+            ],
+        )?;
+        dump("ffn_pre", li, &hn, t * hidden)?;
+        dump("ffn_post", li, &post, t * hc)?;
+        model.rmsnorm(st, &hn2, &hn, &layer.post_norm, t, hidden)?;
+        dump("ffn_in", li, &hn2, t * hidden)?;
+        let Ffn::Dense {
+            gate: g,
+            up,
+            down,
+            norm,
+        } = &layer.ffn
+        else {
+            bail!("hy4 layer {li}: not a dense FFN")
+        };
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sc.big0, Act::X(&hn2), g, t, false)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sc.big1, Act::Same(&hn2), up, t, false)?;
+        let n = t * c.inter;
+        model.ew(
+            st,
+            "silu_mul",
+            n,
+            &[(&sc.big0).into(), (&sc.big0).into(), (&sc.big1).into(), n.into()],
+        )?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&sc.big0), down, t, false)?;
+        model.rmsnorm(st, &hn, &o, norm, t, hidden)?;
+        dump("ffn_out", li, &hn, t * hidden)?;
+        model.k.get("ihc_res").launch(
+            ((t * sd).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&streams).into(),
+                (&hn).into(),
+                (&post).into(),
+                (&streams).into(),
+                (t * sd).into(),
+                hc.into(),
+                hidden.into(),
+            ],
+        )?;
+        // The layer's state in the reference's layout (`layers/<id>/L<i>.f32`, [t, streams * hidden] f32).
+        if let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR") {
+            st.synchronize()?;
+            let v: Vec<f32> = streams.download(t * sd)?;
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join(format!("L{li}_t{t}.f32")), bytes)?;
+        }
+    }
+    sess.len += t;
+    sess.next_pos = max_pos + 1;
+    // The head: the streams mixed down, the final norm and the logits.
+    let normed = crate::session::f32s(t * hidden)?;
+    model.k.get("ihc_head").launch(
+        (t as u32, 1, 1),
+        (256, 1, 1),
+        (256 * 4 + 64 * 4) as u32,
+        st,
+        &[
+            (&normed).into(),
+            (&streams).into(),
+            (&w.head.f).into(),
+            (&w.head.base).into(),
+            (&w.head.scale).into(),
+            t.into(),
+            hc.into(),
+            hidden.into(),
+            eps.into(),
+        ],
+    )?;
+    model.rmsnorm(st, &hn, &normed, &w.norm, t, hidden)?;
+    let first = t - n_logits;
+    let mut last = crate::session::f32s(n_logits * hidden)?;
+    last.copy_from(0, &hn, first * hidden * 4, n_logits * hidden * 4, st)?;
+    let logits = crate::session::f32s(n_logits * c.vocab)?;
+    model.gemm(
+        st,
+        &sc.xr,
+        &sc.xh,
+        &sc.xsc,
+        &logits,
+        Act::X(&last),
+        &model.lm_head,
+        n_logits,
+        false,
+    )?;
+    st.synchronize()?;
+    *model.scratch_cache.lock().unwrap() = Some(sc);
+    Ok(logits.download(n_logits * c.vocab)?)
 }
 
 #[cfg(test)]

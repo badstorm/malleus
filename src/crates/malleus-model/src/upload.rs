@@ -149,6 +149,21 @@ impl Uploader {
         Ok(Linear { w, prefill, n, k })
     }
 
+    /// A norm weight as f32, for the kernels that multiply by it directly instead of going through `rmsnorm`
+    /// (which adds the one and takes bf16): `mla_cache_write` reads `const float* norm_w`.
+    pub(crate) fn norm_f32(&mut self, src: &dyn TensorSource, name: &str, n: usize) -> Result<DeviceBuffer> {
+        let raw = src.read_all(name).with_context(|| format!("missing tensor {name}"))?;
+        let v: Vec<f32> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
+            .collect();
+        ensure!(v.len() == n, "{name}: expected {n} weights, got {}", v.len());
+        self.bytes += v.len() * 4;
+        Ok(DeviceBuffer::from_slice(&v)?)
+    }
+
     /// An RMSNorm weight. Ling stores `w` where the kernels expect `1 + w` (Qwen's form): folding the one at load
     /// keeps every norm kernel single-flavoured, which is the whole point of ADR 0005. The tensors are a few KB, so
     /// the fold happens on the host while uploading.

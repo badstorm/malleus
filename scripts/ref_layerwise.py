@@ -179,6 +179,63 @@ HY4_RENAME = {
 }
 
 
+def hy4_trace(layer, h, s, blobs: Path, tag: str, ngram, engram_mask):
+    """The layer's own forward, step by step, so that the engine can be compared at every boundary.
+
+    The steps are the ones in `HYV4FlashDecoderLayer.forward`; the result is checked against the module's own
+    forward, so this cannot drift from what is being reproduced.
+    """
+    import torch.nn.functional as F
+
+    def save(name, t):
+        save_f32(blobs / f"{tag}_{name}.f32", t[0])
+
+    dtype = h.dtype
+    if layer.engram_layer is not None and ngram is not None:
+        h = h + layer.engram_layer(h, ngram, engram_mask)
+    residual = h
+    flat = h.flatten(2).float()
+    mixes = F.linear(flat, layer.attn_hc.fn.float()) * layer.attn_hc.input_norm(flat)
+    pre_b, post_b = layer.attn_hc.base.split(layer.attn_hc.hc_mult, dim=-1)
+    pre_s, post_s = layer.attn_hc.scale.unbind(0)
+    pre_l, post_l = mixes.split(layer.attn_hc.hc_mult, dim=-1)
+    pre = torch.sigmoid(pre_l * pre_s + pre_b) + layer.attn_hc.hc_eps
+    post = layer.attn_hc.hc_post_magnitude * torch.sigmoid(post_l * post_s + post_b) + layer.attn_hc.hc_eps
+    x = torch.sum(pre.unsqueeze(-1) * h, dim=2).to(dtype)
+    save("ihc_pre", pre.to(dtype))
+    save("ihc_post", post.to(dtype))
+    save("ihc_out", x)
+    hn = layer.input_layernorm(x)
+    save("in_norm", hn)
+    a, _ = layer.self_attn(
+        hidden_states=hn,
+        attention_mask=s["masks"][layer.attention_type],
+        position_embeddings=s["pe"][layer.attention_type],
+        position_ids=s["pos"],
+        indexer_position_ids=s["pos"],
+    )
+    save("attn", a)
+    x = (post.float().unsqueeze(-1) * a.float().unsqueeze(-2) + residual.float()).to(dtype)
+    save("streams_attn", x)
+    residual = x
+    flat = x.flatten(2).float()
+    mixes = F.linear(flat, layer.ffn_hc.fn.float()) * layer.ffn_hc.input_norm(flat)
+    pre_b, post_b = layer.ffn_hc.base.split(layer.ffn_hc.hc_mult, dim=-1)
+    pre_s, post_s = layer.ffn_hc.scale.unbind(0)
+    pre_l, post_l = mixes.split(layer.ffn_hc.hc_mult, dim=-1)
+    pre = torch.sigmoid(pre_l * pre_s + pre_b) + layer.ffn_hc.hc_eps
+    post = layer.ffn_hc.hc_post_magnitude * torch.sigmoid(post_l * post_s + post_b) + layer.ffn_hc.hc_eps
+    x = torch.sum(pre.unsqueeze(-1) * residual, dim=2).to(dtype)
+    save("ffn_pre", pre.to(dtype))
+    save("ffn_post", post.to(dtype))
+    hf = layer.post_attention_layernorm(x)
+    save("ffn_in", hf)
+    m = layer.post_mlp_layernorm(layer.mlp(hf))
+    save("ffn_out", m)
+    out = (post.float().unsqueeze(-1) * m.float().unsqueeze(-2) + residual.float()).to(dtype)
+    return out
+
+
 def hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev):
     """Hy4-flash: the text path of issue #40, layer by layer.
 
@@ -266,17 +323,35 @@ def hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev):
                 )
             layer.eval()
             at = layer.attention_type
+            import os as _os
+
+            trace = int(_os.environ.get("HY4_TRACE_LAYER", "-1"))
             for pid, s in state.items():
-                s["h"] = layer(
-                    s["h"],
-                    attention_mask=s["masks"][at],
-                    position_embeddings=s["pe"][at],
-                    position_ids=s["pos"],
-                    cache=None,
-                    indexer_position_ids=s["pos"],
-                    ngram_tokens=s["ngram"],
-                    engram_mask=s["engram_mask"],
-                )
+                if pid in dump and i == trace:
+                    out_t = hy4_trace(layer, s["h"], s, blob / "layers" / pid, f"T{i}", s["ngram"], s["engram_mask"])
+                    ref = layer(
+                        s["h"],
+                        attention_mask=s["masks"][at],
+                        position_embeddings=s["pe"][at],
+                        position_ids=s["pos"],
+                        cache=None,
+                        indexer_position_ids=s["pos"],
+                        ngram_tokens=s["ngram"],
+                        engram_mask=s["engram_mask"],
+                    )
+                    assert torch.equal(out_t, ref), "the traced steps diverge from the module's forward"
+                    s["h"] = ref
+                else:
+                    s["h"] = layer(
+                        s["h"],
+                        attention_mask=s["masks"][at],
+                        position_embeddings=s["pe"][at],
+                        position_ids=s["pos"],
+                        cache=None,
+                        indexer_position_ids=s["pos"],
+                        ngram_tokens=s["ngram"],
+                        engram_mask=s["engram_mask"],
+                    )
                 if pid in dump:
                     save_f32(blob / "layers" / pid / f"L{i}.f32", s["h"][0])
             del layer
