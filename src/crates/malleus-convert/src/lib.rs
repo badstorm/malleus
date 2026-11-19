@@ -29,6 +29,10 @@ pub enum Kind {
     Mls8,
     /// int8 rows with a trailing f32 scale each (n-gram lookup table).
     RowI8,
+    /// 4-bit rows read on the host, with one f16 scale per row (`<name>.scales`). Used for the Engram memory
+    /// tables, which are looked up by row and never feed a GEMM: 96 wide, so the 128-wide rotation of MLS4 does
+    /// not apply and the rows stay unrotated.
+    RowI4,
 }
 
 /// Which MoE layers store `gate`/`up` at 3 bit. MIGRATE_MODELS.md §2.4 keeps the sensitive last layers at 4 bit;
@@ -105,6 +109,9 @@ pub enum Family {
     /// for a target model to verify, fed by the target's hidden states and sharing its embedding and `lm_head`.
     /// Not a standalone model: `dflash_config.target_layer_ids` names the target layers it reads.
     Dflash,
+    /// Hy4-flash (`hy_v4_flash`): iHC streams, gated MLA with a learned sink, hybrid sparse/sliding layers, a
+    /// compressed indexer, latent MoE, Engram n-gram memories and a vision tower.
+    Hy4,
 }
 
 impl Family {
@@ -114,6 +121,7 @@ impl Family {
             "qwen3_5" | "qwen3_5_moe" => Family::Qwen35,
             "qwen4_exp" => Family::Qwen4Exp,
             "bailing_hybrid" => Family::Ling3,
+            "hy_v4_flash" => Family::Hy4,
             t => bail!("unsupported model_type `{t}`"),
         })
     }
@@ -139,6 +147,7 @@ impl Family {
             Family::Qwen4Exp => "qwen4exp",
             Family::Ling3 => "ling3",
             Family::Dflash => "dflash",
+            Family::Hy4 => "hy4",
         }
     }
 
@@ -151,6 +160,8 @@ impl Family {
             Family::Ling3 => false,
             // 738 MB of draft: it never runs on more than a block of positions, so a prefill copy is dead weight.
             Family::Dflash => false,
+            // The routed experts alone are ~75 GB: a second copy is 75 GB more on a machine that holds 122 GB.
+            Family::Hy4 => false,
         }
     }
 
@@ -167,7 +178,8 @@ impl Family {
         if name == "lm_head.weight" {
             return Kind::Mls8;
         }
-        if name.contains("visual.") {
+        // The vision tower is 0.9 GB and runs on a handful of positions per image: it stays bf16 as stored.
+        if name.contains("visual.") || name.starts_with("vit.") {
             return Kind::Raw;
         }
         if self != Family::Ling3 && MLS8_SUFFIXES.iter().any(|s| name.ends_with(s)) {
@@ -177,8 +189,12 @@ impl Family {
             Family::Qwen35 | Family::Qwen4Exp => QWEN_MLS4_SUFFIXES,
             Family::Ling3 => LING3_MLS4_SUFFIXES,
             Family::Dflash => DFLASH_MLS4_SUFFIXES,
+            Family::Hy4 => HY4_MLS4_SUFFIXES,
         };
-        if !mls4.iter().any(|s| name.ends_with(s)) {
+        // The Engram key projections are one 2-D linear per hyper-connection channel (`key_projs.N.weight`), so a
+        // suffix does not name them.
+        let key_proj = self == Family::Hy4 && name.contains(".engram_layer.key_projs.") && name.ends_with(".weight");
+        if !key_proj && !mls4.iter().any(|s| name.ends_with(s)) {
             return Kind::Raw;
         }
         // The MLA output gate of Ling is [num_heads, hidden]: a gate, never quantized. The KDA one is [4096, 2560].
@@ -229,7 +245,7 @@ impl Family {
                 let last = u("num_hidden_layers") + u("num_nextn_predict_layers");
                 last.checked_sub(1 + MLS3_SKIP_LAST_LAYERS).map(|to| (from, to))
             }
-            Family::Qwen35 | Family::Qwen4Exp | Family::Dflash => None,
+            Family::Qwen35 | Family::Qwen4Exp | Family::Dflash | Family::Hy4 => None,
         }
     }
 
@@ -245,7 +261,7 @@ impl Family {
                 };
                 t["num_hidden_layers"].as_u64().map(|n| (0, n as usize - 1))
             }
-            Family::Qwen35 | Family::Ling3 | Family::Dflash => None,
+            Family::Qwen35 | Family::Ling3 | Family::Dflash | Family::Hy4 => None,
         }
     }
 }
@@ -290,6 +306,42 @@ const QWEN_MLS4_SUFFIXES: &[&str] = &[
     "mtp.fc.weight",
     "mtp.fc_embedding.weight",
     "mtp.fc_hidden.weight",
+];
+
+/// Hy4-flash linears that go to MLS4. Everything else stays raw: the norms, the router (`mlp.gate.weight`) and its
+/// correction bias, the learned attention sinks, the iHC parameters (f32), the indexer's fp32 pooling projections and
+/// its `intra_group_ape`, the Engram normalization and gate parameters, and the vision tower.
+const HY4_MLS4_SUFFIXES: &[&str] = &[
+    // gated MLA (`*_proj` of the sliding layers carry the wider head shape, same names)
+    "self_attn.q_a_proj.weight",
+    "self_attn.q_b_proj.weight",
+    "self_attn.kv_a_proj_with_mqa.weight",
+    "self_attn.kv_b_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.linear_gate.weight",
+    // compressed indexer: the two key-side projections and the per-head weights
+    "self_attn.compressed_indexer.query_projection.weight",
+    "self_attn.compressed_indexer.token_key_projection.weight",
+    "self_attn.compressed_indexer.head_weight_projection.weight",
+    // dense layer 0
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+    // latent MoE: the experts run in 1536 lanes, the two projections around them in the hidden width
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+    "mlp.routed_expert_down_proj.weight",
+    "mlp.routed_expert_up_proj.weight",
+    "mlp.shared_experts.gate_proj.weight",
+    "mlp.shared_experts.up_proj.weight",
+    "mlp.shared_experts.down_proj.weight",
+    // Engram: the value projection; the key projections are matched separately
+    "engram_layer.value_proj.weight",
+    // DFly2 draft: its MLA, its FFN, the fusion and the corrected-hidden projections
+    "mtp_fusion.eh_proj.weight",
+    "hidden_correction.gate_proj.weight",
+    "hidden_correction.up_proj.weight",
+    "hidden_correction.down_proj.weight",
 ];
 
 /// Ling-3.0-flash linears that go to MLS4. `mlp.gate.weight` (the router) and `mlp.gate.expert_bias` do not end
@@ -525,6 +577,34 @@ fn quantize_rows_i8(w: &[f32], n: usize, k: usize) -> Vec<u8> {
     out
 }
 
+/// Unrotated 4-bit rows, one f16 scale per row: `n * k / 2` bytes of nibbles (LSB first, `value + 8`) and `n`
+/// scales. The Engram rows are 96 wide and are read one at a time on the host, so neither the 128-wide rotation
+/// of MLS4 nor its per-block scale applies; per-row absmax keeps them at 52 bytes for a 192-byte bf16 row.
+fn quantize_rows_i4(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    let packed = k.div_ceil(2);
+    let rows: Vec<(Vec<u8>, f32)> = (0..n)
+        .into_par_iter()
+        .map(|r| {
+            let row = &w[r * k..(r + 1) * k];
+            let a = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let sc = if a > 0.0 { a / 7.0 } else { 1.0 };
+            let mut q = vec![0u8; packed];
+            for (i, v) in row.iter().enumerate() {
+                let qv = (v / sc).round().clamp(-8.0, 7.0) as i32 + 8;
+                q[i / 2] |= (qv as u8 & 0xF) << (4 * (i % 2));
+            }
+            (q, sc)
+        })
+        .collect();
+    let mut q = Vec::with_capacity(n * packed);
+    let mut s = Vec::with_capacity(n * 2);
+    for (a, sc) in rows {
+        q.extend(a);
+        s.extend_from_slice(&half::f16::from_f32(sc).to_le_bytes());
+    }
+    (q, s)
+}
+
 /// Hyper-connection low-rank width padded for the 128-wide rotation blocks of MLS8.
 fn pad128(n: usize) -> usize {
     n.next_multiple_of(BLOCK)
@@ -661,6 +741,23 @@ fn plan(
             });
             continue;
         }
+        // The Engram memory table: 164.9M rows of 96 per layer, ~127 GB in bf16 and ~33 GB at 4 bits per row.
+        if name.ends_with("engram_layer.multi_head_embedding.embedding.weight") {
+            let (n, k) = rows_cols(&info.shape);
+            outs.push(Out {
+                name: name.clone(),
+                kind: Kind::RowI4,
+                shape: vec![n, k],
+                parts: vec![Part {
+                    src: name.clone(),
+                    row0: 0,
+                    rows: n,
+                    k,
+                }],
+                prefill: false,
+            });
+            continue;
+        }
         if let Some(i) = name.find("ngram_embedding.shard_") {
             let base = &name[..i];
             if !seen_tables.insert(base.to_string()) {
@@ -753,6 +850,8 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
         }
         // A DFlash draft has no MoE.
         Family::Dflash => None,
+        // Hy4 stores its routed experts fused (`[E, 2 * latent, latent]`), latent MoE included.
+        Family::Hy4 => None,
         Family::Qwen35 | Family::Qwen4Exp => {
             let t = if cfg["text_config"].is_object() {
                 &cfg["text_config"]
@@ -860,6 +959,10 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
                 add(&format!("{}.scales", o.name), DType::F32, lead);
             }
             Kind::RowI8 => add(&o.name, DType::I8, &o.shape),
+            Kind::RowI4 => {
+                add(&o.name, DType::RowI4, &o.shape);
+                add(&format!("{}.scales", o.name), DType::F16, lead);
+            }
         }
     }
     log(&format!(
@@ -927,6 +1030,27 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
             continue;
         }
         let (n, k) = rows_cols(&o.shape);
+        if o.kind == Kind::RowI4 {
+            // Written in row chunks: the table is ~33 GB.
+            let step = (CHUNK_BYTES / (2 * k)).max(1);
+            let (mut q, mut s) = (Vec::new(), Vec::new());
+            for r0 in (0..n).step_by(step) {
+                let rows = step.min(n - r0);
+                let mut raw = vec![0u8; rows * k * 2];
+                st.read(&o.name, r0 * k * 2, &mut raw)?;
+                let (a, b) = quantize_rows_i4(&bf16_rows(&raw), rows, k);
+                q.extend(a);
+                s.extend(b);
+            }
+            sink.write(&q)?;
+            sink.write(&s)?;
+            log(&format!(
+                "[{i}/{total}] {} ({n} rows, {:.0}s)",
+                o.name,
+                t0.elapsed().as_secs_f64()
+            ));
+            continue;
+        }
         if o.kind == Kind::RowI8 {
             // Written part by part: the table is ~50 GB.
             let kk = k - 4;
@@ -1084,11 +1208,86 @@ mod tests {
         assert_eq!(f("qwen3_5_moe"), Family::Qwen35);
         assert_eq!(f("qwen4_exp"), Family::Qwen4Exp);
         assert_eq!(f("bailing_hybrid"), Family::Ling3);
+        assert_eq!(f("hy_v4_flash"), Family::Hy4);
+        assert_eq!(Family::Hy4.arch(), "hy4");
+        assert!(!Family::Hy4.prefill_copy(true) && !Family::Hy4.prefill_copy(false));
         assert_eq!(Family::Ling3.arch(), "ling3");
         assert_eq!(Family::Qwen4Exp.arch(), "qwen4exp");
         assert!(Family::Qwen35.prefill_copy(true) && !Family::Ling3.prefill_copy(true));
         assert!(Family::Qwen4Exp.prefill_copy(false) && !Family::Qwen4Exp.prefill_copy(true));
         assert!(Family::from_model_type("llama").is_err());
+    }
+
+    /// Hy4-flash: the linears go to 4 bits, the learned sinks, the iHC parameters in fp32, the indexer's fp32 pooling
+    /// projections, the Engram normalization and the whole vision tower stay as stored.
+    #[test]
+    fn hy4_classification() {
+        let o = opts();
+        let c = |name: &str, shape: &[usize]| Family::Hy4.classify(name, shape, &o, None, None);
+        let l = "model.layers.0.";
+        // gated MLA: the linear gate is [8192, 3072], the head sink [32] f32
+        assert_eq!(
+            c(&format!("{l}self_attn.linear_gate.weight"), &[8192, 3072]),
+            Kind::Mls4
+        );
+        assert_eq!(c(&format!("{l}self_attn.q_b_proj.weight"), &[8192, 1024]), Kind::Mls4);
+        assert_eq!(c(&format!("{l}self_attn.kv_b_proj.weight"), &[14336, 512]), Kind::Mls4);
+        assert_eq!(c(&format!("{l}self_attn.o_proj.weight"), &[3072, 8192]), Kind::Mls4);
+        assert_eq!(c(&format!("{l}self_attn.q_a_layernorm.weight"), &[1024]), Kind::Raw);
+        assert_eq!(c(&format!("{l}self_attn.post_proj_norm.weight"), &[3072]), Kind::Raw);
+        assert_eq!(c(&format!("{l}self_attn.learnable_sink_param"), &[32]), Kind::Raw);
+        // compressed indexer: the fp32 pooling projections and the apex stay raw
+        assert_eq!(
+            c(
+                &format!("{l}self_attn.compressed_indexer.query_projection.weight"),
+                &[2048, 1024]
+            ),
+            Kind::Mls4
+        );
+        assert_eq!(
+            c(
+                &format!("{l}self_attn.compressed_indexer.key_value_projection.weight"),
+                &[128, 128]
+            ),
+            Kind::Raw
+        );
+        assert_eq!(
+            c(&format!("{l}self_attn.compressed_indexer.intra_group_ape"), &[4, 128]),
+            Kind::Raw
+        );
+        // latent MoE: the fused experts in the 1536 lanes, the router and the correction bias raw
+        assert_eq!(
+            c("model.layers.1.mlp.experts.gate_up_proj", &[512, 3072, 1536]),
+            Kind::Mls4
+        );
+        assert_eq!(
+            c("model.layers.1.mlp.experts.down_proj", &[512, 1536, 1536]),
+            Kind::Mls4
+        );
+        assert_eq!(
+            c("model.layers.1.mlp.routed_expert_down_proj.weight", &[1536, 3072]),
+            Kind::Mls4
+        );
+        assert_eq!(c("model.layers.1.mlp.gate.weight", &[512, 3072]), Kind::Raw);
+        assert_eq!(c("model.layers.1.mlp.combine_output_norm.weight", &[3072]), Kind::Raw);
+        // iHC: the mixing is fp32 and stays where it is
+        assert_eq!(c("model.layers.0.hc_attn_layer.hc_pre.hc_fn", &[8, 12288]), Kind::Raw);
+        assert_eq!(c("model.hc_head.hc_head_fn", &[4, 12288]), Kind::Raw);
+        // Engram: the table is the converter's RowI4, the projections are 4 bit, the norms raw
+        assert_eq!(c("model.layers.1.engram_layer.lookup_table", &[120818]), Kind::Raw);
+        assert_eq!(
+            c("model.layers.1.engram_layer.value_proj.weight", &[3072, 1536]),
+            Kind::Mls4
+        );
+        assert_eq!(
+            c("model.layers.5.engram_layer.key_projs.0.weight", &[3072, 1536]),
+            Kind::Mls4
+        );
+        assert_eq!(c("model.layers.1.engram_layer.unified_pre_gamma", &[3072]), Kind::Raw);
+        // vision and lm_head
+        assert_eq!(c("vit.layers.0.self_attn.q_proj.weight", &[1152, 1152]), Kind::Raw);
+        assert_eq!(c("vit.perceive.proj.0.weight", &[4608, 1152, 2, 2]), Kind::Raw);
+        assert_eq!(c("lm_head.weight", &[120832, 3072]), Kind::Mls8);
     }
 
     /// Ling-3.0-flash: what stays raw is exactly what MIGRATE_MODELS.md §2.4 forbids to quantize, plus the MLA gate.

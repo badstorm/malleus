@@ -16,6 +16,8 @@ pub enum DType {
     Mls3,
     Mls4,
     Mls8,
+    /// 4-bit rows read whole on the host (Engram memory tables), with one f16 scale per row in `<name>.scales`.
+    RowI4,
 }
 
 impl DType {
@@ -31,6 +33,8 @@ impl DType {
             DType::Mls3 => n / 8 * 3,
             DType::Mls4 => n / 2,
             DType::Mls8 => n,
+            // A row of K 4-bit codes is K / 2 bytes (Engram rows are 96 wide: 48 bytes).
+            DType::RowI4 => n / 2,
         }
     }
 }
