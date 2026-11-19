@@ -1,0 +1,439 @@
+//! The checkpoint config: geometry and the family tag, parsed from `config.json`.
+
+use anyhow::{Context, Result, ensure};
+use serde_json::Value;
+use std::path::Path;
+
+use crate::ling3;
+use crate::qwen4exp;
+use crate::qwen35;
+
+pub struct Config {
+    pub hidden: usize,
+    pub n_layers: usize,
+    pub inter: usize,
+    pub vocab: usize,
+    pub n_heads: usize,
+    pub n_kv: usize,
+    pub head_dim: usize,
+    pub lin_nk: usize,
+    pub lin_nv: usize,
+    pub lin_dk: usize,
+    pub lin_dv: usize,
+    pub conv_k: usize,
+    pub eps: f32,
+    pub rope_theta: f32,
+    pub rot_dim: usize,
+    pub mrope_section: [usize; 3],
+    pub full_attn: Vec<bool>,
+    pub eos: Vec<u32>,
+    /// Sparse MoE FFN in every layer (Qwen3.5-MoE); `inter` is then 0.
+    pub moe: Option<MoeConfig>,
+    /// Gated hyper-connections (Qwen3.8-Flash-Next): `count` residual streams replace the residual and the
+    /// pre-norms.
+    pub hc: Option<HcConfig>,
+    /// Per-layer embedding of hashed n-grams added to the streams before one layer.
+    pub ple: Option<PleConfig>,
+    /// Token indexer of the sparse attention (QSA).
+    pub indexer: Option<IndexerConfig>,
+    /// DeltaNet output gate sigmoid(z) instead of silu(z).
+    pub gate_sigmoid: bool,
+    /// Which graph the checkpoint has: Qwen3.5 and its MoE variant share one, Ling-3.0-flash has another.
+    pub family: Family,
+    /// Mixer per layer. `full_attn` is the Qwen-facing view of the same information.
+    pub kind: Vec<MixerKind>,
+    /// MLA geometry (Ling): the cache holds the latent, K and V are absorbed from it.
+    pub mla: Option<MlaConfig>,
+    /// KDA decay floor (`kda_lower_bound`): the gate is `lb * sigmoid(raw)`, with `lb` negative.
+    pub kda_lower_bound: f32,
+    /// RMSNorm weight multiplies by `1 + w` (Qwen) or by `w` (Ling). Folded at load, see ADR 0005.
+    pub norm_one_plus_w: bool,
+    /// 3-section M-RoPE (Qwen) or plain RoPE on `rot_dim` (Ling).
+    pub mrope: bool,
+    /// Leading layers with a dense FFN (Ling: `first_k_dense_replace`); the rest use `moe`.
+    pub dense_ffn: usize,
+    /// Per-layer SwiGLU clamp of Ling-3.0-flash, routed and shared (0 = no clamp). ADR 0004.
+    pub swiglu: Option<Swiglu>,
+}
+
+/// The graphs Malleus knows. `Ling3` is the one with different mixers (KDA and MLA), see ADR 0005.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    Qwen35,
+    Qwen4Exp,
+    Ling3,
+}
+
+impl Family {
+    pub fn from_model_type(t: &str) -> Option<Family> {
+        Some(match t {
+            "qwen3_5" | "qwen3_5_moe" => Family::Qwen35,
+            "qwen4_exp" => Family::Qwen4Exp,
+            "bailing_hybrid" => Family::Ling3,
+            _ => return None,
+        })
+    }
+}
+
+/// The mixer of one layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixerKind {
+    /// Gated attention (Qwen), with the optional QSA indexer.
+    Attn,
+    /// Gated DeltaNet (Qwen): one scalar decay per value head.
+    Delta,
+    /// Kimi Delta Attention (Ling): a decay per key channel.
+    Kda,
+    /// Multi-head latent attention (Ling): the cache holds a 512-wide latent plus 64 rotated dims.
+    Mla,
+}
+
+/// MLA geometry, from `kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim` and `v_head_dim`.
+#[derive(Clone, Copy, Debug)]
+pub struct MlaConfig {
+    pub kv_lora: usize,
+    pub nope: usize,
+    pub rope: usize,
+    pub v: usize,
+}
+
+/// Per-layer SwiGLU clamp, one limit for the routed experts and one for the shared expert (0 = off).
+#[derive(Clone, Debug)]
+pub struct Swiglu {
+    pub routed: Vec<i32>,
+    pub shared: Vec<i32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HcConfig {
+    pub count: usize,
+    pub rank: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PleConfig {
+    /// Layer index (0-based) whose input receives the embedding.
+    pub layer: usize,
+    pub ngram: usize,
+    pub heads_per_ngram: usize,
+    pub dim: usize,
+    pub conv_k: usize,
+    /// End-of-text id: n-grams do not cross it.
+    pub eos: u32,
+}
+
+impl PleConfig {
+    pub fn heads(&self) -> usize {
+        (self.ngram - 1) * self.heads_per_ngram
+    }
+    /// Rows of normalized inputs the dilated conv keeps between calls (dilation = ngram).
+    pub fn conv_state(&self) -> usize {
+        (self.conv_k - 1) * self.ngram
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexerConfig {
+    pub heads: usize,
+    pub dim: usize,
+    pub budget: usize,
+    pub ratio: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MoeConfig {
+    pub experts: usize,
+    pub top_k: usize,
+    pub inter: usize,
+    /// Router scores are sigmoid (Ling, `score_function: sigmoid`) instead of softmax.
+    pub sigmoid: bool,
+    /// Group top-k of `noaux_tc`: `topk_group` of `n_group` groups are kept, and the expert scores that decide
+    /// the groups carry `expert_bias`. Qwen has neither: one group, no bias.
+    pub n_group: usize,
+    pub topk_group: usize,
+    pub bias: bool,
+    /// Multiplier applied to the renormalized weights (Ling: 2,5).
+    pub scaling: f32,
+    /// The shared expert is gated by a learned scalar (Qwen) or added with weight 1 (Ling).
+    pub shared_gate: bool,
+}
+
+impl MoeConfig {
+    /// Routed experts per token plus the shared one.
+    pub fn slots(&self) -> usize {
+        self.top_k + 1
+    }
+
+    /// Whether the router selects through groups (`noaux_tc`, Ling). `n_group` defaults to 1 for families that
+    /// have no groups at all — Qwen parses 1 — so "more than one group" is what distinguishes them, and the
+    /// group scores are defined on the expert bias, so a config asking for groups without one is a config error.
+    pub fn group_routing(&self) -> bool {
+        self.n_group > 1
+    }
+}
+
+impl Config {
+    pub fn from_hf(model_dir: &Path) -> Result<Self> {
+        let cfg = std::fs::read_to_string(model_dir.join("config.json")).context("config.json")?;
+        let gen_cfg = std::fs::read_to_string(model_dir.join("generation_config.json")).ok();
+        Self::from_json(&cfg, gen_cfg.as_deref())
+    }
+
+    pub fn from_json(config: &str, generation_config: Option<&str>) -> Result<Self> {
+        let cfg: Value = serde_json::from_str(config)?;
+        // Ling-3.0-flash keeps its config at the top level; the Qwen checkpoints nest it under text_config.
+        let family = Family::from_model_type(cfg["model_type"].as_str().unwrap_or(""))
+            .or_else(|| Family::from_model_type(cfg["text_config"]["model_type"].as_str().unwrap_or("")))
+            .context("config: unknown or missing model_type")?;
+        let ling = family == Family::Ling3;
+        let t = if ling { &cfg } else { &cfg["text_config"] };
+        let u = |k: &str| {
+            t[k].as_u64()
+                .map(|v| v as usize)
+                .with_context(|| format!("config: {k}"))
+        };
+        let rope = &t["rope_parameters"];
+        let head_dim = u("head_dim")?;
+        // Ling spells the rope settings as plain keys, Qwen inside rope_parameters.
+        let prf = rope["partial_rotary_factor"]
+            .as_f64()
+            .or_else(|| t["partial_rotary_factor"].as_f64())
+            .unwrap_or(1.0);
+        let theta = rope["rope_theta"]
+            .as_f64()
+            .or_else(|| t["rope_theta"].as_f64())
+            .context("config: rope_theta")? as f32;
+        let (mrope_section, mrope) = match family {
+            Family::Ling3 => ling3::rope(),
+            _ => qwen35::rope(t)?,
+        };
+        // Ling has no layer_types: the rule is in the code of the checkpoint, MLA every `layer_group_size`
+        // (plus a final partial group, which 42 layers never produce) and KDA elsewhere.
+        let n_layers = u("num_hidden_layers")?;
+        let kind = match family {
+            Family::Ling3 => ling3::mixer_kinds(n_layers, t),
+            _ => qwen35::mixer_kinds(t)?,
+        };
+        let full_attn: Vec<bool> = kind.iter().map(|k| *k == MixerKind::Attn).collect();
+        let mut eos = vec![];
+        if let Some(g) = generation_config {
+            let g: Value = serde_json::from_str(g)?;
+            match &g["eos_token_id"] {
+                Value::Array(a) => eos.extend(a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32)),
+                Value::Number(n) => eos.extend(n.as_u64().map(|v| v as u32)),
+                _ => {}
+            }
+        }
+        let moe = match t["num_experts"].as_u64() {
+            Some(_) => {
+                let inter = u("moe_intermediate_size")?;
+                let shared = t["shared_expert_intermediate_size"]
+                    .as_u64()
+                    .or_else(|| t["moe_shared_expert_intermediate_size"].as_u64())
+                    .context("config: shared_expert_intermediate_size")? as usize;
+                ensure!(shared == inter, "shared expert size must match the routed experts");
+                Some(MoeConfig {
+                    experts: u("num_experts")?,
+                    top_k: u("num_experts_per_tok")?,
+                    inter,
+                    sigmoid: t["score_function"].as_str() == Some("sigmoid"),
+                    n_group: t["n_group"].as_u64().unwrap_or(1) as usize,
+                    topk_group: t["topk_group"].as_u64().unwrap_or(1) as usize,
+                    bias: t["moe_router_enable_expert_bias"].as_bool().unwrap_or(false),
+                    scaling: t["routed_scaling_factor"].as_f64().unwrap_or(1.0) as f32,
+                    shared_gate: !ling,
+                })
+            }
+            None => None,
+        };
+        let hc = qwen4exp::hc(t, &u)?;
+        let ple = qwen4exp::ple(t, &u)?;
+        let indexer = qwen4exp::indexer(t, &u)?;
+        let mla = match family {
+            Family::Ling3 => Some(ling3::mla(&u)?),
+            _ => None,
+        };
+        let swiglu = match family {
+            Family::Ling3 => ling3::swiglu(t),
+            _ => None,
+        };
+        let c = Config {
+            hidden: u("hidden_size")?,
+            n_layers,
+            // Ling keeps a dense FFN in the first layers and a MoE in the rest: both sizes are live.
+            inter: if moe.is_some() && !ling {
+                0
+            } else {
+                u("intermediate_size")?
+            },
+            vocab: u("vocab_size")?,
+            n_heads: u("num_attention_heads")?,
+            n_kv: u("num_key_value_heads")?,
+            head_dim,
+            // KDA reads the same lin_* fields DeltaNet does: 32 heads of 128, conv 4.
+            lin_nk: if ling {
+                u("num_attention_heads")?
+            } else {
+                u("linear_num_key_heads")?
+            },
+            lin_nv: if ling {
+                u("num_attention_heads")?
+            } else {
+                u("linear_num_value_heads")?
+            },
+            lin_dk: if ling { head_dim } else { u("linear_key_head_dim")? },
+            lin_dv: if ling { head_dim } else { u("linear_value_head_dim")? },
+            conv_k: if ling {
+                u("short_conv_kernel_size")?
+            } else {
+                u("linear_conv_kernel_dim")?
+            },
+            eps: t["rms_norm_eps"].as_f64().context("rms_norm_eps")? as f32,
+            rope_theta: theta,
+            rot_dim: (head_dim as f64 * prf) as usize,
+            mrope_section,
+            full_attn,
+            eos,
+            moe,
+            hc,
+            ple,
+            indexer,
+            gate_sigmoid: t["output_gate_type"].as_str() == Some("sigmoid"),
+            family,
+            kind,
+            mla,
+            kda_lower_bound: t["kda_lower_bound"].as_f64().unwrap_or(0.0) as f32,
+            norm_one_plus_w: !ling,
+            mrope,
+            dense_ffn: if ling { u("first_k_dense_replace")? } else { 0 },
+            swiglu,
+        };
+        c.validate()?;
+        Ok(c)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.full_attn.len() == self.n_layers && self.kind.len() == self.n_layers,
+            "layer types length mismatch"
+        );
+        ensure!(self.conv_k == 4, "reference kernels require conv kernel 4");
+        ensure!(
+            self.n_heads.is_multiple_of(self.n_kv) && self.lin_nv.is_multiple_of(self.lin_nk),
+            "bad head grouping"
+        );
+        ensure!(
+            self.hidden.is_multiple_of(8) && self.inter.is_multiple_of(8),
+            "dims must be multiples of 8"
+        );
+        match self.family {
+            Family::Ling3 => ling3::validate(self)?,
+            _ => qwen35::validate(self)?,
+        }
+        if let Some(m) = &self.moe {
+            ensure!(
+                m.inter.is_multiple_of(128) && self.hidden.is_multiple_of(128),
+                "MoE kernels need an expert size and hidden multiple of 128"
+            );
+            ensure!(m.top_k < 64 && m.experts <= 1 << 20, "unsupported MoE routing");
+            ensure!(
+                m.n_group == 1 || (m.experts.is_multiple_of(m.n_group) && m.topk_group <= m.n_group),
+                "group routing needs groups of equal size"
+            );
+        }
+        if let Some(h) = &self.hc {
+            ensure!(h.count >= 2 && h.rank > 0, "bad hyper-connections");
+        }
+        if let Some(p) = &self.ple {
+            ensure!(
+                self.hc.is_some() && p.layer < self.n_layers,
+                "PLE needs hyper-connections"
+            );
+            ensure!(p.dim.is_multiple_of(p.heads()) && p.ngram >= 2, "bad PLE config");
+        }
+        Ok(())
+    }
+
+    /// Width of the hyper-connection stream state (count * hidden), or hidden without hyper-connections.
+    pub fn stream_dim(&self) -> usize {
+        self.hc.as_ref().map_or(self.hidden, |h| h.count * self.hidden)
+    }
+
+    pub fn lin_qkv_dim(&self) -> usize {
+        self.lin_nk * self.lin_dk * 2 + self.lin_nv * self.lin_dv
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Geometry of `inclusionAI/Ling-3.0-flash`, keys and values taken from its `config.json`.
+    pub(crate) const LING3: &str = r#"{"model_type":"bailing_hybrid","hidden_size":2560,"num_hidden_layers":42,"head_dim":128,"num_attention_heads":32,"num_key_value_heads":32,"intermediate_size":6144,"moe_intermediate_size":768,"moe_shared_expert_intermediate_size":768,"num_experts":512,"num_experts_per_tok":8,"n_group":8,"topk_group":4,"score_function":"sigmoid","routed_scaling_factor":2.5,"moe_router_enable_expert_bias":true,"first_k_dense_replace":2,"layer_group_size":6,"kv_lora_rank":512,"qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,"q_lora_rank":null,"short_conv_kernel_size":4,"kda_lower_bound":-5.0,"rms_norm_eps":1e-06,"rope_theta":6000000,"partial_rotary_factor":0.5,"rope_interleave":true,"num_nextn_predict_layers":1,"vocab_size":157184,"eos_token_id":156895,"expert_swiglu_limit_list":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,4,4,4,4,4,4],"share_expert_swiglu_limit_list":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,5,5,5,5,5,5,7,7]}"#;
+
+    /// Geometry of `Qwen/Qwen3.6-35B-A3B`, the MoE model in production on gfx1150.
+    pub(crate) const QWEN35_MOE: &str = r#"{"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text","hidden_size":2048,"num_hidden_layers":40,"head_dim":256,"num_attention_heads":16,"num_key_value_heads":2,"linear_num_key_heads":16,"linear_num_value_heads":32,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"num_experts":256,"num_experts_per_tok":8,"moe_intermediate_size":512,"shared_expert_intermediate_size":512,"rms_norm_eps":1e-06,"vocab_size":248320,"layer_types":["linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention"],"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"partial_rotary_factor":0.25,"rope_theta":10000000}}}"#;
+
+    #[test]
+    pub(crate) fn ling3_geometry() {
+        let c = Config::from_json(LING3, None).unwrap();
+        assert_eq!(c.family, Family::Ling3);
+        assert_eq!((c.hidden, c.n_layers, c.vocab, c.inter), (2560, 42, 157184, 6144));
+        assert_eq!(c.dense_ffn, 2);
+        // MLA every 6th layer (5, 11, ... 41): 7 of 42, KDA the rest.
+        assert_eq!(c.kind[0], MixerKind::Kda);
+        assert_eq!(c.kind[5], MixerKind::Mla);
+        assert_eq!(c.kind[41], MixerKind::Mla);
+        assert_eq!(c.kind.iter().filter(|k| **k == MixerKind::Mla).count(), 7);
+        assert_eq!(c.full_attn.iter().filter(|f| **f).count(), 0);
+        // KDA borrows the DeltaNet fields: 32 heads of 128, conv 4, gate floor -5.
+        assert_eq!(
+            (c.lin_nk, c.lin_nv, c.lin_dk, c.lin_dv, c.conv_k),
+            (32, 32, 128, 128, 4)
+        );
+        assert_eq!(c.kda_lower_bound, -5.0);
+        let m = c.mla.unwrap();
+        assert_eq!((m.kv_lora, m.nope, m.rope, m.v), (512, 128, 64, 128));
+        // Plain interleaved RoPE on 64 of the 128 dims, and the norms multiply by w, not 1 + w.
+        assert!(!c.mrope && !c.norm_one_plus_w);
+        assert_eq!((c.rope_theta, c.rot_dim), (6e6, 64));
+        let m = c.moe.unwrap();
+        assert_eq!(
+            (m.experts, m.top_k, m.inter, m.n_group, m.topk_group),
+            (512, 8, 768, 8, 4)
+        );
+        assert!(m.group_routing() && m.bias && !m.shared_gate);
+        assert!(m.sigmoid && m.bias && !m.shared_gate);
+        assert_eq!(m.scaling, 2.5);
+        let s = c.swiglu.unwrap();
+        assert_eq!((s.routed[34], s.routed[35], s.routed[41]), (0, 4, 4));
+        assert_eq!((s.shared[33], s.shared[34], s.shared[40]), (0, 5, 7));
+    }
+
+    #[test]
+    pub(crate) fn qwen35_moe_geometry_is_unchanged() {
+        let c = Config::from_json(QWEN35_MOE, None).unwrap();
+        assert_eq!(c.family, Family::Qwen35);
+        assert_eq!((c.hidden, c.n_layers, c.inter), (2048, 40, 0));
+        assert_eq!(c.kind[0], MixerKind::Delta);
+        assert_eq!(c.kind[3], MixerKind::Attn);
+        assert!(c.norm_one_plus_w && c.mrope);
+        assert_eq!(c.mrope_section, [11, 11, 10]);
+        assert_eq!((c.head_dim, c.rot_dim, c.rope_theta), (256, 64, 1e7));
+        let m = c.moe.unwrap();
+        assert_eq!((m.experts, m.top_k, m.inter), (256, 8, 512));
+        assert!(!m.sigmoid && !m.bias && m.shared_gate);
+        assert_eq!((m.n_group, m.topk_group, m.scaling), (1, 1, 1.0));
+        // Qwen parses n_group = 1 when the field is absent: that is "no groups", and the router must take the
+        // plain path (it has no expert_bias to route through). Getting this wrong broke every Qwen MoE model.
+        assert!(!m.group_routing());
+        assert!(c.swiglu.is_none() && c.mla.is_none());
+        assert_eq!(c.dense_ffn, 0);
+    }
+
+    #[test]
+    pub(crate) fn unknown_family_is_rejected() {
+        assert!(Family::from_model_type("llama").is_none());
+        assert!(Config::from_json(r#"{"model_type":"llama"}"#, None).is_err());
+    }
+}
