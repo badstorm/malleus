@@ -4,27 +4,27 @@
 
 <div align="center">
 
-[Models on Hugging Face](https://huggingface.co/duckpage) / [duckpage.dev](https://www.duckpage.dev)
+[🤗 Hugging Face](https://huggingface.co/duckpage) / [🌐 duckpage.dev](https://www.duckpage.dev)
 
 </div>
 
-An open-source LLM inference engine for AMD RDNA 3.5 APUs — **gfx1150** (Strix Point) and **gfx1151**
-(Strix Halo). Rust host, hand-written HIP kernels. Developed and used in production by
-[DuckPage](https://github.com/duckpage).
+**Malleus** is DuckPage's open-source LLM inference engine for AMD RDNA 3.5 APUs — **gfx1150** (Strix Point) and
+**gfx1151** (Strix Halo). A Rust host and hand-written HIP kernels, built for one thing: the long prompt.
 
-Strix APUs share a large pool of system memory with the GPU (96–128 GB), a cheap way to run large modern models
-locally. Malleus exists for the case general-purpose engines serve worst on these chips: **a long prompt on a
-machine with the memory bandwidth of a laptop**. Prompt processing is what this engine is built for — on
-Ornith-1.5-35B-A3B it prefills **2.1x faster than llama.cpp in a fresh session and 2.8x across 131 072 tokens**
-(196 against 69 tok/s on the same box), so a 110 000-token prompt costs 4.5 minutes instead of 12.7. Decode is at
-parity, because at 4 bits a decode step reads every weight it touches; the MTP head is how we go past that. The
-curves, the method and the quality numbers are in [MODELS.md](MODELS.md).
+We put AI on the machines people already own — your computer, your server, your data, nothing sent outside: no
+third-party cloud, no sharing, the control stays with you. Malleus is how we push that to the limit on consumer
+hardware. It is the engine we run in production, and it is public because it is the concrete proof of the work.
 
-So the goal is not breadth, it is **efficiency on the two chips above**: every kernel is written for them, the model
-files are quantized for their memory hierarchy, and the features around them — prefill chunking, the KV and indexer
-budgets, the MTP head, the disk-backed expert cache — exist to keep a long context alive on one APU. The engine is
-readable and auditable, written only from public sources: it contains no code, kernels or weight formats from any
-closed engine.
+Strix APUs share 96–128 GB of memory with the GPU, a cheap way to run large models locally, but at the memory
+bandwidth of a laptop. On Ornith-1.5-35B-A3B, Malleus prefills **2.1x faster than llama.cpp in a fresh session and
+2.8x at 131 072 tokens** (196 against 69 tok/s), so a 110 000-token prompt costs 4.5 minutes instead of 12.7;
+decode is at parity, and the MTP head is how we go past it. [MODELS.md](MODELS.md) has the curves, the method and
+the quality numbers.
+
+Nothing here is generic: every kernel targets those two chips, the model files are quantized for their memory
+hierarchy, and prefill chunking, the KV and indexer budgets, the MTP head and the expert cache keep a long context
+alive on one APU. The engine is readable and auditable: Rust host, HIP kernels, written only from public sources,
+with no code, kernels or weight formats from any closed engine.
 
 ## Status
 
@@ -44,9 +44,9 @@ On the model we run in production ([MODELS.md](MODELS.md) for the full sweep and
 - **quality**: the same distance from the bf16 checkpoint as llama.cpp's `Q4_K_M` — 13/19 against 14/19 of top-1 on
   the golden prompts, and the greedy output is the closer one (11/52 against 6/52 tokens identical to bf16).
 
-A dense model (Qwen3.8-27B) is bandwidth limited on both engines and there Malleus measures ~5 % ahead
-(pp512 209.3 against 191.7 tok/s, tg128 5.02 against 4.74); the MTP head is what breaks the ~5.8 tokens/s that
-~80 GB/s of measured bandwidth allows a 4-bit 27B.
+A dense model (Qwen3.8-27B) is bandwidth limited on both engines: Malleus measures ~5 % ahead (pp512 209.3
+against 191.7 tok/s, tg128 5.02 against 4.74), and the MTP head breaks the ~5.8 tok/s that ~80 GB/s allows a 4-bit
+27B.
 
 ## How it works
 
@@ -82,11 +82,10 @@ malleus run --model qwen38-27b-mls4.malleus --prompt "Hello!"
 malleus serve --models-dir /models
 ```
 
-With `--models-dir`, the first version of this feature keeps **one model resident at a time**: a request for
-another model unloads the current one and loads the new one on the GPU thread, so its first request pays the load
-time and starts with an empty prompt cache. The tokenizer and EOS ids follow the selected model; the context length
-and the tuning variables are still server-wide in this first version. Without `MALLEUS_DEFAULT_MODEL`, a request
-that omits `model` uses the only model when the directory holds one, and is refused when there are several.
+With `--models-dir`, **one model stays resident at a time**: a request for another model unloads the current one
+and loads the new one on the GPU thread, so its first request pays the load and starts with an empty prompt cache.
+The tokenizer and EOS ids follow the selected model; context length and tuning stay server-wide. Without
+`MALLEUS_DEFAULT_MODEL`, a request that omits `model` uses the only model, and is refused when there are several.
 
 The same port serves two API surfaces. Under `/v1` it is OpenAI- and Anthropic-compatible (`/v1/models`,
 `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/messages/count_tokens`). At the root it serves the
@@ -233,9 +232,8 @@ engine behaves as if the variable were unset. Defaults that depend on the model 
 ## License
 
 **Apache License 2.0** ([LICENSE](LICENSE)): use it, modify it, ship it in your product, closed or open, as long as
-you keep the [NOTICE](NOTICE) and the attribution notices — no CLA, no copyleft, and a patent grant on top. That is
-deliberate: the code is not the moat, the tuning and the operations are, and a company that cannot take this code
-into its stack cannot become a user of it.
+you keep the [NOTICE](NOTICE) and the attribution notices — no CLA, no copyleft, and a patent grant on top. The code
+is not the moat: the tuning and the operations are.
 
 | | |
 |---|---|
