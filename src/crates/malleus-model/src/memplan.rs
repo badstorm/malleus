@@ -106,9 +106,11 @@ fn expert_cache_bytes(src: &dyn TensorSource) -> Option<u64> {
 /// Bytes of the tables the engine reads from the file while it runs (the n-gram lookup table): never on the
 /// device, but every decode step reads rows of them through the page cache.
 pub fn tables_on_disk(src: &dyn TensorSource) -> u64 {
+    let rows =
+        |n: &str| n.ends_with("ngram_table") || n.ends_with("engram_layer.multi_head_embedding.embedding.weight");
     src.names()
         .iter()
-        .filter(|n| n.ends_with("ngram_table"))
+        .filter(|n| rows(n))
         .filter_map(|n| src.info(n))
         .map(|i| i.size as u64)
         .sum()
@@ -172,7 +174,13 @@ pub fn working_set_bytes(c: &Config, chunk: usize, moe_y_half: bool) -> u64 {
 /// Whether the loader puts this tensor on the device. Kept in one place so the check and the loader
 /// cannot disagree about the n-gram table or the prefill copies.
 fn uploaded(name: &str, prefill_int8: bool) -> bool {
-    if name.ends_with("ngram_table") {
+    // The hashed tables stay in the file and are read by row: the PLE n-gram table, and Hy4's Engram memories
+    // (31.7 GB of 4-bit rows).
+    if name.ends_with("ngram_table") || name.ends_with("engram_layer.multi_head_embedding.embedding.weight") {
+        return false;
+    }
+    // Hy4's speculative draft (`model.dfly_layers.*`) is the last increment of #40 and is not loaded yet.
+    if name.starts_with("model.dfly_layers.") {
         return false;
     }
     if !prefill_int8 && (name.ends_with(".prefill") || name.ends_with(".prefill.scales")) {
@@ -186,6 +194,10 @@ fn uploaded(name: &str, prefill_int8: bool) -> bool {
 ///
 /// This mirrors `Model::new_session`: if that allocation changes, this has to change with it.
 pub fn session_bytes(cfg: &Config, ctx: usize, mtp: bool) -> u64 {
+    if cfg.family == crate::config::Family::Hy4 {
+        // The latent and the 64 rotated dims per layer, plus a split buffer for the indexed layers' decode.
+        return crate::hy4::session_bytes(cfg, ctx);
+    }
     let kv = (kv_ctx(ctx) * cfg.n_kv * cfg.head_dim * 2 + 64) as u64;
     // With the indexer the V buffer also holds V row-major after V^T.
     let v = if cfg.indexer.is_some() { 2 * kv } else { kv };

@@ -66,6 +66,8 @@ pub struct Model {
     /// receives a null pointer.
     pub(crate) attn_mass: Option<(DeviceBuffer, usize, usize)>,
     pub vision: Option<crate::vision::VisionModel>,
+    /// Hy4-flash weights: its own graph (`crate::hy4`), not the `Layer`/`Mixer` shape of the carried models.
+    pub(crate) hy4: Option<Box<crate::hy4::Weights>>,
 }
 
 pub struct LoadOptions {
@@ -121,6 +123,9 @@ impl Model {
         progress: &dyn Fn(usize, usize),
     ) -> Result<Self> {
         let c = &cfg;
+        if c.family == Family::Hy4 {
+            return Self::load_hy4(cfg, src, opts, kernels, progress);
+        }
         // Read before `kernels` moves into the model: the int4 default for the MoE prefill depends on the GPU.
         let arch = kernels.arch.clone();
         // Ling stores its weights under `model.` and calls the embedding `word_embeddings`; Qwen nests them
@@ -397,10 +402,64 @@ impl Model {
             },
             moe_y_half,
             vision: None,
+            hy4: None,
+        })
+    }
+
+    /// Hy4-flash: the whole model file is the text graph (plus the vision tower and the DFly2 draft, which this
+    /// increment does not load). The loader proves the tensor map and the footprint before the forward exists.
+    fn load_hy4(
+        cfg: Config,
+        src: &dyn TensorSource,
+        opts: &LoadOptions,
+        kernels: Kernels,
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<Self> {
+        let c = &cfg;
+        let mut up = Uploader::new()?;
+        up.use_prefill = false;
+        let embed = up.tensor(src, "model.embed_tokens.weight", &[c.vocab, c.hidden])?;
+        let lm_head = up.linear(src, "lm_head", c.vocab, c.hidden)?;
+        let weights = crate::hy4::Weights::load(src, c, &mut up, progress)?;
+        progress(c.n_layers, c.n_layers);
+        Ok(Model {
+            weight_bytes: up.bytes,
+            expert_stage: None,
+            attn_mass: None,
+            prefill_copies: false,
+            cfg,
+            k: kernels,
+            embed,
+            layers: Vec::new(),
+            norm: None,
+            hc_final: None,
+            ngram: None,
+            lm_head,
+            mtp: None,
+            mtp_post_norm: false,
+            mtp_chain_post: false,
+            draft_head: None,
+            draft_map: None,
+            signs: DeviceBuffer::from_slice(&malleus_gguf::quant::hadamard_signs(opts.hadamard_seed))?,
+            rope_invf: None,
+            scratch_cache: std::sync::Mutex::new(None),
+            stream: Stream::new()?,
+            quant_mode: std::sync::atomic::AtomicU8::new(0),
+            prefill_a8: false,
+            w4_max_t: 0,
+            moe_w4a4: 0,
+            moe_y_half: false,
+            vision: None,
+            hy4: Some(Box::new(weights)),
         })
     }
 
     pub fn new_session(&self, max_ctx: usize) -> Result<Session> {
+        if self.hy4.is_some() {
+            bail!(
+                "Hy4-flash: the text forward is not wired yet (issue #40); the file loads and every tensor is mapped"
+            );
+        }
         let c = &self.cfg;
         let mut s = Session {
             max_ctx,
