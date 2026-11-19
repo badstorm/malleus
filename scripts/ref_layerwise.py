@@ -138,9 +138,10 @@ class HostEngramEmbedding(nn.Module):
         self.offsets = torch.tensor([0] + list(head_vocab_sizes[:-1])).cumsum(0).to(device)
 
     def forward(self, hash_ids: torch.Tensor) -> torch.Tensor:
-        flat = hash_ids.flatten().cpu()
+        # Each hash head has its own slice of the shared table: the offsets are what makes the ids global.
+        flat = (hash_ids.clamp_min(0).cpu() + self.offsets.cpu()).flatten()
         # One read per distinct row: a prompt of a few hundred tokens touches at most that many.
-        uniq, inv = torch.unique(flat.clamp_min(0), return_inverse=True)
+        uniq, inv = torch.unique(flat, return_inverse=True)
         rows = self.shards.rows(self.name, uniq.tolist()).to(hash_ids.device).to(torch.bfloat16)
         out = rows[inv.to(hash_ids.device)]
         return out.view(*hash_ids.shape, self.dim).masked_fill(hash_ids.unsqueeze(-1) < 0, 0.0)
@@ -192,7 +193,34 @@ def hy4_trace(layer, h, s, blobs: Path, tag: str, ngram, engram_mask):
 
     dtype = h.dtype
     if layer.engram_layer is not None and ngram is not None:
-        h = h + layer.engram_layer(h, ngram, engram_mask)
+        # The Engram steps, dumped: hashes, the rows after the fp8 round trip and the per-head norms, the memory
+        # value, the per-stream gates and the result. The final line asserts the steps equal the module's forward.
+        el = layer.engram_layer
+        hash_ids = el.hash_ngrams(ngram)
+        emb = el.multi_head_embedding(hash_ids).to(h.dtype)
+        if el.fp8_embedding:
+            import transformers.models.hy_v4_flash.modeling_hy_v4_flash as _M
+
+            emb = _M._fp8_round_trip(emb)
+        save("e_hash", hash_ids.to(torch.float32))
+        save("e_emb_fp8", emb)
+        normed = torch.stack([n(emb[:, :, i]) for i, n in enumerate(el.lookup_per_head_norms)], dim=2)
+        flat = normed.flatten(start_dim=-2)
+        save("e_emb_norm", flat)
+        main = el.unified_pre_gamma * el.unified_rmsnorm(el.value_proj(flat))
+        save("e_main", main)
+        gates = []
+        for c in range(el.hc_mult):
+            key = el.norm_key[c](el.key_projs[c](flat))
+            query = el.norm_query[c](h[:, :, c])
+            gate = (key * query).sum(dim=-1) * el.hidden_size**-0.5
+            gates.append((gate.abs().clamp_min(1e-6).sqrt() * gate.sign()).sigmoid())
+        gs = torch.stack(gates, dim=2)
+        save("e_gate", gs)
+        e = gs.unsqueeze(-1) * main.unsqueeze(2) + el.unified_per_hc_scales(main)
+        save("engram_out", e.to(torch.float32))
+        h = h + e
+    save("layer_in", h)
     residual = h
     flat = h.flatten(2).float()
     mixes = F.linear(flat, layer.attn_hc.fn.float()) * layer.attn_hc.input_norm(flat)
@@ -311,9 +339,17 @@ def hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev):
                 skip = ("multi_head_embedding.embedding.weight",)
             load_module(layer, shards, prefix, skip, HY4_RENAME)
             if el is not None:
+                # The module's non-persistent buffers are built in `__init__`, which ran on the meta device, so
+                # `to_empty` leaves them uninitialised: the table's offsets, the head sizes and the hash
+                # multipliers must be rebuilt from the loaded map exactly as `_init_weights` does, or every lookup
+                # reads the wrong row.
                 # Non-persistent buffers: the table's sizes, the frozen vocabulary map and the hash multipliers
                 # drawn from it are computed, not stored.
                 el.head_vocab_sizes = torch.tensor(sizes, device=dev)
+                el.multi_head_embedding.offsets = (
+                    torch.tensor([0] + sizes[:-1], device=dev).cumsum(0).to(torch.long)
+                )
+                el.multi_head_embedding.head_vocab_sizes = el.head_vocab_sizes
                 el.lookup_table = shards.get(prefix + "engram_layer.lookup_table").to(dev)
                 el.hash_multipliers = el.draw_hash_multipliers(int(el.lookup_table.max()) + 1).to(dev)
                 print(
