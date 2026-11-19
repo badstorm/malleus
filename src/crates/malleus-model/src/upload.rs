@@ -1,0 +1,219 @@
+//! The pinned uploader: one tensor at a time from the file to the device, plus the layout of a
+//! `Linear` (decode weights and, when the file carries it, the MLS8 prefill copy).
+
+use anyhow::{Context, Result, bail, ensure};
+use malleus_gguf::{DType, TensorSource};
+use malleus_hip::{DeviceBuffer, PinnedBuffer};
+
+use crate::weights::{Linear, Weights};
+
+pub(crate) struct Uploader {
+    pub(crate) pinned: PinnedBuffer,
+    pub(crate) bytes: usize,
+    pub(crate) use_prefill: bool,
+    pub(crate) prefill_families: Vec<String>,
+    /// Decode on the MLS8 copy when the file has one (MTP head).
+    pub(crate) decode_int8: bool,
+    /// Whether any `.prefill` tensor was actually read: a single-copy file has none, and then the prefill runs on
+    /// the MLS4 nibbles (W4A8) whatever the flags say. Reported at startup and used to word it correctly.
+    pub(crate) prefill_loaded: bool,
+}
+
+impl Uploader {
+    /// Whether the MLS8 prefill copy of `name` is loaded: all of them when the list is unset, none with `none`, else
+    /// the ones whose tensor name contains one of the entries (`MALLEUS_PREFILL_INT8_FAMILIES`).
+    pub(crate) fn want_prefill(&self, name: &str) -> bool {
+        match self.prefill_families.first().map(String::as_str) {
+            Some("none") => false,
+            None => true,
+            _ => self.prefill_families.iter().any(|f| name.contains(f.as_str())),
+        }
+    }
+
+    pub(crate) const CHUNK: usize = 64 << 20;
+
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Uploader {
+            pinned: PinnedBuffer::alloc(Self::CHUNK)?,
+            bytes: 0,
+            use_prefill: true,
+            prefill_families: Vec::new(),
+            decode_int8: false,
+            prefill_loaded: false,
+        })
+    }
+
+    pub(crate) fn tensor(&mut self, src: &dyn TensorSource, name: &str, shape: &[usize]) -> Result<DeviceBuffer> {
+        self.typed(src, name, DType::BF16, shape)
+    }
+
+    pub(crate) fn typed(
+        &mut self,
+        src: &dyn TensorSource,
+        name: &str,
+        dtype: DType,
+        shape: &[usize],
+    ) -> Result<DeviceBuffer> {
+        let info = src.info(name).with_context(|| format!("missing tensor {name}"))?;
+        ensure!(info.dtype == dtype, "{name}: expected {dtype:?}, got {:?}", info.dtype);
+        let flat: Vec<usize> = info.shape.iter().copied().filter(|&d| d != 1).collect();
+        let want: Vec<usize> = shape.iter().copied().filter(|&d| d != 1).collect();
+        ensure!(flat == want, "{name}: shape {:?}, expected {:?}", info.shape, shape);
+        let mut buf = DeviceBuffer::alloc(info.size)?;
+        self.copy(src, name, info.size, &mut buf, 0)?;
+        Ok(buf)
+    }
+
+    /// Uploads a tensor into `buf` at byte offset `at`; `shape` is checked against the tensor flattened to the same
+    /// number of elements and, for matrices, last dimension (expert stacks [E, N, K] load as [E * N, K]).
+    pub(crate) fn into(
+        &mut self,
+        src: &dyn TensorSource,
+        name: &str,
+        dtype: DType,
+        shape: &[usize],
+        buf: &mut DeviceBuffer,
+        at: usize,
+    ) -> Result<()> {
+        let info = src.info(name).with_context(|| format!("missing tensor {name}"))?;
+        ensure!(info.dtype == dtype, "{name}: expected {dtype:?}, got {:?}", info.dtype);
+        ensure!(
+            info.shape.iter().product::<usize>() == shape.iter().product::<usize>()
+                && (shape.len() < 2 || info.shape.last() == shape.last()),
+            "{name}: shape {:?}, expected {:?}",
+            info.shape,
+            shape
+        );
+        ensure!(at + info.size <= buf.len(), "{name}: does not fit its buffer");
+        self.copy(src, name, info.size, buf, at)
+    }
+
+    pub(crate) fn copy(
+        &mut self,
+        src: &dyn TensorSource,
+        name: &str,
+        size: usize,
+        buf: &mut DeviceBuffer,
+        at: usize,
+    ) -> Result<()> {
+        let mut off = 0;
+        while off < size {
+            let n = Self::CHUNK.min(size - off);
+            src.read(name, off, &mut self.pinned.as_mut_slice()[..n])?;
+            self.pinned.copy_to(n, buf, at + off)?;
+            off += n;
+        }
+        self.bytes += size;
+        Ok(())
+    }
+
+    pub(crate) fn linear(&mut self, src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Result<Linear> {
+        let wn = format!("{name}.weight");
+        let info = src.info(&wn).with_context(|| format!("missing tensor {wn}"))?;
+        let g = k / malleus_gguf::quant::BLOCK;
+        let pn = format!("{wn}.prefill");
+        let w = match info.dtype {
+            _ if self.decode_int8 && src.info(&pn).is_some() => Weights::Mls8 {
+                q: self.typed(src, &pn, DType::Mls8, &[n, k])?,
+                sc: self.typed(src, &format!("{pn}.scales"), DType::F32, &[n])?,
+            },
+            DType::BF16 => Weights::Bf16(self.tensor(src, &wn, &[n, k])?),
+            DType::Mls2 => Weights::Mls2 {
+                q: self.typed(src, &wn, DType::Mls2, &[n, k])?,
+                sc: self.typed(src, &format!("{wn}.scales"), DType::F16, &[n, g])?,
+            },
+            DType::Mls4 => Weights::Mls4 {
+                q: self.typed(src, &wn, DType::Mls4, &[n, k])?,
+                sc: self.typed(src, &format!("{wn}.scales"), DType::F16, &[n, g])?,
+            },
+            DType::Mls3 => Weights::Mls3 {
+                q: self.typed(src, &wn, DType::Mls3, &[n, k])?,
+                sc: self.typed(src, &format!("{wn}.scales"), DType::F16, &[n, g])?,
+            },
+            DType::Mls8 => Weights::Mls8 {
+                q: self.typed(src, &wn, DType::Mls8, &[n, k])?,
+                sc: self.typed(src, &format!("{wn}.scales"), DType::F32, &[n])?,
+            },
+            d => bail!("{wn}: unsupported dtype {d:?}"),
+        };
+        let family_ok = self.want_prefill(name);
+        let prefill = if self.use_prefill && family_ok && src.info(&pn).is_some() {
+            self.prefill_loaded = true;
+            Some((
+                self.typed(src, &pn, DType::Mls8, &[n, k])?,
+                self.typed(src, &format!("{pn}.scales"), DType::F32, &[n])?,
+            ))
+        } else {
+            None
+        };
+        Ok(Linear { w, prefill, n, k })
+    }
+
+    /// An RMSNorm weight. Ling stores `w` where the kernels expect `1 + w` (Qwen's form): folding the one at load
+    /// keeps every norm kernel single-flavoured, which is the whole point of ADR 0005. The tensors are a few KB, so
+    /// the fold happens on the host while uploading.
+    /// An MLS4 tensor read back as plain fp32 [n, k]: dequantize every 128 group and undo the Hadamard rotation.
+    /// This is the one place the quantized form has to become a matrix again, and it is here because MLA decode
+    /// absorbs `kv_b_proj` into the query — a product against the transpose, which no GEMV can express.
+    pub(crate) fn linear_f32(
+        &mut self,
+        src: &dyn TensorSource,
+        name: &str,
+        n: usize,
+        k: usize,
+        seed: u64,
+    ) -> Result<DeviceBuffer> {
+        use malleus_gguf::quant::{self, BLOCK};
+        let wn = format!("{name}.weight");
+        let info = src.info(&wn).with_context(|| format!("missing tensor {wn}"))?;
+        ensure!(info.dtype == DType::Mls4, "{wn}: expected MLS4, got {:?}", info.dtype);
+        let q = src.read_all(&wn)?;
+        let sc = src.read_all(&format!("{wn}.scales"))?;
+        let g = k / BLOCK;
+        let signs = quant::hadamard_signs(seed);
+        let mut out = vec![0f32; n * k];
+        for r in 0..n {
+            for j in 0..g {
+                let s = half::f16::from_le_bytes([sc[r * g + j * 2], sc[r * g + j * 2 + 1]]).to_f32();
+                let mut blk = [0f32; BLOCK];
+                quant::dequant_int4(&q[r * k / 2 + j * BLOCK / 2..][..BLOCK / 2], s, &mut blk);
+                quant::unrotate_block(&mut blk, &signs);
+                out[r * k + j * BLOCK..][..BLOCK].copy_from_slice(&blk);
+            }
+        }
+        self.bytes += n * k * 4;
+        Ok(DeviceBuffer::from_slice(&out)?)
+    }
+
+    /// A norm weight, as the kernels that read it want it.
+    ///
+    /// Qwen's RMSNorm is `(1 + w) * x / rms(x)` and the kernels add the one, so the tensor goes up as it is
+    /// (`raw`). Ling's is `w * x / rms(x)`: rather than teaching every kernel the difference — the one is added
+    /// in `rmsnorm`, in the fused GEMM epilogues of `wmma.hip` and in the hyper-connection passes — the one is
+    /// taken away here and they put it back. Storing `w - 1` in bf16 is also *more* accurate in absolute terms
+    /// than storing `w`, because the rounding is relative to the stored value.
+    ///
+    /// The gated norms (KDA `o_norm`, MLA `kv_a_layernorm`) are fla's `FusedRMSNormGated`, which uses `w`
+    /// directly in a kernel of its own that never adds one: those are `raw` for both families.
+    pub(crate) fn norm(&mut self, src: &dyn TensorSource, name: &str, n: usize, raw: bool) -> Result<DeviceBuffer> {
+        if raw {
+            return self.tensor(src, name, &[n]);
+        }
+        let info = src.info(name).with_context(|| format!("missing tensor {name}"))?;
+        ensure!(
+            info.dtype == DType::BF16 && info.size == n * 2,
+            "{name}: expected bf16 [{n}]"
+        );
+        let bytes = src.read_all(name)?;
+        let w: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_le_bytes(*b).to_f32() - 1.0)
+            .map(|x| half::bf16::from_f32(x).to_le_bytes())
+            .map(u16::from_le_bytes)
+            .collect();
+        self.bytes += w.len() * 2;
+        Ok(DeviceBuffer::from_slice(&w)?)
+    }
+}

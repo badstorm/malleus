@@ -18,7 +18,10 @@
 use anyhow::{Result, bail};
 use malleus_gguf::TensorSource;
 
-use crate::qwen35::{Config, DN_CHUNK, GEMV_MAX_T, MOE_BM, MixerKind, kv_ctx, pad128};
+use crate::config::{Config, MixerKind};
+use crate::engine::MOE_BM;
+use crate::session::DN_CHUNK;
+use crate::weights::{GEMV_MAX_T, kv_ctx, pad128};
 
 const GIB: u64 = 1 << 30;
 /// The part of the working set that does not depend on the chunk (see `working_set_bytes`).

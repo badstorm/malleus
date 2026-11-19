@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use malleus_hip::DeviceBuffer;
 use malleus_model::image_pre::{PreConfig, decode, preprocess_rgb};
 use malleus_model::mrope;
-use malleus_model::qwen35::{Model, Session, Snapshot};
+use malleus_model::{GEMV_MAX_T, Model, Session, Snapshot};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -1259,7 +1259,7 @@ fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Resu
     Ok(Worker {
         spec: spec.clone(),
         drafts: if model.has_mtp() {
-            env_or("MALLEUS_SPEC_DRAFTS", DEFAULT_DRAFTS).min(malleus_model::qwen35::GEMV_MAX_T - 1)
+            env_or("MALLEUS_SPEC_DRAFTS", DEFAULT_DRAFTS).min(GEMV_MAX_T - 1)
         } else {
             0
         },

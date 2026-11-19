@@ -17,7 +17,7 @@
 //! (`GEMV_MAX_T = 6` today, so a block of 7), are in the issue.
 
 use crate::kernels::Kernels;
-use crate::qwen35::{Linear, Weights};
+use crate::weights::{Linear, Weights};
 use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::{DType, TensorSource};
 use malleus_hip::DeviceBuffer;
@@ -310,7 +310,7 @@ fn weights_bytes(w: &Weights) -> usize {
 /// Drafts the target's verify path accepts in one pass: `GEMV_MAX_T - 1` (the kernel's register budget, and the
 /// measured that widening it is a loss). A block of `verify_width() + 1` positions fits it.
 fn verify_width() -> usize {
-    crate::qwen35::GEMV_MAX_T - 1
+    crate::weights::GEMV_MAX_T - 1
 }
 
 /// Fails loudly on a checkpoint that is not a DFlash draft, instead of half-loading it.

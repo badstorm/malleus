@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 use malleus_gguf::gguf::Gguf;
 use malleus_gguf::safetensors::SafeTensors;
 use malleus_model::kernels::{Kernels, select_device};
-use malleus_model::qwen35::{Config, LoadOptions, Model};
 use malleus_model::vision::{VisionConfig, VisionModel};
+use malleus_model::{Config, GEMV_MAX_T, LoadOptions, Model, Session, dense_w4a4};
 use malleus_sched::{Catalog, ModelSpec};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -407,7 +407,7 @@ fn load_model(path: &Path) -> Result<Model> {
     // read, so the prefill runs on the MLS4 nibbles with int8 activations (W4A8).
     eprintln!(
         "dense prefill GEMMs: {}",
-        if malleus_model::qwen35::dense_w4a4() {
+        if dense_w4a4() {
             "W4A4 (int4 WMMA on the MLS4 weights)"
         } else if m.prefill_copies {
             "W8A8 (fused MLS8 copies)"
@@ -500,8 +500,7 @@ fn batch_exact(
         best as u32
     };
     let mut serial = m.new_session(ctx)?;
-    let mut batched: Vec<malleus_model::qwen35::Session> =
-        (0..sessions).map(|_| m.new_session(ctx)).collect::<Result<_>>()?;
+    let mut batched: Vec<Session> = (0..sessions).map(|_| m.new_session(ctx)).collect::<Result<_>>()?;
     // The prompt is the same for every session, and so is its first token.
     let first = m.forward_argmax(&mut serial, &ids)?;
     let mut tok = first;
@@ -516,7 +515,7 @@ fn batch_exact(
     for step in 0..steps {
         let row = m.forward(&mut serial, &[tok], None, 1)?;
         let want = argmax(&row);
-        let mut runs: Vec<(&mut malleus_model::qwen35::Session, u32)> = batched.iter_mut().map(|s| (s, tok)).collect();
+        let mut runs: Vec<(&mut Session, u32)> = batched.iter_mut().map(|s| (s, tok)).collect();
         let rows = m.decode_batch(&mut runs)?;
         for (i, r) in rows.iter().enumerate() {
             ensure!(r.len() == row.len(), "row {i} is not a logits row");
@@ -550,7 +549,6 @@ fn spec_exact(
     replay: usize,
     ctx: usize,
 ) -> Result<()> {
-    use malleus_model::qwen35::GEMV_MAX_T;
     let g: serde_json::Value = serde_json::from_reader(std::fs::File::open(golden)?)?;
     let entry = g["text"]
         .as_array()
@@ -676,7 +674,7 @@ fn spec_replay(m: &Model, prompt: &[u32], n: usize, ctx: usize) -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5usize)
-        .min(malleus_model::qwen35::GEMV_MAX_T - 1);
+        .min(GEMV_MAX_T - 1);
     let pmin: f32 = std::env::var("MALLEUS_DRAFT_PMIN")
         .ok()
         .and_then(|v| v.parse().ok())
