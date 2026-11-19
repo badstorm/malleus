@@ -1,6 +1,12 @@
 # Malleus
 
-[![Models on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Models-duckpage-FFD21E)](https://huggingface.co/duckpage)
+![Malleus, forged for local AI](https://raw.githubusercontent.com/duckpage/duckpage-brand/refs/heads/main/brands/malleus/logo/svg/cover/cover-dark.svg)
+
+<div align="center">
+
+[Models on Hugging Face](https://huggingface.co/duckpage) / [duckpage.dev](https://www.duckpage.dev)
+
+</div>
 
 An open-source LLM inference engine for AMD RDNA 3.5 APUs — **gfx1150** (Strix Point) and **gfx1151**
 (Strix Halo). Rust host, hand-written HIP kernels. Developed and used in production by
