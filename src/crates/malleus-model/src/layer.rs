@@ -461,7 +461,8 @@ pub(crate) fn load_layer(
             Mixer::Mla {
                 q: up.linear(src, &l("attention.q_proj"), c.n_heads * qd, c.hidden)?,
                 kv_a: up.linear(src, &l("attention.kv_a_proj_with_mqa"), m.kv_lora + m.rope, c.hidden)?,
-                kv_a_norm: up.norm(src, &l("attention.kv_a_layernorm.weight"), m.kv_lora, true)?,
+                // `mla_cache_write` multiplies by it directly and reads f32, so raw in f32 (not bf16, not folded).
+                kv_a_norm: up.norm_f32(src, &l("attention.kv_a_layernorm.weight"), m.kv_lora)?,
                 kv_b: up.linear_f32(
                     src,
                     &l("attention.kv_b_proj"),

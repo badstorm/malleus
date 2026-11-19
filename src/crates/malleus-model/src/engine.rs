@@ -456,9 +456,7 @@ impl Model {
 
     pub fn new_session(&self, max_ctx: usize) -> Result<Session> {
         if self.hy4.is_some() {
-            bail!(
-                "Hy4-flash: the text forward is not wired yet (issue #40); the file loads and every tensor is mapped"
-            );
+            return crate::hy4::new_session(self, max_ctx);
         }
         let c = &self.cfg;
         let mut s = Session {
@@ -1771,6 +1769,9 @@ impl Model {
         verify: bool,
         argmax_only: bool,
     ) -> Result<Vec<f32>> {
+        if self.hy4.is_some() {
+            return crate::hy4::forward(self, sess, tokens, positions, n_logits);
+        }
         let c = &self.cfg;
         let t = tokens.len();
         ensure!(t > 0, "empty input");
