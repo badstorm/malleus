@@ -264,6 +264,76 @@ def hy4_trace(layer, h, s, blobs: Path, tag: str, ngram, engram_mask):
     return out
 
 
+VISION_RENAME = {
+    "layer_norm1": "input_layernorm",
+    "layer_norm2": "post_attention_layernorm",
+    "mlp.fc1": "mlp.dense_h_to_4h",
+    "mlp.fc2": "mlp.dense_4h_to_h",
+    "patch_merger.before_rms": "perceive.norm",
+    "patch_merger.proj_conv": "perceive.proj.0",
+    "patch_merger.proj_out": "perceive.proj.2",
+    "patch_merger.mlp": "perceive.mlp",
+    "patch_merger.image_newline": "perceive.image_newline",
+}
+
+
+def hy4_vision(args, cfg, model_dir, src_dev):
+    """Hy4's vision tower on one image: the golden the engine's vision path is compared against."""
+    import torch
+    from transformers import AutoProcessor
+    from transformers.models.hy_v4_vl import modeling_hy_v4_vl as V
+
+    img = Path(args.vision)
+    from transformers import AutoConfig
+
+    vcfg = AutoConfig.from_pretrained(args.model).vision_config
+    vcfg._attn_implementation = "eager"
+    proc = AutoProcessor.from_pretrained(args.model)
+    from PIL import Image
+
+    im = Image.open(img).convert("RGB")
+    # A small image: the tower is what is being checked here, not the anyres policy.
+    im.thumbnail((512, 512))
+    inputs = proc(images=im, return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(src_dev).to(torch.bfloat16)
+    grid = inputs["image_grid_thw"].to(src_dev)
+    print("image", img.name, "pixel_values", tuple(pixel_values.shape), "grid", grid.tolist(), flush=True)
+    torch.set_default_dtype(torch.bfloat16)
+    with torch.device("meta"):
+        tower = V.HYV4VLVisionModel(vcfg)
+    tower = tower.to_empty(device=src_dev)
+    tower.eval()
+    shards = Shards(model_dir, src_dev)
+    # The module's names against the checkpoint's: the tower is HunYuan's ViT with Hy4's merger.
+    sd = tower.state_dict()
+    for k in sd:
+        name = k
+        for a, b in VISION_RENAME.items():
+            name = name.replace(a, b)
+        t = shards.get("vit." + name)
+        if t.shape != sd[k].shape:
+            raise ValueError(f"vit.{name}: checkpoint {tuple(t.shape)}, module {tuple(sd[k].shape)}")
+        with torch.no_grad():
+            sd[k].copy_(t)
+    with torch.no_grad():
+        out = tower(pixel_values, grid)
+    tower_out = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+    merged = out.pooler_output if hasattr(out, "pooler_output") else out[1]
+    blob = Path(args.blob_dir)
+    save_f32(blob / "vision" / f"{img.stem}-tower.f32", tower_out[0].float())
+    save_f32(blob / "vision" / f"{img.stem}-merged.f32", merged[0].float())
+    print(
+        "vision tower %s rms %.5f | merged %s rms %.5f"
+        % (
+            tuple(tower_out.shape),
+            float(tower_out.float().pow(2).mean().sqrt()),
+            tuple(merged.shape),
+            float(merged.float().pow(2).mean().sqrt()),
+        ),
+        flush=True,
+    )
+
+
 def hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev):
     """Hy4-flash: the text path of issue #40, layer by layer.
 
@@ -273,7 +343,7 @@ def hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev):
     import transformers
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
     from transformers.models.hy_v4.modeling_hy_v4 import HYV4HyperHead
-    from transformers.models.hy_v4_flash import modeling_hy_v4_flash as H
+    from transformers.models.hy_v4_vl import modeling_hy_v4_vl as V
 
     pre = "model."
     pad = cfg.engram_pad_id
@@ -450,6 +520,7 @@ def main():
     ap.add_argument("--dump", default="en-fact", help="comma-separated ids whose per-layer states are saved")
     ap.add_argument("--layers", type=int, default=0, help="run only the first N layers (debug)")
     ap.add_argument("--only", default="", help="comma-separated prompt ids to run (default: all)")
+    ap.add_argument("--vision", default=None, help="run only the vision tower on this image (hy4)")
     args = ap.parse_args()
 
     import transformers
@@ -473,6 +544,9 @@ def main():
     seqs = sequences(tok, args, chat=not family_hy4)
     torch.set_default_dtype(torch.bfloat16)
     if family_hy4:
+        if args.vision:
+            hy4_vision(args, cfg, model_dir, dev)
+            return
         hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev)
         return
     t0 = time.time()
