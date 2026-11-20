@@ -423,7 +423,7 @@ impl Model {
         up.use_prefill = false;
         let embed = up.tensor(src, "model.embed_tokens.weight", &[c.vocab, c.hidden])?;
         let lm_head = up.linear(src, "lm_head", c.vocab, c.hidden)?;
-        let weights = crate::hy4::Weights::load(src, c, &mut up, progress)?;
+        let weights = crate::hy4::Weights::load(src, c, &mut up, opts.hadamard_seed, progress)?;
         let vision = match &c.hy4.as_ref().context("no hy4 config")?.vision {
             Some(v) if src.info("vit.embeddings.patch_embedding.weight").is_some() => {
                 Some(Box::new(crate::hy4::Vision::load(src, &mut up, v)?))

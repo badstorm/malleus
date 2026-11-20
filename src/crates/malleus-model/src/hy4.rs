@@ -298,7 +298,8 @@ pub(crate) struct Attn {
     pub(crate) q_a: Linear,
     pub(crate) q_b: Linear,
     pub(crate) kv_a: Linear,
-    pub(crate) kv_b: Linear,
+    /// fp32 `[heads * (nope + v), kv_lora]`, dequantized at load: the absorbed kernels read it as a matrix.
+    pub(crate) kv_b: DeviceBuffer,
     pub(crate) o: Linear,
     pub(crate) gate: Linear,
     pub(crate) q_a_norm: DeviceBuffer,
@@ -460,6 +461,7 @@ impl Weights {
         src: &dyn TensorSource,
         c: &Config,
         up: &mut Uploader,
+        seed: u64,
         progress: &dyn Fn(usize, usize),
     ) -> Result<Self> {
         let h = c.hy4.as_ref().context("no hy4 config")?;
@@ -467,7 +469,7 @@ impl Weights {
         let mut layers = Vec::with_capacity(c.n_layers);
         for i in 0..c.n_layers {
             progress(i, c.n_layers);
-            layers.push(load_layer(up, src, c, h, i)?);
+            layers.push(load_layer(up, src, c, h, i, seed)?);
         }
         let mut engram_scales = Vec::new();
         for (li, l) in layers.iter().enumerate() {
@@ -502,7 +504,14 @@ impl Weights {
     }
 }
 
-fn load_layer(up: &mut Uploader, src: &dyn TensorSource, c: &Config, h: &Hy4Config, i: usize) -> Result<Layer> {
+fn load_layer(
+    up: &mut Uploader,
+    src: &dyn TensorSource,
+    c: &Config,
+    h: &Hy4Config,
+    i: usize,
+    seed: u64,
+) -> Result<Layer> {
     let p = |s: &str| format!("model.layers.{i}.{s}");
     let hc = |up: &mut Uploader, which: &str| -> Result<Ihc> {
         Ok(Ihc {
@@ -557,7 +566,7 @@ fn load_layer(up: &mut Uploader, src: &dyn TensorSource, c: &Config, h: &Hy4Conf
         q_a: up.linear(src, &p("self_attn.q_a_proj"), h.q_lora, c.hidden)?,
         q_b: up.linear(src, &p("self_attn.q_b_proj"), qd, h.q_lora)?,
         kv_a: up.linear(src, &p("self_attn.kv_a_proj_with_mqa"), h.kv_lora + rope, c.hidden)?,
-        kv_b: up.linear(src, &p("self_attn.kv_b_proj"), kvd, h.kv_lora)?,
+        kv_b: up.linear_f32(src, &p("self_attn.kv_b_proj"), kvd, h.kv_lora, seed)?,
         o: up.linear(src, &p("self_attn.o_proj"), c.hidden, od)?,
         gate: up.linear(src, &p("self_attn.linear_gate"), od, c.hidden)?,
         q_a_norm: up.norm(src, &p("self_attn.q_a_layernorm.weight"), h.q_lora, false)?,
@@ -1860,7 +1869,8 @@ pub(crate) fn forward(
     // The kv_b expansion GEMM runs over the whole cache (`nk = len + t`), so the GEMM scratch is sized for the
     // larger of the step and the cache: with no history the two coincide, which is why this only showed up once
     // the bench decoded into a prompt.
-    let mut sc = model.take_scratch((sess.len + t).max(t))?;
+    let sc_cap = (sess.len + t).max(t);
+    let mut sc = model.take_scratch(sc_cap)?;
     let ids: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
     // An image prompt: the merged features replace the placeholder rows and the positions are the 3-D M-RoPE
     // ones (an image block is a rectangle of patches with a newline column, not a run of positions).
@@ -2012,11 +2022,7 @@ pub(crate) fn forward(
     let gate = crate::session::f32s(t * vd)?;
     let attn_out = crate::session::f32s(t * vd)?;
     let o = crate::session::f32s(t * hidden)?;
-    let nk = sess.len + t;
-    ensure!(nk <= 4096, "the first hy4 pass scores at most 4096 keys");
-    let lat = crate::session::f32s(nk * h.kv_lora)?;
-    let crot = crate::session::f32s(nk * h.rope)?;
-    let kvb = crate::session::f32s(nk * kvd)?;
+    let _ = (sess.len + t, kvd);
     for (li, layer) in w.layers.iter().take(layers).enumerate() {
         let a = &layer.attn;
         // Debug: take the streams from a file (`MALLEUS_HY4_STREAMS_IN`), so the Engram can be compared against
@@ -2110,45 +2116,142 @@ pub(crate) fn forward(
                 h.rope.into(),
             ],
         )?;
-        // Expand the cache into K/V (the non-absorbed path: correct first, absorbed later).
-        model.ew(
+        // Post-rope query and rotated key dims, for the score reconstruction against the reference replay.
+        dump("q_rot", li, &q, t * qd)?;
+        if std::env::var("MALLEUS_HY4_DUMP_KROT").is_ok() {
+            model.ew(
+                st,
+                "hy4_cast_f32",
+                t * h.rope,
+                &[(&sc.big1).into(), ckrot.into(), (t * h.rope).into()],
+            )?;
+            dump("krot", li, &sc.big1, t * h.rope)?;
+        }
+        // Absorbed MLA: `kv_b`'s QK half is folded into the query once per token and head, the split walks the cached
+        // latents (the sliding layers only the last `window` of them), and the combine applies its V half and the gate.
+        let nsplit = 8usize;
+        let qt = crate::session::f32s(t * a.heads * h.kv_lora)?;
+        model.k.get("hy4_absorb").launch(
+            ((t * a.heads).div_ceil(8) as u32, 1, 1),
+            (256, 1, 1),
+            0,
             st,
-            "hy4_cast_f32",
-            nk * h.kv_lora,
-            &[(&lat).into(), ckv.into(), (nk * h.kv_lora).into()],
+            &[
+                (&qt).into(),
+                (&q).into(),
+                (&a.kv_b).into(),
+                t.into(),
+                a.heads.into(),
+                a.nope.into(),
+                h.kv_lora.into(),
+                a.rope.into(),
+                (a.nope + a.v).into(),
+            ],
         )?;
-        model.ew(
-            st,
-            "hy4_cast_f32",
-            nk * h.rope,
-            &[(&crot).into(), ckrot.into(), (nk * h.rope).into()],
-        )?;
-        dump("lat", li, &lat, nk * h.kv_lora)?;
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &kvb, Act::X(&lat), &a.kv_b, nk, false)?;
+        dump("qt", li, &qt, t * a.heads * h.kv_lora)?;
+        if let Ok(dir) = std::env::var("MALLEUS_HY4_DUMP_W") {
+            st.synchronize()?;
+            let v: Vec<f32> = a.kv_b.download(a.kv_b.len() / 4)?;
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join(format!("W{li}_kvb.f32")), bytes)?;
+            // The gate weight, dequantized like linear_f32 does (MLS4 -> f32), to check the row order.
+            if let crate::weights::Weights::Mls4 { q, sc } = &a.gate.w {
+                use malleus_gguf::quant::{self, BLOCK};
+                let (n, k) = (a.gate.n, a.gate.k);
+                let g = k / BLOCK;
+                let signs = quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED);
+                let qw = q.download::<u8>(n * k / 2)?;
+                let sw = sc.download::<u8>(n * g * 2)?;
+                let mut out = vec![0f32; n * k];
+                for r in 0..n {
+                    for j in 0..g {
+                        let at = (r * g + j) * 2;
+                        let s = half::f16::from_le_bytes([sw[at], sw[at + 1]]).to_f32();
+                        let mut blk = [0f32; BLOCK];
+                        quant::dequant_int4(&qw[r * k / 2 + j * BLOCK / 2..][..BLOCK / 2], s, &mut blk);
+                        quant::unrotate_block(&mut blk, &signs);
+                        out[r * k + j * BLOCK..][..BLOCK].copy_from_slice(&blk);
+                    }
+                }
+                let bytes: Vec<u8> = out.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(format!("W{li}_gate.f32")), bytes)?;
+            }
+        }
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &gate, Act::X(&hn2), &a.gate, t, false)?;
         dump("gate", li, &gate, t * vd)?;
+        let part = crate::session::f32s(t * a.heads * nsplit * (h.kv_lora + 2))?;
         let sink = a.sink.as_ref().context("hy4 gated MLA needs the learned sink")?;
-        model.k.get("hy4_attn").launch(
-            (a.heads as u32, t as u32, 1),
+        let window = match c.kind[li] {
+            crate::config::MixerKind::Hy4Sliding => h.window,
+            _ => 0,
+        };
+        model.k.get("hy4_mla_split").launch(
+            ((t * a.heads) as u32, 1, 1),
             (256, 1, 1),
-            (4096 * 4 + 256 * 4) as u32,
+            0,
+            st,
+            &[
+                (&part).into(),
+                (&qt).into(),
+                (&q).into(),
+                ckv.into(),
+                ckrot.into(),
+                sink.into(),
+                sess.len.into(),
+                t.into(),
+                a.heads.into(),
+                a.nope.into(),
+                h.kv_lora.into(),
+                a.rope.into(),
+                (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                nsplit.into(),
+                window.into(),
+            ],
+        )?;
+        // The merge into a global buffer, then the V half of kv_b_proj and the gate: two kernels so that the
+        // latent the V projection reads is the one written, not a block of shared memory.
+        let lat_merged = crate::session::f32s(t * a.heads * h.kv_lora)?;
+        model.k.get("hy4_mla_merge").launch(
+            ((t * a.heads) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&lat_merged).into(), (&part).into(), h.kv_lora.into(), nsplit.into()],
+        )?;
+        if std::env::var("MALLEUS_HY4_DUMP_PART").is_ok() && li == 0 {
+            st.synchronize()?;
+            let dir = std::env::var("MALLEUS_DUMP_DIR")?;
+            let n_lat = crate::weights::kv_ctx(sess.max_ctx) * h.kv_lora;
+            let cache: Vec<u16> = ckv.download(n_lat)?;
+            let bytes: Vec<u8> = cache.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("T0_ckv.f16"), bytes)?;
+            let v: Vec<f32> = part.download(t * a.heads * nsplit * (h.kv_lora + 2))?;
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("T0_part.f32"), bytes)?;
+            let lm: Vec<f32> = lat_merged.download(t * a.heads * h.kv_lora)?;
+            let bytes: Vec<u8> = lm.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("T0_latmerged.f32"), bytes)?;
+            let gl: Vec<f32> = gate.download(t * vd)?;
+            let bytes: Vec<u8> = gl.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("T0_gate2.f32"), bytes)?;
+        }
+        model.k.get("hy4_mla_v").launch(
+            ((t * a.heads) as u32, 1, 1),
+            (256, 1, 1),
+            0,
             st,
             &[
                 (&attn_out).into(),
-                (&q).into(),
-                (&kvb).into(),
-                (&crot).into(),
-                sink.into(),
+                (&lat_merged).into(),
+                (&a.kv_b).into(),
                 (&gate).into(),
-                sess.len.into(),
                 a.heads.into(),
                 a.nope.into(),
-                a.rope.into(),
                 a.v.into(),
-                (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                h.kv_lora.into(),
             ],
         )?;
-        dump("attn_raw", li, &attn_out, t * vd)?;
+        dump("attn_raw2", li, &attn_out, t * vd)?;
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&attn_out), &a.o, t, false)?;
         model.rmsnorm(st, &hn, &o, &a.post_norm, t, hidden)?;
         dump("attn", li, &hn, t * hidden)?;
