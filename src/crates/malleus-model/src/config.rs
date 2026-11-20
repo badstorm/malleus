@@ -104,6 +104,8 @@ pub struct Hy4Config {
     pub engram: Option<Hy4Engram>,
     /// The vision tower, when the checkpoint carries one.
     pub vision: Option<Hy4Vision>,
+    /// Token id of an image placeholder in the prompt; 0 when the checkpoint has no vision.
+    pub image_token: u32,
 }
 
 /// The vision tower's geometry (`vision_config`): HunYuan's ViT plus Hy4's patch merger.
