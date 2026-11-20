@@ -189,7 +189,9 @@ impl Uploader {
         let mut out = vec![0f32; n * k];
         for r in 0..n {
             for j in 0..g {
-                let s = half::f16::from_le_bytes([sc[r * g + j * 2], sc[r * g + j * 2 + 1]]).to_f32();
+                // One f16 scale per (row, 128-group): the byte offset is `(r * g + j) * 2`, not `r * g + j * 2`.
+                let at = (r * g + j) * 2;
+                let s = half::f16::from_le_bytes([sc[at], sc[at + 1]]).to_f32();
                 let mut blk = [0f32; BLOCK];
                 quant::dequant_int4(&q[r * k / 2 + j * BLOCK / 2..][..BLOCK / 2], s, &mut blk);
                 quant::unrotate_block(&mut blk, &signs);
