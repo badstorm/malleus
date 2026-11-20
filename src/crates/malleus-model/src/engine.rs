@@ -68,6 +68,8 @@ pub struct Model {
     pub vision: Option<crate::vision::VisionModel>,
     /// Hy4-flash weights: its own graph (`crate::hy4`), not the `Layer`/`Mixer` shape of the carried models.
     pub(crate) hy4: Option<Box<crate::hy4::Weights>>,
+    /// Hy4-flash's vision tower (`vit.*`), when the file carries one.
+    pub(crate) hy4_vision: Option<Box<crate::hy4::Vision>>,
 }
 
 pub struct LoadOptions {
@@ -403,6 +405,7 @@ impl Model {
             moe_y_half,
             vision: None,
             hy4: None,
+            hy4_vision: None,
         })
     }
 
@@ -421,6 +424,12 @@ impl Model {
         let embed = up.tensor(src, "model.embed_tokens.weight", &[c.vocab, c.hidden])?;
         let lm_head = up.linear(src, "lm_head", c.vocab, c.hidden)?;
         let weights = crate::hy4::Weights::load(src, c, &mut up, progress)?;
+        let vision = match &c.hy4.as_ref().context("no hy4 config")?.vision {
+            Some(v) if src.info("vit.embeddings.patch_embedding.weight").is_some() => {
+                Some(Box::new(crate::hy4::Vision::load(src, &mut up, v)?))
+            }
+            _ => None,
+        };
         progress(c.n_layers, c.n_layers);
         Ok(Model {
             weight_bytes: up.bytes,
@@ -451,6 +460,7 @@ impl Model {
             moe_y_half: false,
             vision: None,
             hy4: Some(Box::new(weights)),
+            hy4_vision: vision,
         })
     }
 

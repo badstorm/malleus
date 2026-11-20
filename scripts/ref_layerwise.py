@@ -320,6 +320,8 @@ def hy4_vision(args, cfg, model_dir, src_dev):
     tower_out = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
     merged = out.pooler_output if hasattr(out, "pooler_output") else out[1]
     blob = Path(args.blob_dir)
+    save_f32(blob / "vision" / f"{img.stem}-pixels.f32", pixel_values.float())
+    blob.joinpath("vision", f"{img.stem}-grid.txt").write_text("%dx%d" % (int(grid[0][1]), int(grid[0][2])))
     save_f32(blob / "vision" / f"{img.stem}-tower.f32", tower_out[0].float())
     save_f32(blob / "vision" / f"{img.stem}-merged.f32", merged[0].float())
     print(

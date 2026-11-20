@@ -245,3 +245,114 @@ extern "C" __global__ void __launch_bounds__(256) hy4_expert_gemv(float* y, cons
         else y[o] = red[0];
     }
 }
+
+// The vision tower: LayerNorm (with bias, mean subtracted), exact GELU, bias and residual adds, the full
+// per-image attention of the ViT, and the 2x2 pack the patch merger's convolution reads.
+__device__ __forceinline__ float hy4_bf(unsigned short v) { return __uint_as_float((unsigned)v << 16); }
+
+extern "C" __global__ void __launch_bounds__(256) hy4_ln(float* out, const float* x, const unsigned short* w,
+                                                         const unsigned short* b, int n) {
+    __shared__ float sh[256];
+    const float* xr = x + (size_t)blockIdx.x * n;
+    float* yr = out + (size_t)blockIdx.x * n;
+    float s = 0.f, s2 = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        s += xr[i];
+        s2 += xr[i] * xr[i];
+    }
+    sh[threadIdx.x] = s;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sh[threadIdx.x] += sh[threadIdx.x + st];
+        __syncthreads();
+    }
+    const float mean = sh[0] / n;
+    __syncthreads();
+    sh[threadIdx.x] = s2;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sh[threadIdx.x] += sh[threadIdx.x + st];
+        __syncthreads();
+    }
+    const float var = sh[0] / n - mean * mean;
+    const float inv = rsqrtf(var + 1e-5f);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        yr[i] = (xr[i] - mean) * inv * hy4_bf(w[i]) + hy4_bf(b[i]);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) hy4_gelu(float* x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 0.5f * x[i] * (1.f + erff(x[i] * 0.7071067811865476f));
+}
+
+// out[i] += bias[i % n], over rows rows: the bias of the projections the GEMM does not carry.
+extern "C" __global__ void __launch_bounds__(256) hy4_bias(float* out, const unsigned short* b, int n, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) out[i] += hy4_bf(b[i % n]);
+}
+
+extern "C" __global__ void __launch_bounds__(256) hy4_add(float* dst, const float* src, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+
+// Full attention of the ViT: no causal mask, no sink, one block per (token, head).
+extern "C" __global__ void __launch_bounds__(256) hy4_vit_attn(float* out, const float* q, const float* k,
+                                                              const float* v, int t, int nh, int dim, float scale) {
+    extern __shared__ float sh[];
+    float* sc = sh;
+    float* red = sh + 4096;
+    const int ti = blockIdx.y, h = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* qh = q + ((size_t)ti * nh + h) * dim;
+    const float* kh = k + (size_t)h * dim;
+    float mx = -INFINITY;
+    for (int j = tid; j < t; j += blockDim.x) {
+        const float* kj = kh + (size_t)j * nh * dim;
+        float acc = 0.f;
+        for (int d = 0; d < dim; ++d) acc += qh[d] * kj[d];
+        sc[j] = acc * scale;
+        mx = fmaxf(mx, sc[j]);
+    }
+    red[tid] = mx;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
+        __syncthreads();
+    }
+    mx = red[0];
+    float sum = 0.f;
+    for (int j = tid; j < t; j += blockDim.x) {
+        sc[j] = expf(sc[j] - mx);
+        sum += sc[j];
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    const float den = red[0];
+    const int d = tid;
+    if (d < dim) {
+        float acc = 0.f;
+        for (int j = 0; j < t; ++j) acc += sc[j] * v[((size_t)j * nh + h) * dim + d];
+        out[((size_t)ti * nh + h) * dim + d] = acc / den;
+    }
+}
+
+// Packs the 2x2 blocks the patch merger's 2x2 convolution reads: out[mp, ch * 4 + dy * 2 + dx] = x[row * 2 + dy,
+// col * 2 + dx, ch], with mp = row * cols + col (the merged grid).
+extern "C" __global__ void __launch_bounds__(256) hy4_merge_pack(float* out, const float* x, int hidden, int rows,
+                                                                int cols) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * cols * hidden * 4;
+    if (i >= total) return;
+    const int ch = i % hidden, rest = i / hidden;
+    const int pos = rest % 4, mp = rest / 4;
+    const int row = mp / cols, col = mp % cols;
+    const int dy = pos / 2, dx = pos % 2;
+    const int src = (((row * 2 + dy) * cols * 2) + col * 2 + dx) * hidden + ch;
+    out[(size_t)mp * hidden * 4 + ch * 4 + dy * 2 + dx] = x[src];
+}
