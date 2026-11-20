@@ -102,6 +102,22 @@ pub struct Hy4Config {
     pub sparse: Vec<bool>,
     /// Engram memories, when the checkpoint carries them.
     pub engram: Option<Hy4Engram>,
+    /// The vision tower, when the checkpoint carries one.
+    pub vision: Option<Hy4Vision>,
+}
+
+/// The vision tower's geometry (`vision_config`): HunYuan's ViT plus Hy4's patch merger.
+#[derive(Clone, Debug)]
+pub struct Hy4Vision {
+    pub hidden: usize,
+    pub inter: usize,
+    pub heads: usize,
+    pub patch: usize,
+    /// Edge of the learned position grid (`max_image_size / patch_size`).
+    pub edge: usize,
+    pub merge: usize,
+    /// Width the merger projects to: the text model's hidden size.
+    pub out: usize,
 }
 
 /// The hashed n-gram memory of Hy4: which layers carry it and the shape of the hashes.

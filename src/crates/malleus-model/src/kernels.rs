@@ -203,6 +203,12 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "hy4_glu",
             "hy4_moe_acc",
             "hy4_expert_gemv",
+            "hy4_ln",
+            "hy4_gelu",
+            "hy4_bias",
+            "hy4_add",
+            "hy4_vit_attn",
+            "hy4_merge_pack",
         ],
     ),
     (

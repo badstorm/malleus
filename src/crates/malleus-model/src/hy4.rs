@@ -66,6 +66,25 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
     };
     let mrope_section = sec(indexed);
 
+    let vision = match cfg["vision_config"]["hidden_size"].as_u64() {
+        Some(hidden) => {
+            let v = &cfg["vision_config"];
+            Some(crate::config::Hy4Vision {
+                hidden: hidden as usize,
+                inter: v["intermediate_size"]
+                    .as_u64()
+                    .context("vision_config: intermediate_size")? as usize,
+                heads: v["num_attention_heads"].as_u64().context("vision_config: heads")? as usize,
+                patch: v["patch_size"].as_u64().context("vision_config: patch_size")? as usize,
+                edge: (v["max_image_size"].as_u64().unwrap_or(2048) / v["patch_size"].as_u64().unwrap_or(16)) as usize,
+                merge: v["spatial_merge_size"].as_u64().unwrap_or(2) as usize,
+                out: v["text_hidden_size"]
+                    .as_u64()
+                    .context("vision_config: text_hidden_size")? as usize,
+            })
+        }
+        None => None,
+    };
     let engram = match t["engram_layer_ids"].as_array() {
         Some(ids) if !ids.is_empty() => {
             let layers: Vec<usize> = ids
@@ -159,6 +178,7 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         routed_scaling: f("routed_scaling_factor")?,
         sparse,
         engram,
+        vision,
     };
     let c = Config {
         hidden: u("hidden_size")?,
@@ -1210,6 +1230,371 @@ fn engram(
     Ok(())
 }
 
+/// Hy4's vision tower (the `vit.*` tensors): HunYuan's ViT with Hy4's patch merger.
+///
+/// LayerNorm with bias, exact GELU, full per-image attention, no RoPE. The patch embed's convolution is a
+/// `[1152, 3 * 16 * 16]` GEMM over the patches, and the merger's 2x2 convolution a `[4608, 4 * 1152]` one over the
+/// packed 2x2 blocks; the position grid is interpolated on the host (bilinear, align_corners=False, as the module).
+#[allow(dead_code)]
+pub(crate) struct Vision {
+    pub(crate) patch: Linear,
+    pub(crate) patch_bias: DeviceBuffer,
+    /// The 128x128 learned patch grid (the checkpoint's first row is a class token, never used).
+    pub(crate) pos: Vec<f32>,
+    pub(crate) blocks: Vec<VBlock>,
+    pub(crate) norm: DeviceBuffer,
+    pub(crate) proj0: Linear,
+    pub(crate) proj0_bias: DeviceBuffer,
+    pub(crate) proj2: Linear,
+    pub(crate) proj2_bias: DeviceBuffer,
+    pub(crate) newline: Vec<f32>,
+    pub(crate) hidden: usize,
+    pub(crate) inter: usize,
+    pub(crate) heads: usize,
+    pub(crate) edge: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+}
+
+#[allow(dead_code)]
+pub(crate) struct VBlock {
+    pub(crate) ln1: (DeviceBuffer, DeviceBuffer),
+    pub(crate) q: Linear,
+    pub(crate) k: Linear,
+    pub(crate) v: Linear,
+    pub(crate) o: Linear,
+    pub(crate) qb: DeviceBuffer,
+    pub(crate) kb: DeviceBuffer,
+    pub(crate) vb: DeviceBuffer,
+    pub(crate) ob: DeviceBuffer,
+    pub(crate) ln2: (DeviceBuffer, DeviceBuffer),
+    pub(crate) fc1: Linear,
+    pub(crate) fc2: Linear,
+    pub(crate) f1b: DeviceBuffer,
+    pub(crate) f2b: DeviceBuffer,
+}
+
+impl Vision {
+    pub(crate) fn load(src: &dyn TensorSource, up: &mut Uploader, cfg: &crate::config::Hy4Vision) -> Result<Self> {
+        let (hidden, inter, heads, edge) = (cfg.hidden, cfg.inter, cfg.heads, cfg.edge);
+        let out = cfg.out;
+        let lin = |up: &mut Uploader, n: &str, rows: usize, cols: usize| -> Result<Linear> {
+            up.linear(src, &format!("vit.{n}"), rows, cols)
+        };
+        let bias = |up: &mut Uploader, n: &str, len: usize| -> Result<DeviceBuffer> {
+            up.tensor(src, &format!("vit.{n}.bias"), &[len])
+        };
+        // The convolutions are GEMMs: their weight flattening is the im2col order the kernels see.
+        let conv = |up: &mut Uploader, n: &str, rows: usize, cols: usize, shape: &[usize]| -> Result<Linear> {
+            Ok(Linear {
+                w: crate::weights::Weights::Bf16(up.tensor(src, &format!("vit.{n}.weight"), shape)?),
+                prefill: None,
+                n: rows,
+                k: cols,
+            })
+        };
+        let patch = conv(
+            up,
+            "embeddings.patch_embedding",
+            hidden,
+            3 * 16 * 16,
+            &[hidden, 3, 16, 16],
+        )?;
+        let patch_bias = bias(up, "embeddings.patch_embedding", hidden)?;
+        // The learned grid, without the class token row and as f32 for the host interpolation.
+        let pos = bf16_vec(
+            src,
+            "vit.embeddings.position_embedding.weight",
+            (edge * edge + 1) * hidden,
+        )?;
+        let pos = pos[hidden..].to_vec();
+        let n_layers = src
+            .names()
+            .iter()
+            .filter(|n| n.starts_with("vit.layers.") && n.ends_with(".input_layernorm.weight"))
+            .count();
+        let mut blocks = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            let p = |s: &str| format!("layers.{i}.{s}");
+            blocks.push(VBlock {
+                ln1: (
+                    up.tensor(src, &format!("vit.{}.weight", p("input_layernorm")), &[hidden])?,
+                    up.tensor(src, &format!("vit.{}.bias", p("input_layernorm")), &[hidden])?,
+                ),
+                q: lin(up, &p("self_attn.q_proj"), hidden, hidden)?,
+                k: lin(up, &p("self_attn.k_proj"), hidden, hidden)?,
+                v: lin(up, &p("self_attn.v_proj"), hidden, hidden)?,
+                o: lin(up, &p("self_attn.o_proj"), hidden, hidden)?,
+                qb: bias(up, &p("self_attn.q_proj"), hidden)?,
+                kb: bias(up, &p("self_attn.k_proj"), hidden)?,
+                vb: bias(up, &p("self_attn.v_proj"), hidden)?,
+                ob: bias(up, &p("self_attn.o_proj"), hidden)?,
+                ln2: (
+                    up.tensor(src, &format!("vit.{}.weight", p("post_attention_layernorm")), &[hidden])?,
+                    up.tensor(src, &format!("vit.{}.bias", p("post_attention_layernorm")), &[hidden])?,
+                ),
+                fc1: lin(up, &p("mlp.dense_h_to_4h"), inter, hidden)?,
+                fc2: lin(up, &p("mlp.dense_4h_to_h"), hidden, inter)?,
+                f1b: bias(up, &p("mlp.dense_h_to_4h"), inter)?,
+                f2b: bias(up, &p("mlp.dense_4h_to_h"), hidden)?,
+            });
+        }
+        Ok(Vision {
+            patch,
+            patch_bias,
+            pos,
+            blocks,
+            // `before_rms`: RMSNorm without bias, applied raw (one-plus off).
+            norm: up.norm(src, "vit.perceive.norm.weight", hidden, true)?,
+            proj0: conv(
+                up,
+                "perceive.proj.0",
+                4 * hidden,
+                4 * hidden,
+                &[4 * hidden, hidden, 2, 2],
+            )?,
+            proj0_bias: bias(up, "perceive.proj.0", 4 * hidden)?,
+            proj2: conv(up, "perceive.proj.2", out, 4 * hidden, &[out, 4 * hidden, 1, 1])?,
+            proj2_bias: bias(up, "perceive.proj.2", out)?,
+            newline: bf16_vec(src, "vit.perceive.image_newline", out)?,
+            hidden,
+            inter,
+            heads,
+            edge,
+            rows: cfg.merge,
+            cols: cfg.merge,
+        })
+    }
+}
+
+/// Bilinear interpolation of the learned patch grid to `(gh, gw)`, as `torch.nn.functional.interpolate` with
+/// `align_corners=False` does it.
+fn interp_pos(pos: &[f32], edge: usize, gh: usize, gw: usize, hidden: usize) -> Vec<f32> {
+    let (sy, sx) = (edge as f32 / gh as f32, edge as f32 / gw as f32);
+    let mut out = vec![0f32; gh * gw * hidden];
+    for oy in 0..gh {
+        let fy = ((oy as f32 + 0.5) * sy - 0.5).max(0.0);
+        let y0 = (fy.floor() as usize).min(edge - 1);
+        let y1 = (y0 + 1).min(edge - 1);
+        let wy = fy - y0 as f32;
+        for ox in 0..gw {
+            let fx = ((ox as f32 + 0.5) * sx - 0.5).max(0.0);
+            let x0 = (fx.floor() as usize).min(edge - 1);
+            let x1 = (x0 + 1).min(edge - 1);
+            let wx = fx - x0 as f32;
+            let dst = (oy * gw + ox) * hidden;
+            for c in 0..hidden {
+                let p = |y: usize, x: usize| pos[(y * edge + x) * hidden + c];
+                let top = p(y0, x0) * (1.0 - wx) + p(y0, x1) * wx;
+                let bot = p(y1, x0) * (1.0 - wx) + p(y1, x1) * wx;
+                out[dst + c] = top * (1.0 - wy) + bot * wy;
+            }
+        }
+    }
+    out
+}
+
+/// The vision tower on one image: `pixels` are `[n, 3 * 16 * 16]` (the processor's flat patches), the grid is
+/// `gh x gw`. Returns the tower's last hidden state `[n, hidden]` and the merged features
+/// `[gh/2 * (gw/2 + 1), out_hidden]`, the newline column appended per row.
+pub(crate) fn vision_forward(
+    model: &crate::engine::Model,
+    v: &Vision,
+    pixels: &[f32],
+    gh: usize,
+    gw: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    use crate::engine::Act;
+    let st = &model.stream;
+    let c = &model.cfg;
+    let n = gh * gw;
+    let hidden = v.hidden;
+    ensure!(pixels.len() >= n * 3 * 16 * 16, "pixel values too small for the grid");
+    let sc = model.scratch(n)?;
+    let pix = DeviceBuffer::from_slice(&pixels[..n * 3 * 16 * 16])?;
+    let mut x = crate::session::f32s(n * hidden)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &x, Act::X(&pix), &v.patch, n, false)?;
+    model.k.get("hy4_bias").launch(
+        ((n * hidden).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&x).into(), (&v.patch_bias).into(), hidden.into(), (n * hidden).into()],
+    )?;
+    // The position grid, interpolated and added on the host.
+    let pos = interp_pos(&v.pos, v.edge, gh, gw, hidden);
+    let mut xh: Vec<f32> = x.download(n * hidden)?;
+    for i in 0..n * hidden {
+        xh[i] += pos[i];
+    }
+    x.upload(&xh)?;
+    let ln = crate::session::f32s(n * hidden)?;
+    let qq = crate::session::f32s(n * hidden)?;
+    let kk = crate::session::f32s(n * hidden)?;
+    let vv = crate::session::f32s(n * hidden)?;
+    let attn = crate::session::f32s(n * hidden)?;
+    let tmp = crate::session::f32s(n * hidden.max(v.inter))?;
+    let dim = hidden / v.heads;
+    let scale = 1.0 / (dim as f32).sqrt();
+    for b in &v.blocks {
+        model.k.get("hy4_ln").launch(
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&ln).into(),
+                (&x).into(),
+                (&b.ln1.0).into(),
+                (&b.ln1.1).into(),
+                hidden.into(),
+            ],
+        )?;
+        for (dst, w, bias) in [(&qq, &b.q, &b.qb), (&kk, &b.k, &b.kb), (&vv, &b.v, &b.vb)] {
+            model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, dst, Act::X(&ln), w, n, false)?;
+            model.k.get("hy4_bias").launch(
+                ((n * hidden).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[dst.into(), bias.into(), hidden.into(), (n * hidden).into()],
+            )?;
+        }
+        model.k.get("hy4_vit_attn").launch(
+            (v.heads as u32, n as u32, 1),
+            (256, 1, 1),
+            (4096 * 4 + 256 * 4) as u32,
+            st,
+            &[
+                (&attn).into(),
+                (&qq).into(),
+                (&kk).into(),
+                (&vv).into(),
+                n.into(),
+                v.heads.into(),
+                dim.into(),
+                scale.into(),
+            ],
+        )?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &tmp, Act::X(&attn), &b.o, n, false)?;
+        model.k.get("hy4_bias").launch(
+            ((n * hidden).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&tmp).into(), (&b.ob).into(), hidden.into(), (n * hidden).into()],
+        )?;
+        model.k.get("hy4_add").launch(
+            ((n * hidden).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&x).into(), (&tmp).into(), (n * hidden).into()],
+        )?;
+        model.k.get("hy4_ln").launch(
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&ln).into(),
+                (&x).into(),
+                (&b.ln2.0).into(),
+                (&b.ln2.1).into(),
+                hidden.into(),
+            ],
+        )?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &tmp, Act::X(&ln), &b.fc1, n, false)?;
+        model.k.get("hy4_bias").launch(
+            ((n * v.inter).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&tmp).into(), (&b.f1b).into(), v.inter.into(), (n * v.inter).into()],
+        )?;
+        model.k.get("hy4_gelu").launch(
+            ((n * v.inter).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&tmp).into(), (n * v.inter).into()],
+        )?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &vv, Act::X(&tmp), &b.fc2, n, false)?;
+        model.k.get("hy4_bias").launch(
+            ((n * hidden).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&vv).into(), (&b.f2b).into(), hidden.into(), (n * hidden).into()],
+        )?;
+        model.k.get("hy4_add").launch(
+            ((n * hidden).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&x).into(), (&vv).into(), (n * hidden).into()],
+        )?;
+    }
+    let tower_out: Vec<f32> = {
+        st.synchronize()?;
+        x.download(n * hidden)?
+    };
+    // The merger: before_rms, the 2x2 pack, the two convolutions and the newline per merged row.
+    rmsnorm_raw(model, st, &ln, &x, &v.norm, n, hidden)?;
+    let (mh, mw) = (gh / 2, gw / 2);
+    ensure!(mh > 0 && mw > 0, "the grid must be at least 2x2");
+    let nm = mh * mw;
+    let packed = crate::session::f32s(nm * 4 * hidden)?;
+    model.k.get("hy4_merge_pack").launch(
+        ((nm * 4 * hidden).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&packed).into(), (&ln).into(), hidden.into(), mh.into(), mw.into()],
+    )?;
+    let big = crate::session::f32s(nm * 4 * hidden)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &big, Act::X(&packed), &v.proj0, nm, false)?;
+    model.k.get("hy4_bias").launch(
+        ((nm * 4 * hidden).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            (&big).into(),
+            (&v.proj0_bias).into(),
+            (4 * hidden).into(),
+            (nm * 4 * hidden).into(),
+        ],
+    )?;
+    model.k.get("hy4_gelu").launch(
+        ((nm * 4 * hidden).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&big).into(), (nm * 4 * hidden).into()],
+    )?;
+    let out_w = c.hidden;
+    let o = crate::session::f32s(nm * out_w)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&big), &v.proj2, nm, false)?;
+    model.k.get("hy4_bias").launch(
+        ((nm * out_w).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&o).into(), (&v.proj2_bias).into(), out_w.into(), (nm * out_w).into()],
+    )?;
+    st.synchronize()?;
+    let merged_raw: Vec<f32> = o.download(nm * out_w)?;
+    // The newline column goes at the end of every merged row.
+    let mut merged = Vec::with_capacity(mh * (mw + 1) * out_w);
+    for r in 0..mh {
+        merged.extend_from_slice(&merged_raw[r * mw * out_w..(r + 1) * mw * out_w]);
+        merged.extend_from_slice(&v.newline);
+    }
+    *model.scratch_cache.lock().unwrap() = Some(sc);
+    Ok((tower_out, merged))
+}
+
 /// Hy4's session: the latent and the rotated dims per layer (fp16), no conv or recurrent state.
 pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Result<crate::session::Session> {
     let c = &model.cfg;
@@ -1272,6 +1657,35 @@ pub(crate) fn forward(
     let c = &model.cfg;
     let h = c.hy4.as_ref().context("no hy4 config")?;
     let w = model.hy4.as_ref().context("no hy4 weights")?;
+    // Debug: run the vision tower alone on the processor's pixels (`MALLEUS_HY4_VISION_PIX` + `..._GRID`), dump
+    // the two stages and stop. It is how the tower is compared against `--vision` in the reference tool.
+    if let Ok(pix) = std::env::var("MALLEUS_HY4_VISION_PIX") {
+        let v = model.hy4_vision.as_ref().context("the file has no vision tower")?;
+        let bytes = std::fs::read(&pix)?;
+        let pixels: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let grid = std::env::var("MALLEUS_HY4_VISION_GRID").context("MALLEUS_HY4_VISION_GRID")?;
+        let (gh, gw) = grid.split_once('x').context("grid as HxW")?;
+        let (gh, gw): (usize, usize) = (gh.parse()?, gw.parse()?);
+        let (tower_back, merged) = vision_forward(model, v, &pixels, gh, gw)?;
+        let dir = std::env::var("MALLEUS_DUMP_DIR").context("MALLEUS_DUMP_DIR")?;
+        let put = |name: &str, v: &[f32]| -> Result<()> {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            Ok(std::fs::write(std::path::Path::new(&dir).join(name), bytes)?)
+        };
+        put("V_tower.f32", &tower_back)?;
+        put("V_merged.f32", &merged)?;
+        bail!(
+            "vision tower: {} patches, {} merged tokens of {} (dumped to MALLEUS_DUMP_DIR)",
+            gh * gw,
+            merged.len() / c.hidden,
+            c.hidden
+        );
+    }
     let t = tokens.len();
     ensure!(t > 0 && n_logits >= 1 && n_logits <= t, "bad hy4 step");
     ensure!(
