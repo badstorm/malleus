@@ -1001,6 +1001,17 @@ impl Model {
         acc: bool,
     ) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
+        // The scratch holds the GEMM input in three forms (f32 rotated, fp16 rotated, int8 scales): a mismatch here
+        // used to surface as a memory fault inside a kernel.
+        ensure!(
+            t * w.k * 4 <= xr.len() && t * w.k * 2 <= xh.len() && t * w.k.div_ceil(128) * 4 <= xsc.len(),
+            "gemm scratch too small: t={t} k={} n={} xr={} xh={} xsc={}",
+            w.k,
+            w.n,
+            xr.len(),
+            xh.len(),
+            xsc.len()
+        );
         let a8 = t >= WMMA_MIN_TOKENS && self.prefill_a8 && !matches!(w.w, Weights::Bf16(_));
         // int4 activations. The plain inputs go through the per-chunk quantizer (`rot_quant_i4_w`); an input that needs
         // a transform folds it in `rot_quant_i4_row`, the int4 twin of the int8 row path, so o_proj and out_proj no

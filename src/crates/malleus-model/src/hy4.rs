@@ -1857,7 +1857,10 @@ pub(crate) fn forward(
         sess.max_ctx
     );
     let st = &model.stream;
-    let mut sc = model.scratch(t)?;
+    // The kv_b expansion GEMM runs over the whole cache (`nk = len + t`), so the GEMM scratch is sized for the
+    // larger of the step and the cache: with no history the two coincide, which is why this only showed up once
+    // the bench decoded into a prompt.
+    let mut sc = model.take_scratch((sess.len + t).max(t))?;
     let ids: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
     // An image prompt: the merged features replace the placeholder rows and the positions are the 3-D M-RoPE
     // ones (an image block is a rectangle of patches with a newline column, not a run of positions).
