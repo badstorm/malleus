@@ -311,6 +311,14 @@ const QWEN_MLS4_SUFFIXES: &[&str] = &[
 /// Hy4-flash linears that go to MLS4. Everything else stays raw: the norms, the router (`mlp.gate.weight`) and its
 /// correction bias, the learned attention sinks, the iHC parameters (f32), the indexer's fp32 pooling projections and
 /// its `intra_group_ape`, the Engram normalization and gate parameters, and the vision tower.
+///
+/// The compressed indexer's three projections stay raw too, and that is deliberate: they do not compute an output,
+/// they *choose* which groups a query recalls, and 4 bits move that choice. Measured at 2100 tokens of context
+/// (scripts/ref_indexer_replay.py, layer 0): at rel-L2 0.104 (MLS4) 47 of the 52 queries with a real selection pick
+/// a different group than the bf16 reference; perturbing the reference's own weights by the same amount reproduces
+/// 46 of them. The three tensors are 5.1 MB per layer in bf16 against 1.3 in MLS4, i.e. 46 MB of disk over the 12
+/// indexed layers and +0.2 ms on a decode token — and the selection is exact instead of one group off in 90 % of
+/// them. (They were MLS4 in the first conversion of this file.)
 const HY4_MLS4_SUFFIXES: &[&str] = &[
     // gated MLA (`*_proj` of the sliding layers carry the wider head shape, same names)
     "self_attn.q_a_proj.weight",
@@ -319,10 +327,8 @@ const HY4_MLS4_SUFFIXES: &[&str] = &[
     "self_attn.kv_b_proj.weight",
     "self_attn.o_proj.weight",
     "self_attn.linear_gate.weight",
-    // compressed indexer: the two key-side projections and the per-head weights
-    "self_attn.compressed_indexer.query_projection.weight",
-    "self_attn.compressed_indexer.token_key_projection.weight",
-    "self_attn.compressed_indexer.head_weight_projection.weight",
+    // The compressed indexer's `query_projection`, `token_key_projection` and `head_weight_projection` are kept raw
+    // (bf16) on purpose: see the note above, 4 bits there flips the group selection.
     // dense layer 0
     "mlp.gate_proj.weight",
     "mlp.up_proj.weight",
@@ -1236,13 +1242,28 @@ mod tests {
         assert_eq!(c(&format!("{l}self_attn.q_a_layernorm.weight"), &[1024]), Kind::Raw);
         assert_eq!(c(&format!("{l}self_attn.post_proj_norm.weight"), &[3072]), Kind::Raw);
         assert_eq!(c(&format!("{l}self_attn.learnable_sink_param"), &[32]), Kind::Raw);
-        // compressed indexer: the fp32 pooling projections and the apex stay raw
+        // compressed indexer: the three projections that decide the selection stay raw, as do the fp32 pooling
+        // projections and the apex
         assert_eq!(
             c(
                 &format!("{l}self_attn.compressed_indexer.query_projection.weight"),
                 &[2048, 1024]
             ),
-            Kind::Mls4
+            Kind::Raw
+        );
+        assert_eq!(
+            c(
+                &format!("{l}self_attn.compressed_indexer.token_key_projection.weight"),
+                &[128, 3072]
+            ),
+            Kind::Raw
+        );
+        assert_eq!(
+            c(
+                &format!("{l}self_attn.compressed_indexer.head_weight_projection.weight"),
+                &[16, 3072]
+            ),
+            Kind::Raw
         );
         assert_eq!(
             c(

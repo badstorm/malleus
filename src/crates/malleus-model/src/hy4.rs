@@ -244,6 +244,12 @@ pub(crate) fn validate(c: &Config) -> Result<()> {
         h.index_pool > 0 && h.index_topk % h.index_pool == 0 && h.index_heads > 0,
         "hy4 compressed indexer geometry"
     );
+    // The pooling kernel is one block of `index_dim` threads (its reduction is 128 wide) and holds one slot per
+    // token of the group in registers.
+    ensure!(
+        h.index_dim == 128 && h.index_pool <= 8,
+        "hy4 compressed indexer: a 128-wide key and at most 8 slots per group"
+    );
     ensure!(h.sparse.len() == c.n_layers, "hy4 mlp_layer_types length");
     ensure!(
         c.kind.contains(&MixerKind::Hy4Indexed) && c.kind.contains(&MixerKind::Hy4Sliding),
@@ -538,7 +544,8 @@ fn load_layer(
             Some(Indexer {
                 query: up.linear(src, &ix("query_projection"), h.index_heads * h.index_dim, h.q_lora)?,
                 token_key: up.linear(src, &ix("token_key_projection"), h.index_dim, c.hidden)?,
-                token_key_norm: up.tensor(src, &ix("token_key_norm.weight"), &[h.index_dim])?,
+                // The indexer's norms multiply by the weight without the one, and the pooling kernel reads them as f32.
+                token_key_norm: up.norm_f32(src, &ix("token_key_norm.weight"), h.index_dim)?,
                 value: up.typed(
                     src,
                     &ix("key_value_projection.weight"),
@@ -795,8 +802,21 @@ fn load_engram(
 pub(crate) fn session_bytes(c: &Config, ctx: usize) -> u64 {
     let Some(h) = &c.hy4 else { return 0 };
     let per_token = h.kv_lora as u64 + h.rope as u64;
-    let layers = c.n_layers as u64;
-    (ctx as u64).div_ceil(32) * 32 * per_token * 2 * layers
+    let n = crate::weights::kv_ctx(ctx) as u64;
+    let mut t = n * per_token * 2 * c.n_layers as u64;
+    // The compressed indexer of every indexed layer keeps its token keys, the groups that closed, and the 3-D
+    // position of every slot (shared by the layers).
+    let indexed = c
+        .kind
+        .iter()
+        .filter(|k| **k == crate::config::MixerKind::Hy4Indexed)
+        .count() as u64;
+    let dim = h.index_dim as u64;
+    t += indexed * (n * dim * 2 + (n / h.index_pool as u64 + 1) * dim * 2);
+    if indexed > 0 {
+        t += n * 3 * 4;
+    }
+    t
 }
 
 /// An RMSNorm applied with the weight as stored (`w * x`, no `1 +`): what every Hy4 norm is.
@@ -1803,19 +1823,302 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
         idx_list: None,
         ple_snap: None,
         ngram_prev: Vec::new(),
+        ix_tk: Vec::new(),
+        ix_gk: Vec::new(),
+        ix_pooled: Vec::new(),
+        ix_pos: None,
     };
     let n = crate::weights::kv_ctx(max_ctx);
-    for _ in 0..c.n_layers {
+    let w = model.hy4.as_ref().context("no hy4 weights")?;
+    for li in 0..c.n_layers {
         s.kv.push((
             DeviceBuffer::zeroed(n * h.kv_lora * 2)?,
             DeviceBuffer::zeroed(n * h.rope * 2)?,
         ));
+        // The compressed indexer caches the token keys of every indexed layer and the groups that closed; the
+        // sliding layers have neither, so they hold `None` and the layer index stays the one of `s.kv`.
+        match w.layers[li].attn.indexer {
+            Some(_) => {
+                s.ix_tk.push(Some(DeviceBuffer::zeroed(n * h.index_dim * 2)?));
+                s.ix_gk
+                    .push(Some(DeviceBuffer::zeroed((n / h.index_pool + 1) * h.index_dim * 2)?));
+                s.ix_pooled.push(0);
+            }
+            None => {
+                s.ix_tk.push(None);
+                s.ix_gk.push(None);
+                s.ix_pooled.push(0);
+            }
+        }
+    }
+    if c.kind.contains(&crate::config::MixerKind::Hy4Indexed) {
+        s.ix_pos = Some(DeviceBuffer::zeroed(n * 3 * 4)?);
     }
     Ok(s)
 }
 
-/// One forward of the text graph. The first slice: iHC, the gated MLA with its sink (dense, the indexer comes
-/// later), the dense FFN of layer 0 and the head. The latent MoE and the Engram memories are not wired yet.
+/// Query rows scored per pass of the compressed indexer: bounds its score buffer to `IX_CHUNK * groups` floats,
+/// which at 262k of context is 16 MB instead of the whole prompt's worth.
+const IX_CHUNK: usize = 64;
+
+/// One step of the compressed indexer of an indexed layer (issue #40).
+///
+/// The token keys go into the layer's fp16 cache on every step (the reference caches them too, even below the
+/// budget); a group is pooled once, when its last token arrives, and rotated at its first token's position. Below
+/// `index_topk` the layer attends densely and nothing else runs (`None`), which is what the reference does: the
+/// indexer only pays off once the context outgrows the budget.
+///
+/// Above it, every query scores the groups that closed before it (`sum_h head_w * relu(q . pooled_key)`), keeps
+/// the `index_topk / pool - 1` best plus its own group, and the returned list is what its attention walks.
+fn indexer_step(
+    model: &crate::engine::Model,
+    ix: &Indexer,
+    sess: &mut crate::session::Session,
+    sc: &crate::session::Scratch,
+    li: usize,
+    q_resid: &DeviceBuffer,
+    block_in: &DeviceBuffer,
+    t: usize,
+    dump: &dyn Fn(&str, usize, &DeviceBuffer, usize) -> Result<()>,
+) -> Result<Option<DeviceBuffer>> {
+    use crate::engine::Act;
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let st = &model.stream;
+    let (dim, pool, nh, rope) = (h.index_dim, h.index_pool, h.index_heads, h.rope);
+    let (len, nkeys) = (sess.len, sess.len + t);
+    // Debug A/B (`MALLEUS_HY4_IX_OFF=1`): the indexed layers attend densely, as they did before the indexer.
+    if std::env::var("MALLEUS_HY4_IX_OFF").is_ok() {
+        return Ok(None);
+    }
+    let pooled = sess.ix_pooled[li];
+    let ncg = nkeys / pool;
+    let group_topk = h.index_topk / pool;
+    // The indexer's own norms multiply by the weight, so the kernels read them as f32 raw (no plus one).
+    {
+        let cache = sess.ix_tk[li].as_ref().context("hy4 indexer: token-key cache")?;
+        let tk = crate::session::f32s(t * dim)?;
+        model.gemm(
+            st,
+            &sc.xr,
+            &sc.xh,
+            &sc.xsc,
+            &tk,
+            Act::X(block_in),
+            &ix.token_key,
+            t,
+            false,
+        )?;
+        model.k.get("hy4_ix_keys").launch(
+            (t as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                cache.into(),
+                (&tk).into(),
+                (&ix.token_key_norm).into(),
+                len.into(),
+                t.into(),
+                dim.into(),
+                c.eps.into(),
+            ],
+        )?;
+        dump("ix_tk", li, &tk, t * dim)?;
+        if ncg > pooled {
+            let gk = sess.ix_gk[li].as_ref().context("hy4 indexer: group-key cache")?;
+            let ng = ncg - pooled;
+            model.k.get("hy4_ix_pool").launch(
+                (ng as u32, 1, 1),
+                (dim as u32, 1, 1),
+                ((pool * dim + 128) * 4) as u32,
+                st,
+                &[
+                    gk.into(),
+                    cache.into(),
+                    (&ix.value).into(),
+                    (&ix.gate).into(),
+                    (&ix.intra_ape).into(),
+                    (&ix.key_norm).into(),
+                    pooled.into(),
+                    ng.into(),
+                    dim.into(),
+                    pool.into(),
+                    c.eps.into(),
+                ],
+            )?;
+            let pos = sess.ix_pos.as_ref().context("hy4 indexer: positions")?;
+            model.k.get("hy4_ix_krope").launch(
+                ((ng * (rope / 2)).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    gk.into(),
+                    pos.into(),
+                    pooled.into(),
+                    ng.into(),
+                    pool.into(),
+                    dim.into(),
+                    rope.into(),
+                    h.mrope_section[1].into(),
+                    h.mrope_section[2].into(),
+                    h.theta_indexed.into(),
+                ],
+            )?;
+            // The group keys are fp16 in the cache: the dump goes through the cast the other caches use.
+            if std::env::var("MALLEUS_HY4_TRACE").is_ok()
+                && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR")
+            {
+                let f = crate::session::f32s(ncg * dim)?;
+                model.ew(
+                    st,
+                    "hy4_cast_f32",
+                    ncg * dim,
+                    &[(&f).into(), gk.into(), (ncg * dim).into()],
+                )?;
+                let v: Vec<f32> = f.download(ncg * dim)?;
+                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join(format!("IX{li}_gk.f32")), bytes)?;
+            }
+        }
+    }
+    if ncg > pooled {
+        sess.ix_pooled[li] = ncg;
+    }
+    let force_all = std::env::var("MALLEUS_HY4_IX_ALL").is_ok();
+    if nkeys <= h.index_topk && !force_all {
+        return Ok(None);
+    }
+    let gk = sess.ix_gk[li].as_ref().context("hy4 indexer: group-key cache")?;
+    // The query: `query_projection` of the q_a latent, rotated at the token's own position (the same M-RoPE).
+    let qd = nh * dim;
+    let iq = crate::session::f32s(t * qd)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &iq, Act::X(q_resid), &ix.query, t, false)?;
+    model.k.get("hy4_ix_qrope").launch(
+        ((t * nh * (rope / 2)).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            (&iq).into(),
+            (&sc.pos).into(),
+            t.into(),
+            nh.into(),
+            dim.into(),
+            rope.into(),
+            h.mrope_section[1].into(),
+            h.mrope_section[2].into(),
+            h.theta_indexed.into(),
+        ],
+    )?;
+    dump("ix_q", li, &iq, t * qd)?;
+    let hw = crate::session::f32s(t * nh)?;
+    model.gemm(
+        st,
+        &sc.xr,
+        &sc.xh,
+        &sc.xsc,
+        &hw,
+        Act::X(block_in),
+        &ix.head_weight,
+        t,
+        false,
+    )?;
+    // `MALLEUS_HY4_IX_ALL` recalls every closed group (the list outgrows the budget): the sparse path then has to
+    // reproduce the dense one, which is how the kernel is checked against the attention already verified.
+    let slots = if force_all { ncg + 1 } else { group_topk };
+    let nsel = if force_all { ncg } else { group_topk - 1 };
+    let mut list = DeviceBuffer::alloc(t * slots * 4)?;
+    let keys = DeviceBuffer::alloc(IX_CHUNK.min(t) * ncg.max(1) * 4)?;
+    let scale = 1.0f32 / ((nh * dim) as f32).sqrt();
+    for ti0 in (0..t).step_by(IX_CHUNK) {
+        let nq = IX_CHUNK.min(t - ti0);
+        if force_all {
+            let mut flat = vec![-1i32; nq * slots];
+            for i in 0..nq {
+                let own = (len + ti0 + i) / pool;
+                for g in 0..own.min(slots) {
+                    flat[i * slots + g] = g as i32;
+                }
+                if own < slots {
+                    flat[i * slots + own] = own as i32;
+                }
+            }
+            list.upload_at(ti0 * slots * 4, &flat)?;
+            continue;
+        }
+        model.k.get("hy4_ix_score").launch(
+            (ncg.div_ceil(256) as u32, nq as u32, 1),
+            (256, 1, 1),
+            ((nh * dim + nh) * 4) as u32,
+            st,
+            &[
+                (&keys).into(),
+                (&iq).into(),
+                gk.into(),
+                (&hw).into(),
+                len.into(),
+                ti0.into(),
+                ncg.into(),
+                nq.into(),
+                nh.into(),
+                dim.into(),
+                pool.into(),
+                scale.into(),
+            ],
+        )?;
+        // Debug: the order-preserving scores of this chunk, appended in query order, so the selection can be
+        // compared against the reference's own logits (the transform is inverted in ref_indexer_replay.py).
+        if std::env::var("MALLEUS_HY4_TRACE").is_ok()
+            && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR")
+        {
+            use std::io::Write;
+            let v: Vec<u32> = keys.download(nq * ncg)?;
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = std::path::Path::new(&dir).join(format!("IX{li}_keys.bin"));
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p)?;
+            f.write_all(&bytes)?;
+        }
+        model.k.get("hy4_ix_select").launch(
+            (nq as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&list).into(),
+                (&keys).into(),
+                len.into(),
+                ti0.into(),
+                pool.into(),
+                ncg.into(),
+                nsel.into(),
+                slots.into(),
+            ],
+        )?;
+    }
+    if std::env::var("MALLEUS_HY4_TRACE").is_ok()
+        && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR")
+    {
+        dump("ix_hw", li, &hw, t * nh)?;
+        let v: Vec<i32> = list.download(t * slots)?;
+        let mut text = String::new();
+        for ti in 0..t {
+            let row: Vec<String> = v[ti * slots..][..slots].iter().map(|x| x.to_string()).collect();
+            text.push_str(&row.join(" "));
+            text.push('\n');
+        }
+        std::fs::write(std::path::Path::new(&dir).join(format!("IX{li}_list.txt")), text)?;
+        std::fs::write(
+            std::path::Path::new(&dir).join(format!("IX{li}_list_meta.txt")),
+            format!("{len} {t} {ncg} {nsel} {slots}"),
+        )?;
+    }
+    Ok(Some(list))
+}
+
+/// One forward of the text graph: iHC, the Engram memories, the gated MLA with its sink (dense below `index_topk`,
+/// over the recalled groups above it), the compressed indexer of the indexed layers, the latent MoE and the head.
 pub(crate) fn forward(
     model: &crate::engine::Model,
     sess: &mut crate::session::Session,
@@ -1961,6 +2264,17 @@ pub(crate) fn forward(
     };
     let max_pos = pos.iter().copied().max().unwrap_or(0) as i64;
     sc.upload_step(sess.len as i32, &ids, &pos)?;
+    // The indexer reads the position of every token slot (its group keys rotate at their first token), and the
+    // slots outlive the step, so they are kept beside the KV cache.
+    if let Some(ixp) = sess.ix_pos.as_mut() {
+        ensure!(
+            (sess.len + t) * 3 * 4 <= ixp.len(),
+            "hy4 indexer position cache too small ({} + {})",
+            sess.len,
+            t
+        );
+        ixp.copy_from(sess.len * 12, &sc.pos, 0, t * 12, st)?;
+    }
     model.k.get("embed_bf16").launch(
         (t as u32, 1, 1),
         (256, 1, 1),
@@ -2044,7 +2358,6 @@ pub(crate) fn forward(
             engram(model, e, &mut streams, tokens, t, &mut sc)?;
             dump("engram_out", li, &streams, t * sd)?;
         }
-        let (ckv, ckrot) = &sess.kv[li];
         // iHC pre-mix of the mixer, its norm, and the MLA projections.
         model.k.get("ihc_pre").launch(
             (t as u32, 1, 1),
@@ -2075,6 +2388,13 @@ pub(crate) fn forward(
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &q, Act::X(&hn), &a.q_b, t, false)?;
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &kva, Act::X(&hn2), &a.kv_a, t, false)?;
         dump("q", li, &q, t * qd)?;
+        dump("ix_qresid", li, &hn, t * h.q_lora)?;
+        // The compressed indexer of an indexed layer: `hn` is the q_a latent its query reads and `hn2` the block
+        // input its token keys and head weights read. `ix_list` is `Some` once the context outgrows `index_topk`.
+        let ix_list = match &a.indexer {
+            Some(ix) => indexer_step(model, ix, sess, &sc, li, &hn, &hn2, t, &dump)?,
+            None => None,
+        };
         model.k.get("hy4_rope").launch(
             ((t * (h.heads + 1) * (h.rope / 2)).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
@@ -2099,6 +2419,7 @@ pub(crate) fn forward(
                 .into(),
             ],
         )?;
+        let (ckv, ckrot) = &sess.kv[li];
         model.k.get("mla_cache_write").launch(
             ((t * (h.kv_lora + h.rope)).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
@@ -2185,29 +2506,60 @@ pub(crate) fn forward(
             crate::config::MixerKind::Hy4Sliding => h.window,
             _ => 0,
         };
-        model.k.get("hy4_mla_split").launch(
-            ((t * a.heads) as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[
-                (&part).into(),
-                (&qt).into(),
-                (&q).into(),
-                ckv.into(),
-                ckrot.into(),
-                sink.into(),
-                sess.len.into(),
-                t.into(),
-                a.heads.into(),
-                a.nope.into(),
-                h.kv_lora.into(),
-                a.rope.into(),
-                (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
-                nsplit.into(),
-                window.into(),
-            ],
-        )?;
+        if let Some(list) = &ix_list {
+            // The groups this query recalled (`index_topk / pool - 1` plus its own), or every closed one under
+            // `MALLEUS_HY4_IX_ALL`; the same split and merge as the dense path, one kernel over the list.
+            let slots = list.len() / (t * 4);
+            model.k.get("hy4_mla_split_ix").launch(
+                ((t * a.heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&part).into(),
+                    (&qt).into(),
+                    (&q).into(),
+                    ckv.into(),
+                    ckrot.into(),
+                    list.into(),
+                    sink.into(),
+                    sess.len.into(),
+                    t.into(),
+                    a.heads.into(),
+                    a.nope.into(),
+                    h.kv_lora.into(),
+                    a.rope.into(),
+                    (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                    nsplit.into(),
+                    h.index_pool.into(),
+                    slots.into(),
+                ],
+            )?;
+        } else {
+            model.k.get("hy4_mla_split").launch(
+                ((t * a.heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&part).into(),
+                    (&qt).into(),
+                    (&q).into(),
+                    ckv.into(),
+                    ckrot.into(),
+                    sink.into(),
+                    sess.len.into(),
+                    t.into(),
+                    a.heads.into(),
+                    a.nope.into(),
+                    h.kv_lora.into(),
+                    a.rope.into(),
+                    (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                    nsplit.into(),
+                    window.into(),
+                ],
+            )?;
+        }
         // The merge into a global buffer, then the V half of kv_b_proj and the gate: two kernels so that the
         // latent the V projection reads is the one written, not a block of shared memory.
         let lat_merged = crate::session::f32s(t * a.heads * h.kv_lora)?;
@@ -2407,7 +2759,7 @@ mod tests {
     const HY4: &str = r#"{
       "model_type": "hy_v4_flash_text",
       "hidden_size": 256, "num_hidden_layers": 4, "vocab_size": 1024,
-      "intermediate_size": 512, "rms_norm_eps": 1e-5,
+      "intermediate_size": 512, "moe_intermediate_size": 256, "rms_norm_eps": 1e-5,
       "num_attention_heads": 2, "q_lora_rank": 128, "kv_lora_rank": 512,
       "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
       "swa_num_attention_heads": 4, "swa_qk_nope_head_dim": 192,

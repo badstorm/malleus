@@ -511,6 +511,10 @@ impl Model {
             idx_list: None,
             ple_snap: None,
             ngram_prev: vec![],
+            ix_tk: vec![],
+            ix_gk: vec![],
+            ix_pooled: vec![],
+            ix_pos: None,
         };
         if let Some(ic) = &c.indexer {
             let idx_bufs = || -> Result<[DeviceBuffer; 3]> {
