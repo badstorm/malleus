@@ -718,9 +718,18 @@ impl Model {
         let big = c.inter.max(c.n_heads * c.head_dim * 2).max(c.lin_qkv_dim());
         let small = (c.n_heads * c.head_dim).max(c.lin_nv * c.lin_dv);
         // Widest GEMM input: also the hyper-connection streams and the PLE embedding.
+        // Hy4's sliding layers project to `heads * (nope + v)` (16384), wider than the Qwen widths: the GEMM input
+        // buffer must hold `t * k`.
+        let hy4_k = c.hy4.as_ref().map_or(0, |h| {
+            (h.heads * (h.nope + h.v))
+                .max(h.swa_heads * (h.swa_nope + h.swa_v))
+                .max(h.hc_mult * c.hidden)
+                .max(h.latent)
+        });
         let kmax = c
             .inter
             .max(c.hidden)
+            .max(hy4_k)
             .max(c.n_heads * c.head_dim)
             .max(c.stream_dim())
             .max(c.ple.as_ref().map_or(0, |p| p.dim));

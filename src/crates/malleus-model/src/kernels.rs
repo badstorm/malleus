@@ -193,7 +193,17 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
     ("kda", &["kda_scan", "kda_conv_norm"]),
     (
         "hy4",
-        &["ihc_pre", "ihc_res", "ihc_head", "hy4_rope", "hy4_attn", "hy4_cast_f32"],
+        &[
+            "ihc_pre",
+            "ihc_res",
+            "ihc_head",
+            "hy4_rope",
+            "hy4_attn",
+            "hy4_cast_f32",
+            "hy4_glu",
+            "hy4_moe_acc",
+            "hy4_expert_gemv",
+        ],
     ),
     (
         "mla",

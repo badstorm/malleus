@@ -92,6 +92,10 @@ pub struct Hy4Config {
     pub index_dim: usize,
     /// Width the routed experts run in (`routed_expert_hidden_size`), and the SwiGLU clamp of their activation.
     pub latent: usize,
+    /// Routed experts per layer, the experts a token takes, and their intermediate width.
+    pub experts: usize,
+    pub top_k: usize,
+    pub moe_inter: usize,
     pub swiglu_limit: f32,
     pub routed_scaling: f32,
     /// Per-layer FFN kind (`mlp_layer_types`): true where the FFN is a latent MoE, false for the dense layer.
