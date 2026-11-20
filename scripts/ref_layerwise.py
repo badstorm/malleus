@@ -374,6 +374,9 @@ def hy4_image(args, cfg, model_dir, shards, out_dev, blob, dump, dev):
     proc = AutoProcessor.from_pretrained(args.model)
     im = Image.open(args.vision).convert("RGB")
     im.thumbnail((512, 512))
+    blob_dir = Path(args.blob_dir)
+    blob_dir.joinpath("vision").mkdir(parents=True, exist_ok=True)
+    im.save(blob_dir / "vision" / (Path(args.vision).stem + "-input.png"))
     msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": args.ask}]}]
     chat = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     pi = proc(text=[chat], images=[im], return_tensors="pt")
