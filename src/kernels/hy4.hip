@@ -86,12 +86,14 @@ extern "C" __global__ void __launch_bounds__(256) hy4_rope(float* q, float* kv, 
     int axis = 0;
     if (f % 3 == 1 && f < sec_h * 3) axis = 1;
     else if (f % 3 == 2 && f < sec_w * 3) axis = 2;
+    // `apply_rotary_pos_emb` with the repeat-interleaved cos/sin rotates the ADJACENT pair (2f, 2f+1) with the
+    // frequency f, not (f, f + half): each half of the rope dims holds the two members of the 32 interleaved pairs.
     const float inv = 1.0f / powf(theta, (float)(2 * f) / (float)rd);
     const float ang = (float)pos[ti * 3 + axis] * inv;
     const float c = cosf(ang), s = sinf(ang);
-    const float x0 = p[f], x1 = p[f + half];
-    p[f] = x0 * c - x1 * s;
-    p[f + half] = x1 * c + x0 * s;
+    const float x0 = p[2 * f], x1 = p[2 * f + 1];
+    p[2 * f] = x0 * c - x1 * s;
+    p[2 * f + 1] = x1 * c + x0 * s;
 }
 
 // Gated MLA with the learned sink. One block per (head, token): `nv` threads, dynamic shared of `nk` scores plus
@@ -251,7 +253,10 @@ extern "C" __global__ void __launch_bounds__(256) hy4_expert_gemv(float* y, cons
 __device__ __forceinline__ float hy4_bf(unsigned short v) { return __uint_as_float((unsigned)v << 16); }
 __device__ __forceinline__ float h2f(__half v) { return __half2float(v); }
 __device__ __forceinline__ float warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_down(v, o);
+    // The butterfly keeps every lane in range: `__shfl_down` at o=16 asks lanes 16..31 for lane+16 (>= 32),
+    // whose value is undefined on gfx11 and was observed as 0, leaving each lane with a partial sum of its own
+    // 16-dim chunk and a different softmax weight.
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o);
     return v;
 }
 

@@ -2116,6 +2116,17 @@ pub(crate) fn forward(
                 h.rope.into(),
             ],
         )?;
+        // Post-rope query and rotated key dims, for the score reconstruction against the reference replay.
+        dump("q_rot", li, &q, t * qd)?;
+        if std::env::var("MALLEUS_HY4_DUMP_KROT").is_ok() {
+            model.ew(
+                st,
+                "hy4_cast_f32",
+                t * h.rope,
+                &[(&sc.big1).into(), ckrot.into(), (t * h.rope).into()],
+            )?;
+            dump("krot", li, &sc.big1, t * h.rope)?;
+        }
         // Absorbed MLA: `kv_b`'s QK half is folded into the query once per token and head, the split walks the cached
         // latents (the sliding layers only the last `window` of them), and the combine applies its V half and the gate.
         let nsplit = 8usize;

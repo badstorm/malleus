@@ -56,6 +56,11 @@ def hy4_attn_trace(a, x, mask, pe, blobs: Path, tag: str):
         k_pass = a.kv_a_layernorm(kv_pass).view(B, 1, T, kv)
         k_rot = k_rot.view(B, 1, T, rope)
         cos, sin = pe
+        print("shapes: cos", tuple(cos.shape), "sin", tuple(sin.shape), "q_rot_in", tuple(q_rot.shape), flush=True)
+        import os as _os
+        if _os.environ.get("DUMP_ROT"):
+            save_f32(blobs / f"{tag}_cos.f32", cos)
+            save_f32(blobs / f"{tag}_sin.f32", sin)
         q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
 
         # The engine dumps its query before the rotation: keep that stage too, to compare like with like.
@@ -100,7 +105,9 @@ def hy4_attn_trace(a, x, mask, pe, blobs: Path, tag: str):
         attn = torch.matmul(p, value_states)  # [B, nh, T, v]
         save("attn_raw", attn.transpose(1, 2).reshape(B, T, nh * v))
         attn = attn * torch.sigmoid(gate_states.transpose(1, 2))
-        save("gate", gate_states.transpose(1, 2).reshape(B, T, nh * v))
+        # gate_states is [B, T, nh, V] (not [B, nh, T, V] like the query space): no transpose, or the file is
+        # head-major and every comparison reads the wrong (token, head) pair.
+        save("gate", gate_states.reshape(B, T, nh * v))
         save("attn_gated", attn.transpose(1, 2).reshape(B, T, nh * v))
         attn = attn.transpose(1, 2).reshape(B, T, -1).contiguous()
         return a.post_proj_norm(a.o_proj(attn))
