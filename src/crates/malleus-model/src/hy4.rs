@@ -179,6 +179,7 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         sparse,
         engram,
         vision,
+        image_token: cfg["image_token_id"].as_u64().unwrap_or(0) as u32,
     };
     let c = Config {
         hidden: u("hidden_size")?,
@@ -1052,6 +1053,55 @@ fn moe(
     Ok(normed)
 }
 
+/// The 3-D positions of a prompt that carries images, as `get_rope_index` builds them: text grows by one on all
+/// three planes; an image block is `t` frames of `h/merge` rows of `w/merge + 1` tokens (every merged row ends
+/// with a newline), all three planes offset by the block's start; the text after it continues at the block's
+/// maximum plus one.
+pub(crate) fn image_positions(
+    tokens: &[u32],
+    image_token: u32,
+    merge: usize,
+    grids: &[(usize, usize, usize)],
+) -> Result<Vec<[i32; 3]>> {
+    ensure!(merge > 0, "bad merge size");
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut pos: i32 = 0;
+    let mut img = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] != image_token {
+            out.push([pos; 3]);
+            pos += 1;
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < tokens.len() && tokens[i] == image_token {
+            i += 1;
+        }
+        let (gt, gh, gw) = *grids.get(img).context("more image blocks than images")?;
+        img += 1;
+        let (hm, wm) = (gh / merge, gw / merge);
+        ensure!(hm > 0 && wm > 0, "image grid smaller than the merge size");
+        let rows = gt * hm * (wm + 1);
+        ensure!(i - start == rows, "image block {} tokens, grid wants {rows}", i - start);
+        let block = hm.max(wm + 1) as i32;
+        let mut mx = pos;
+        for t in 0..gt as i32 {
+            let base = pos + t * block;
+            for r in 0..hm as i32 {
+                for c in 0..wm as i32 + 1 {
+                    out.push([base, base + r, base + c]);
+                    mx = mx.max(base + r).max(base + c);
+                }
+            }
+        }
+        pos = mx + 1;
+    }
+    ensure!(img == grids.len(), "fewer image blocks than images");
+    Ok(out)
+}
+
 /// The precision `nn.RMSNorm` uses when its eps is left to the dtype (the Engram norms do that).
 const BF16_EPS: f32 = 0.0;
 
@@ -1205,6 +1255,10 @@ fn engram(
             }
             let g = dot / nh.sqrt();
             let g = 1.0 / (1.0 + (-(g.abs().max(1e-6).sqrt() * g.signum())).exp());
+            if tokens[ti] == h.image_token {
+                // A visual placeholder has no token to hash: the memory contributes nothing there.
+                continue;
+            }
             for i in 0..hidden {
                 out[(ti * hc + s) * hidden + i] = gamma[i] * (g + e.scales[s][i]);
             }
@@ -1698,9 +1752,52 @@ pub(crate) fn forward(
     let st = &model.stream;
     let mut sc = model.scratch(t)?;
     let ids: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
-    let pos: Vec<i32> = match positions {
-        Some(p) => p.iter().flatten().copied().collect(),
-        None => (0..t).flat_map(|i| [(sess.next_pos + i as i64) as i32; 3]).collect(),
+    // An image prompt: the merged features replace the placeholder rows and the positions are the 3-D M-RoPE
+    // ones (an image block is a rectangle of patches with a newline column, not a run of positions).
+    let merge = h.vision.as_ref().map_or(2, |v| v.merge);
+    let mut image: Option<(usize, usize, Vec<f32>)> = None;
+    if let Ok(f) = std::env::var("MALLEUS_HY4_IMAGE_FEATURES") {
+        let g = std::env::var("MALLEUS_HY4_IMAGE_GRID").context("MALLEUS_HY4_IMAGE_GRID")?;
+        let d: Vec<usize> = g
+            .split('x')
+            .map(|v| v.parse::<usize>().context("grid as TxHxW"))
+            .collect::<Result<_>>()?;
+        ensure!(d.len() == 3, "grid as TxHxW");
+        let start = tokens
+            .iter()
+            .position(|&x| x == h.image_token)
+            .context("no image placeholder in the prompt")?;
+        let rows = d[0] * (d[1] / merge) * (d[2] / merge + 1);
+        let bytes = std::fs::read(&f)?;
+        let v: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        ensure!(v.len() >= rows * c.hidden, "image features too small");
+        image = Some((start, rows, v));
+    }
+    let pos: Vec<i32> = match (&image, positions) {
+        (Some((_, _, _)), _) => {
+            let g = std::env::var("MALLEUS_HY4_IMAGE_GRID").context("MALLEUS_HY4_IMAGE_GRID")?;
+            let d: Vec<usize> = g.split('x').filter_map(|v| v.parse().ok()).collect();
+            let p3 = image_positions(tokens, h.image_token, merge, &[(d[0], d[1], d[2])])?;
+            if std::env::var("MALLEUS_HY4_TRACE").is_ok()
+                && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR")
+            {
+                let mut text = String::new();
+                for plane in 0..3 {
+                    let line: Vec<String> = p3.iter().map(|p| p[plane].to_string()).collect();
+                    text.push_str(&line.join(" "));
+                    text.push('\n');
+                }
+                std::fs::write(std::path::Path::new(&dir).join("V_pos.txt"), text)?;
+            }
+            p3.iter().flatten().copied().collect()
+        }
+        (None, Some(p)) => p.iter().flatten().copied().collect(),
+        (None, None) => (0..t).flat_map(|i| [(sess.next_pos + i as i64) as i32; 3]).collect(),
     };
     let max_pos = pos.iter().copied().max().unwrap_or(0) as i64;
     sc.upload_step(sess.len as i32, &ids, &pos)?;
@@ -1711,6 +1808,10 @@ pub(crate) fn forward(
         st,
         &[(&sc.x).into(), (&model.embed).into(), (&sc.ids).into(), c.hidden.into()],
     )?;
+    if let Some((start, rows, feat)) = &image {
+        let buf = DeviceBuffer::from_slice(feat)?;
+        sc.x.copy_from(start * c.hidden * 4, &buf, 0, rows * c.hidden * 4, st)?;
+    }
     // The streams are the embedding repeated `hc_mult` times.
     let sd = h.hc_mult * c.hidden;
     let mut streams = crate::session::f32s(t * sd)?;

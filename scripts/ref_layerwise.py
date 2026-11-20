@@ -324,6 +324,27 @@ def hy4_vision(args, cfg, model_dir, src_dev):
     blob.joinpath("vision", f"{img.stem}-grid.txt").write_text("%dx%d" % (int(grid[0][1]), int(grid[0][2])))
     save_f32(blob / "vision" / f"{img.stem}-tower.f32", tower_out[0].float())
     save_f32(blob / "vision" / f"{img.stem}-merged.f32", merged[0].float())
+    # The prompt the image goes with, and the M-RoPE positions the model derives from it.
+    import types
+
+    msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe this image."}]}]
+    chat = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    pi = proc(text=[chat], images=[im], return_tensors="pt")
+    ids = pi["input_ids"][0].tolist()
+    types_ids = pi["mm_token_type_ids"][0].tolist()
+    blob = Path(args.blob_dir)
+    blob.joinpath("vision", f"{img.stem}-prompt.txt").write_text(
+        " ".join(str(v) for v in ids) + "\n" + " ".join(str(v) for v in types_ids) + "\n"
+    )
+    ns = types.SimpleNamespace(config=AutoConfig.from_pretrained(args.model))
+    ns.get_vision_position_ids = types.MethodType(V.HYV4VLModel.get_vision_position_ids, ns)
+    pos, _ = V.HYV4VLModel.get_rope_index(
+        ns, pi["input_ids"], image_grid_thw=pi["image_grid_thw"], video_grid_thw=None,
+        attention_mask=None, mm_token_type_ids=pi["mm_token_type_ids"],
+    )
+    lines = "\n".join(" ".join(str(int(v)) for v in pos[p][0].tolist()) for p in range(3))
+    blob.joinpath("vision", f"{img.stem}-positions.txt").write_text(lines + "\n")
+    print("prompt", len(ids), "tokens, image rows", sum(1 for t in types_ids if t == 1), flush=True)
     print(
         "vision tower %s rms %.5f | merged %s rms %.5f"
         % (
@@ -334,6 +355,131 @@ def hy4_vision(args, cfg, model_dir, src_dev):
         ),
         flush=True,
     )
+
+
+def hy4_image(args, cfg, model_dir, shards, out_dev, blob, dump, dev):
+    """One image prompt through the whole text model, layer by layer: the golden for the engine's image path."""
+    import types
+
+    import torch
+    from transformers import AutoConfig, AutoProcessor
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+    from transformers.models.hy_v4_flash import modeling_hy_v4_flash as H
+    from transformers.models.hy_v4_vl import modeling_hy_v4_vl as V
+    from PIL import Image
+
+    full = AutoConfig.from_pretrained(args.model)
+    vcfg = full.vision_config
+    vcfg._attn_implementation = "eager"
+    proc = AutoProcessor.from_pretrained(args.model)
+    im = Image.open(args.vision).convert("RGB")
+    im.thumbnail((512, 512))
+    msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": args.ask}]}]
+    chat = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    pi = proc(text=[chat], images=[im], return_tensors="pt")
+    ids = pi["input_ids"]
+    grid = pi["image_grid_thw"]
+    torch.set_default_dtype(torch.bfloat16)
+    with torch.device("meta"):
+        tower = V.HYV4VLVisionModel(vcfg)
+    tower = tower.to_empty(device=dev).eval()
+    sd = tower.state_dict()
+    for k in sd:
+        name = k
+        for a, b in VISION_RENAME.items():
+            name = name.replace(a, b)
+        with torch.no_grad():
+            sd[k].copy_(shards.get("vit." + name))
+    with torch.no_grad():
+        feats = tower(pi["pixel_values"].to(dev).to(torch.bfloat16), grid).pooler_output[0]
+    print("image prompt", ids.shape[1], "tokens, image features", tuple(feats.shape), flush=True)
+
+    ns = types.SimpleNamespace(config=full)
+    ns.get_vision_position_ids = types.MethodType(V.HYV4VLModel.get_vision_position_ids, ns)
+    pos, _ = V.HYV4VLModel.get_rope_index(
+        ns, ids, image_grid_thw=grid, video_grid_thw=None, attention_mask=None,
+        mm_token_type_ids=pi["mm_token_type_ids"],
+    )
+    x_cpu = ids[0]
+    x = x_cpu.to(dev)
+    pos = pos.to(dev)
+    # The module's scatter: the merged features replace the placeholder rows of the embedding.
+    pre = "model."
+    emb = shards.get(pre + "embed_tokens.weight")[x_cpu].unsqueeze(0).to(dev)
+    mask = (x == full.image_token_id)
+    emb = emb.masked_scatter(mask.unsqueeze(-1).unsqueeze(0), feats.unsqueeze(0))
+    ngram = None
+    if cfg.engram_layer_ids is not None:
+        shifted = []
+        for o in range(cfg.engram_max_ngram_size):
+            prev = torch.nn.functional.pad(x.unsqueeze(0), (o, 0), value=cfg.engram_pad_id)[:, : x.shape[0]]
+            shifted.append(torch.where(torch.arange(x.shape[0], device=dev) < o, torch.tensor(cfg.engram_pad_id, device=dev), prev))
+        ngram = torch.stack(shifted, dim=-1)
+    engram_mask = ((x != full.image_token_id) & (x != cfg.engram_pad_id)).unsqueeze(0)
+    pe = {}
+    rot = H.HYV4FlashRotaryEmbedding(cfg).to(dev).eval()
+    with torch.no_grad():
+        for lt in rot.layer_types:
+            pe[lt] = rot(emb, position_ids=pos, layer_type=lt)
+        mk = {
+            "config": cfg,
+            "inputs_embeds": emb,
+            "attention_mask": None,
+            "cache": None,
+            "position_ids": pos[0],
+            "allow_is_causal_skip": False,
+        }
+        masks = {
+            "indexed_attention": create_causal_mask(**mk),
+            "sliding_attention": create_sliding_window_causal_mask(**mk),
+        }
+        h = emb.unsqueeze(2).expand(-1, -1, cfg.hc_mult, -1).contiguous()
+        t0 = time.time()
+        for i in range(cfg.num_hidden_layers):
+            with torch.device("meta"):
+                layer = H.HYV4FlashDecoderLayer(cfg, i)
+            layer = layer.to_empty(device=dev)
+            for name, p in layer.named_parameters():
+                if any(k in name for k in KEEP_FP32):
+                    p.data = p.data.float()
+            prefix = f"{pre}layers.{i}."
+            skip = ()
+            el = layer.engram_layer
+            if el is not None:
+                sizes = [s for order in cfg.engram_layer_head_vocab_sizes[str(i + 1)] for s in order]
+                el.multi_head_embedding = HostEngramEmbedding(
+                    shards, prefix + "engram_layer.multi_head_embedding.embedding.weight", sizes,
+                    cfg.engram_n_embed_per_ngram // cfg.engram_n_head_per_ngram, dev,
+                )
+                skip = ("multi_head_embedding.embedding.weight",)
+            load_module(layer, shards, prefix, skip, HY4_RENAME)
+            if el is not None:
+                el.head_vocab_sizes = torch.tensor(sizes, device=dev)
+                el.multi_head_embedding.offsets = torch.tensor([0] + sizes[:-1], device=dev).cumsum(0).to(torch.long)
+                el.multi_head_embedding.head_vocab_sizes = el.head_vocab_sizes
+                el.lookup_table = shards.get(prefix + "engram_layer.lookup_table").to(dev)
+                el.hash_multipliers = el.draw_hash_multipliers(int(el.lookup_table.max()) + 1).to(dev)
+            layer.eval()
+            at = layer.attention_type
+            h = layer(h, attention_mask=masks[at], position_embeddings=pe[at], position_ids=pos, cache=None,
+                      indexer_position_ids=pos, ngram_tokens=ngram, engram_mask=engram_mask)
+            del layer
+            torch.cuda.empty_cache()
+            print(f"layer {i} done, {time.time() - t0:.0f}s", flush=True)
+        with torch.device("meta"):
+            head = H.HYV4FlashHyperHead(cfg)
+            norm = H.HYV4FlashRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        head, norm = head.to_empty(device=dev), norm.to_empty(device=dev)
+        for p in head.parameters():
+            p.data = p.data.float()
+        load_module(head, shards, pre + "hc_head.", rename={"hc_fn": "hc_head_fn", "hc_scale": "hc_head_scale", "hc_base": "hc_head_base"})
+        load_module(norm, shards, pre, rename={"weight": "norm.weight"})
+        head.eval()
+        lm = shards.get("lm_head.weight").to(dev).float()
+        hn = norm(head(h))
+        logits = hn[0].float() @ lm.T
+        save_f32(blob / "image" / "logits_last.f32", logits[-1])
+        print("image logits", tuple(logits.shape), flush=True)
 
 
 def hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev):
@@ -523,6 +669,7 @@ def main():
     ap.add_argument("--layers", type=int, default=0, help="run only the first N layers (debug)")
     ap.add_argument("--only", default="", help="comma-separated prompt ids to run (default: all)")
     ap.add_argument("--vision", default=None, help="run only the vision tower on this image (hy4)")
+    ap.add_argument("--ask", default=None, help="with --vision: run the whole model on the image and this question")
     args = ap.parse_args()
 
     import transformers
@@ -546,6 +693,9 @@ def main():
     seqs = sequences(tok, args, chat=not family_hy4)
     torch.set_default_dtype(torch.bfloat16)
     if family_hy4:
+        if args.vision and args.ask:
+            hy4_image(args, cfg, model_dir, shards, dev, blob, dump, dev)
+            return
         if args.vision:
             hy4_vision(args, cfg, model_dir, dev)
             return
