@@ -209,6 +209,10 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "hy4_add",
             "hy4_vit_attn",
             "hy4_merge_pack",
+            "hy4_absorb",
+            "hy4_mla_split",
+            "hy4_mla_merge",
+            "hy4_mla_v",
         ],
     ),
     (

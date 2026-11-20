@@ -249,6 +249,11 @@ extern "C" __global__ void __launch_bounds__(256) hy4_expert_gemv(float* y, cons
 // The vision tower: LayerNorm (with bias, mean subtracted), exact GELU, bias and residual adds, the full
 // per-image attention of the ViT, and the 2x2 pack the patch merger's convolution reads.
 __device__ __forceinline__ float hy4_bf(unsigned short v) { return __uint_as_float((unsigned)v << 16); }
+__device__ __forceinline__ float h2f(__half v) { return __half2float(v); }
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down(v, o);
+    return v;
+}
 
 extern "C" __global__ void __launch_bounds__(256) hy4_ln(float* out, const float* x, const unsigned short* w,
                                                          const unsigned short* b, int n) {
@@ -355,4 +360,127 @@ extern "C" __global__ void __launch_bounds__(256) hy4_merge_pack(float* out, con
     const int dy = pos / 2, dx = pos % 2;
     const int src = (((row * 2 + dy) * cols * 2) + col * 2 + dx) * hidden + ch;
     out[(size_t)mp * hidden * 4 + ch * 4 + dy * 2 + dx] = x[src];
+}
+
+// Absorbed MLA. The cache holds the latent (512) and the rotated dims (64); `kv_b_proj` is read once into the query
+// instead of expanding K and V for every token, so a step costs 1.1 KiB per cached token and not `heads * (nope + v)`.
+// The per-head stride of `kv_b` is `nope + v` (Hy4's V is wider than its nope), which is where Ling's kernels differ.
+extern "C" __global__ void __launch_bounds__(256) hy4_absorb(float* qt, const float* q, const float* wkb, int t,
+                                                            int nh, int nope, int kv, int rd, int vo) {
+    const int wl = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int w = blockIdx.x * 8 + wl;
+    if (w >= t * nh) return;
+    const int ti = w / nh, h = w % nh;
+    const int d0 = lane * 16;
+    const float* qh = q + (size_t)ti * nh * (nope + rd) + (size_t)h * (nope + rd);
+    const float* wk = wkb + (size_t)h * vo * kv;
+    float acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.f;
+    for (int n = 0; n < nope; ++n) {
+        const float qn = qh[n];
+        const float* row = wk + (size_t)n * kv + d0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) acc[i] += qn * row[i];
+    }
+    float* dst = qt + (size_t)w * kv + d0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) dst[i] = acc[i];
+}
+
+// One split of one (token, head): the block's eight warps split the token's keys, each with an online softmax and the
+// weighted latent. The learned sink joins as one extra key, only in the first split.
+extern "C" __global__ void __launch_bounds__(256) hy4_mla_split(float* part, const float* qt, const float* q,
+                                                               const __half* ckv, const __half* krot,
+                                                               const float* sinh, int len, int t, int nh, int nope,
+                                                               int kv, int rd, float scale, int nsplit, int window) {
+    __shared__ float qr[8][64];
+    const int wl = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int th = blockIdx.x;
+    const int ti = th / nh, h = th % nh;
+    const int split = wl;
+    const int d0 = lane * 16;
+    const float* qh = q + (size_t)ti * nh * (nope + rd) + (size_t)h * (nope + rd);
+    float qtv[16];
+    const float* qts = qt + (size_t)th * kv + d0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) qtv[i] = qts[i];
+    if (lane < 2) {
+        for (int r = lane * 32; r < (lane + 1) * 32 && r < rd; ++r) qr[wl][r] = qh[nope + r];
+    }
+    __syncwarp();
+    const int nkeys = len + ti + 1;
+    const int per = (nkeys + nsplit - 1) / nsplit;
+    // The sliding layers see only the last `window` keys, counting the query's own position.
+    const int first = window > 0 ? max(0, nkeys - window) : 0;
+    const int k0 = max(first, split * per), k_end = min(nkeys, k0 + per);
+    float m = split == 0 ? sinh[h] : -INFINITY;
+    float l = split == 0 ? 1.f : 0.f;
+    float acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.f;
+    for (int j = k0; j < k_end; ++j) {
+        const __half* ck = ckv + (size_t)j * kv + d0;
+        float s = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) s += qtv[i] * h2f(ck[i]);
+        for (int r = lane * 2; r < (lane + 1) * 2 && r < rd; ++r) s += qr[wl][r] * h2f(krot[(size_t)j * rd + r]);
+        s = warp_sum(s) * scale;
+        const float mn = fmaxf(m, s);
+        const float f = expf(m - mn);
+        const float p = expf(s - mn);
+        l = l * f + p;
+        m = mn;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) acc[i] = acc[i] * f + p * h2f(ck[i]);
+    }
+    float* dst = part + ((size_t)th * nsplit + split) * (kv + 2);
+    if (lane == 0) {
+        dst[0] = m;
+        dst[1] = l;
+    }
+#pragma unroll
+    for (int i = 0; i < 16; ++i) dst[2 + d0 + i] = acc[i];
+}
+
+// Merge the splits of one (token, head) into the weighted latent, in a global buffer. The sink stays in the
+// denominator: the probabilities do not renormalise after it is dropped.
+extern "C" __global__ void __launch_bounds__(256) hy4_mla_merge(float* lat_out, const float* part, int kv,
+                                                               int nsplit) {
+    const int th = blockIdx.x;
+    const int d = threadIdx.x;
+    const float* src = part + (size_t)th * nsplit * (kv + 2);
+    float M = -INFINITY;
+    for (int i = 0; i < nsplit; ++i) M = fmaxf(M, src[(size_t)i * (kv + 2)]);
+    float L = 0.f;
+    for (int i = 0; i < nsplit; ++i) {
+        const float mi = src[(size_t)i * (kv + 2)];
+        if (mi == -INFINITY) continue;
+        L += src[(size_t)i * (kv + 2) + 1] * expf(mi - M);
+    }
+    float a = 0.f, b = 0.f;
+    for (int i = 0; i < nsplit; ++i) {
+        const float mi = src[(size_t)i * (kv + 2)];
+        if (mi == -INFINITY) continue;
+        const float f = expf(mi - M);
+        a += src[(size_t)i * (kv + 2) + 2 + d] * f;
+        b += src[(size_t)i * (kv + 2) + 2 + d + 256] * f;
+    }
+    lat_out[(size_t)th * kv + d] = L > 0.f ? a / L : 0.f;
+    if (d + 256 < kv) lat_out[(size_t)th * kv + d + 256] = L > 0.f ? b / L : 0.f;
+}
+
+// The V half of `kv_b_proj` for one (token, head) of the merged latent, times the per-(head, dim) output gate.
+extern "C" __global__ void __launch_bounds__(256) hy4_mla_v(float* out, const float* lat_out, const float* wkb,
+                                                           const float* gate, int nh, int nope, int v, int kv) {
+    const int th = blockIdx.x;
+    const int h = th % nh;
+    const int d = threadIdx.x;
+    if (d >= v) return;
+    const float* row = wkb + (size_t)h * (nope + v) * kv + (size_t)(nope + d) * kv;
+    const float* lat = lat_out + (size_t)th * kv;
+    float sum = 0.f;
+    for (int c = 0; c < kv; ++c) sum += row[c] * lat[c];
+    const size_t o = (size_t)th * v + d;
+    out[o] = sum * (1.f / (1.f + expf(-gate[o])));
 }
