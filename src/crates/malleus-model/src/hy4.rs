@@ -1053,6 +1053,113 @@ fn moe(
     Ok(normed)
 }
 
+/// The processor's `smart_resize`: both sides a multiple of `patch * merge`, inside the pixel budget. It rounds
+/// halves to even, like Python's `round`.
+pub(crate) fn smart_resize(h: usize, w: usize, factor: usize, min_pixels: usize, max_pixels: usize) -> (usize, usize) {
+    let (hf, wf) = (h as f64, w as f64);
+    let f = factor as f64;
+    let mut hb = (hf / f).round_ties_even() as usize * factor;
+    let mut wb = (wf / f).round_ties_even() as usize * factor;
+    if hb * wb > max_pixels {
+        let beta = (hf * wf / max_pixels as f64).sqrt();
+        hb = ((hf / beta / f).floor().max(1.0) as usize) * factor;
+        wb = ((wf / beta / f).floor().max(1.0) as usize) * factor;
+    } else if hb * wb < min_pixels {
+        let beta = (min_pixels as f64 / (hf * wf)).sqrt();
+        hb = ((hf * beta / f).ceil() as usize) * factor;
+        wb = ((wf * beta / f).ceil() as usize) * factor;
+    }
+    (hb.max(factor), wb.max(factor))
+}
+
+/// The weights of one PIL resample pass: for every output position, the first input index and the filter weights
+/// around it (the triangle filter with its support widened by the reduction).
+fn resample_weights(in_len: usize, out_len: usize) -> Vec<(usize, Vec<f64>, f64)> {
+    let scale = in_len as f64 / out_len as f64;
+    let fscale = scale.max(1.0);
+    let support = fscale;
+    (0..out_len)
+        .map(|o| {
+            let center = (o as f64 + 0.5) * scale;
+            let lo = ((center - support + 0.5).floor() as isize).max(0) as usize;
+            let hi = (((center + support + 0.5).floor() as isize).max(0) as usize).min(in_len);
+            let mut ws = Vec::with_capacity(hi.saturating_sub(lo));
+            let mut total = 0.0f64;
+            for i in lo..hi {
+                let x = ((i as f64 - center + 0.5) / fscale).abs();
+                let w = (1.0 - x).max(0.0);
+                total += w;
+                ws.push(w);
+            }
+            (lo, ws, total)
+        })
+        .collect()
+}
+
+/// PIL's bilinear resize of an `u8` image with `c` interleaved channels: horizontal then vertical, each pass
+/// rounded back to `u8` the way PIL's 8-bit resampler is.
+fn resize_u8(src: &[u8], h: usize, w: usize, nh: usize, nw: usize, c: usize) -> Vec<u8> {
+    let wh = resample_weights(w, nw);
+    let mut mid = vec![0u8; h * nw * c];
+    for y in 0..h {
+        for (o, (lo, ws, total)) in wh.iter().enumerate() {
+            for ch in 0..c {
+                let mut acc = 0.0f64;
+                for (k, &wt) in ws.iter().enumerate() {
+                    acc += src[(y * w + lo + k) * c + ch] as f64 * wt;
+                }
+                let v = if *total > 0.0 { acc / total } else { 0.0 };
+                mid[(y * nw + o) * c + ch] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    let wv = resample_weights(h, nh);
+    let mut out = vec![0u8; nh * nw * c];
+    for (o, (lo, ws, total)) in wv.iter().enumerate() {
+        for x in 0..nw {
+            for ch in 0..c {
+                let mut acc = 0.0f64;
+                for (k, &wt) in ws.iter().enumerate() {
+                    acc += mid[((lo + k) * nw + x) * c + ch] as f64 * wt;
+                }
+                let v = if *total > 0.0 { acc / total } else { 0.0 };
+                out[(o * nw + x) * c + ch] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// The processor: smart resize, bilinear resize, rescale and normalise to `[-1, 1]` (mean and std 0.5), and the
+/// row-major patches of `patch x patch` in `(channel, y, x)` order. Returns the flat patch tensor and the patch
+/// grid.
+pub(crate) fn preprocess(rgb: &[u8], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize)> {
+    const PATCH: usize = 16;
+    const MERGE: usize = 2;
+    const MIN_PIXELS: usize = 4096;
+    const MAX_PIXELS: usize = 4194304;
+    ensure!(rgb.len() >= h * w * 3, "rgb buffer too small");
+    let (rh, rw) = smart_resize(h, w, PATCH * MERGE, MIN_PIXELS, MAX_PIXELS);
+    let img = resize_u8(rgb, h, w, rh, rw, 3);
+    let (gh, gw) = (rh / PATCH, rw / PATCH);
+    let mut out = vec![0f32; gh * gw * 3 * PATCH * PATCH];
+    for py in 0..gh {
+        for px in 0..gw {
+            let p = py * gw + px;
+            for c in 0..3 {
+                for y in 0..PATCH {
+                    for x in 0..PATCH {
+                        let v = img[((py * PATCH + y) * rw + px * PATCH + x) * 3 + c];
+                        // (v / 255 - 0.5) / 0.5
+                        out[p * 3 * PATCH * PATCH + c * PATCH * PATCH + y * PATCH + x] = v as f32 * (2.0 / 255.0) - 1.0;
+                    }
+                }
+            }
+        }
+    }
+    Ok((out, gh, gw))
+}
+
 /// The 3-D positions of a prompt that carries images, as `get_rope_index` builds them: text grows by one on all
 /// three planes; an image block is `t` frames of `h/merge` rows of `w/merge + 1` tokens (every merged row ends
 /// with a newline), all three planes offset by the block's start; the text after it continues at the block's
@@ -1756,7 +1863,41 @@ pub(crate) fn forward(
     // ones (an image block is a rectangle of patches with a newline column, not a run of positions).
     let merge = h.vision.as_ref().map_or(2, |v| v.merge);
     let mut image: Option<(usize, usize, Vec<f32>)> = None;
-    if let Ok(f) = std::env::var("MALLEUS_HY4_IMAGE_FEATURES") {
+    let mut grid: Option<(usize, usize, usize)> = None;
+    // The whole image path from a PNG: the processor, the tower, then the prompt with the features in place.
+    if let Ok(png) = std::env::var("MALLEUS_HY4_IMAGE_PNG") {
+        let v = model.hy4_vision.as_ref().context("the file has no vision tower")?;
+        let bytes = std::fs::read(&png)?;
+        let (rgb, ih, iw) = crate::image_pre::decode(&bytes, &crate::image_pre::PreConfig::default())?;
+        let (pixels, gh, gw) = preprocess(&rgb, ih, iw)?;
+        let (tower_back, merged) = vision_forward(model, v, &pixels, gh, gw)?;
+        if std::env::var("MALLEUS_HY4_TRACE").is_ok()
+            && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR")
+        {
+            let put = |name: &str, v: &[f32]| -> Result<()> {
+                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                Ok(std::fs::write(std::path::Path::new(&dir).join(name), bytes)?)
+            };
+            put("P_pixels.f32", &pixels)?;
+            put("P_tower.f32", &tower_back)?;
+            put("P_merged.f32", &merged)?;
+            std::fs::write(std::path::Path::new(&dir).join("P_grid.txt"), format!("1x{gh}x{gw}"))?;
+        }
+        eprintln!(
+            "image {}x{} -> {}x{} patches, {} merged",
+            iw,
+            ih,
+            gh,
+            gw,
+            merged.len() / c.hidden
+        );
+        let start = tokens
+            .iter()
+            .position(|&x| x == h.image_token)
+            .context("no image placeholder in the prompt")?;
+        image = Some((start, merged.len() / c.hidden, merged));
+        grid = Some((1, gh, gw));
+    } else if let Ok(f) = std::env::var("MALLEUS_HY4_IMAGE_FEATURES") {
         let g = std::env::var("MALLEUS_HY4_IMAGE_GRID").context("MALLEUS_HY4_IMAGE_GRID")?;
         let d: Vec<usize> = g
             .split('x')
@@ -1780,9 +1921,15 @@ pub(crate) fn forward(
     }
     let pos: Vec<i32> = match (&image, positions) {
         (Some((_, _, _)), _) => {
-            let g = std::env::var("MALLEUS_HY4_IMAGE_GRID").context("MALLEUS_HY4_IMAGE_GRID")?;
-            let d: Vec<usize> = g.split('x').filter_map(|v| v.parse().ok()).collect();
-            let p3 = image_positions(tokens, h.image_token, merge, &[(d[0], d[1], d[2])])?;
+            let g = match grid {
+                Some(g) => g,
+                None => {
+                    let g = std::env::var("MALLEUS_HY4_IMAGE_GRID").context("MALLEUS_HY4_IMAGE_GRID")?;
+                    let d: Vec<usize> = g.split('x').filter_map(|v| v.parse().ok()).collect();
+                    (d[0], d[1], d[2])
+                }
+            };
+            let p3 = image_positions(tokens, h.image_token, merge, &[g])?;
             if std::env::var("MALLEUS_HY4_TRACE").is_ok()
                 && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR")
             {
