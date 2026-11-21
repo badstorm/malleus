@@ -199,10 +199,10 @@ the KV cache (48 slots, one per layer and pass).
 |---|---|
 | weights on the device | 14.41 GB text + 0.64 GB vision + 0.27 GB (MTP, loaded, not used yet) |
 | session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
-| prefill `pp512` / `pp4096` / `pp8192` | **282** / **159** / **129** tok/s |
-| decode `tg16` at ctx 512 / 2048 / 8192 | **16.7** / **15.4** / **14.0** tok/s |
+| prefill `pp512` / `pp4096` / `pp8192` / `pp32768` | **282** / **159** / **137** / **65** tok/s |
+| decode `tg16` at ctx 512 / 2048 / 8192 / 32768 | **16.7** / **15.4** / **14.1** / **10.0** tok/s |
 
-Three consecutive runs per point, spread under 2 %.
+Three consecutive runs per point at 512..8192 (spread under 2 %); the 32K point is one run: 501 s for the prompt.
 
 What the prefill costs, and where it goes. The ablation below is from the 2048-token chunk before this session's
 work (70.8 s -> 11.1 s); the split of the 1.81 s a 512-token prompt now takes is from a `rocprofv3 --kernel-trace`
@@ -210,7 +210,7 @@ summary (`percentage` of the GPU time, 48 layer visits):
 
 | kernel | calls | total | share | note |
 |---|---|---|---|---|
-| `inkling2_attn` | 48 | 503 ms | **27 %** | four query rows a block; the traffic is at the 80 GB/s wall, 16 rows a tile is the next 4x |
+| `inkling2_attn` | 48 | 503 ms | **27 %** | four query rows a block at the time of the profile; sixteen now, with the relative bias folded in |
 | `moe_w4a8` + `moe_w4a8_m32` | 192 | 483 ms | **26 %** | 25 GB of expert weights a chunk (each of the 128 read once); at the wall |
 | `inkling2_control` | 96 | 213 ms | 12 % | scalar bf16 matvecs, 0.6 GFLOP in 2.2 ms; three GEMMs would be 18x fewer FLOPs |
 | `gemm_wmma` | 288 | 170 ms | 9 % | the dense projections: 7.7 TFLOPS, nothing to fix here |
@@ -261,8 +261,17 @@ removed by ablation — the rest of the graph, at the same weights:
 | 512 | 214.3 tok/s | **282** | 12.9 tok/s | **16.7** |
 | 2 048 | 119.4 | **191** | 9.6 | **15.4** |
 | 4 096 | 91.6 | **159** | 8.5 | **15.1** |
-| 8 192 | 63.4 | **129** | 6.95 | **14.1** |
-| retention at 8 K | 30 % | **46 %** | 54 % | **84 %** |
+| 8 192 | 63.4 | **137** | 6.95 | **14.1** |
+| 32 768 | — | **65** | — | **10.0** |
+| retention at 8 K | 30 % | **49 %** | 54 % | **84 %** |
+| retention at 32 K | — | 23 % | — | 60 % |
+
+32K now runs at all: the relative bias used to be materialised into a `[heads, T, T]` buffer, which is 103 GB at a
+32 768-token prompt. It is computed inside the attention from the query's 16-wide `rel` row and the `proj` columns the
+key chunk needs. At 32K the attention is 81 % of the prefill (12.4 of 15.3 ms a token) and runs at ~0.3 TFLOPS: the
+kernel is dominated by the five `__shfl_xor` steps of a 128-wide dot, which is what a WMMA tile would replace. The
+session state at 32K is 12.9 GiB of keys and values today (48 slots, fp32): a ring buffer for the 40 sliding slots
+takes it to 3.3 GiB.
 
 Everything that is not attention is **flat with depth**: 289 tok/s at 512 tokens and 289 at 8 192, i.e. 3.46 ms per
 token for 8.7 GFLOP of experts and projections (2.5 TFLOPS). The degradation was one kernel reading the K and V of

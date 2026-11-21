@@ -85,92 +85,126 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_rms_unnorm(float* y, 
     if (live) y[(size_t)row * dim + r] = v * rsqrtf(ss[0] / dim + eps);
 }
 
-// bias[head][q][s] = rel[q][head] . proj[:, s - q] when 0 <= q - s < rel_extent, else 0.
-// rel is [T, heads, d_rel], proj is [d_rel, rel_extent] row-major, bias is [heads, T, T].
-extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias(float* bias, const float* rel, const float* proj,
-                                                                   int T, int heads, int d_rel, int extent) {
-    const long long idx = (long long)blockIdx.x * 256 + threadIdx.x;
-    if (idx >= (long long)heads * T * T) return;
-    const int h = (int)(idx / ((long long)T * T));
-    const int q = (int)((idx % ((long long)T * T)) / T);
-    const int s = (int)(idx % T);
-    const int d = q - s;
-    float acc = 0.f;
-    if (d >= 0 && d < extent) {
-        const float* rp = rel + ((size_t)q * heads + h) * d_rel;
-        for (int i = 0; i < d_rel; ++i) acc += rp[i] * proj[(size_t)i * extent + d];
-    }
-    bias[idx] = acc;
-}
-
 // Causal attention with the relative bias, the learned sink and the output gate.
-// q, k, v and gate are [T, heads|nkv, dim] (kh = h / (heads / nkv) for k and v); bias is [heads, T, T]; `sink` is
-// [T, heads] or null. The window is the number of keys a token sees (0 = all of them, the full layers).
+// q, k, v, gate and rel are [T, heads|nkv, dim] for q/k/v/gate and [T, heads, d_rel] for rel; `proj` is
+// [d_rel, extent] row-major and `sink` is [T, heads] or null. The window is the number of keys a token sees (0 = all
+// of them, the full layers).
 //
-// A block is four query rows of one head and the four warps each own one of them: the keys are staged in shared in
-// chunks of KBATCH, so one read of K and V serves four query rows instead of one, and the block crosses the barrier
-// once per chunk instead of twice per key. That ratio — 4x less traffic, 8x fewer barriers — is the whole depth
-// curve: the kernel used to read `depth x 8 KiB` per slot per query row.
+// A block is 16 query rows of one head: the four warps each own four of them, and the keys are staged in shared in
+// chunks of KBATCH, so one read of K and V serves sixteen query rows. The relative bias is computed inside the block
+// from the query's 16-wide `rel` row and the `proj` columns the chunk needs — the [heads, T, T] buffer it used to be
+// materialised into is 103 GB at a 32K prompt, and its kernel was O(heads x T^2) on every layer.
 #define IKA_KB 16
+#define IKA_TQ 16
+#define IKA_MAXD (IKA_KB + IKA_TQ - 1)
 extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, const float* q, const float* k,
-                                                                const float* v, const float* bias, const float* sink,
-                                                                const float* gate, int T, int heads, int nkv, int dim,
-                                                                int window, float scale) {
+                                                                const float* v, const float* rel, const float* proj,
+                                                                const float* sink, const float* gate, int T, int heads,
+                                                                int nkv, int dim, int d_rel, int extent, int window,
+                                                                float scale) {
     __shared__ float ks[IKA_KB][128];
     __shared__ float vs[IKA_KB][128];
-    const int h = blockIdx.x % heads, tq0 = (blockIdx.x / heads) * 4;
+    __shared__ float rs[IKA_TQ][16];
+    __shared__ float bt[IKA_TQ][IKA_KB];
+    const int h = blockIdx.x % heads, q0 = (blockIdx.x / heads) * IKA_TQ;
     const int kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int tq = tq0 + wave, tlast = min(T - 1, tq0 + 3);
-    // The block's key window: the union of the four rows' windows, capped at the last row (causal).
-    const int k0 = window > 0 ? max(0, tq0 - window + 1) : 0;
-    // This warp's own limits; keys outside them are loaded (the block shares one chunk) but not used.
-    const int w0 = window > 0 ? max(0, tq - window + 1) : 0;
-    float m = sink ? sink[(size_t)tq * heads + h] : -INFINITY, l = sink ? 1.f : 0.f;
-    const int live = tq < T;
-    const float4 qv = live ? *(const float4*)(q + ((size_t)tq * heads + h) * dim + 4 * lane)
-                           : make_float4(0.f, 0.f, 0.f, 0.f);
-    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-    for (int kc = k0; kc <= tlast; kc += IKA_KB) {
-        // One copy of the chunk for the whole block: KBATCH keys x dim, both streams.
+    const int qlast = min(T - 1, q0 + IKA_TQ - 1);
+    const int k0 = window > 0 ? max(0, q0 - window + 1) : 0;
+    // The query rows this warp owns: four, one set of four dims per lane.
+    const int qb = q0 + wave * 4;
+    float4 qv[4];
+    float m[4], l[4];
+    float4 acc[4];
+    for (int i = 0; i < 4; ++i) {
+        const int t = qb + i;
+        qv[i] = t < T ? *(const float4*)(q + ((size_t)t * heads + h) * dim + 4 * lane)
+                      : make_float4(0.f, 0.f, 0.f, 0.f);
+        m[i] = sink && t < T ? sink[(size_t)t * heads + h] : -INFINITY;
+        l[i] = sink && t < T ? 1.f : 0.f;
+        acc[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    for (int e = threadIdx.x; e < IKA_TQ * d_rel; e += 128) {
+        rs[e / d_rel][e % d_rel] = q0 + e / d_rel <= qlast ? rel[((size_t)(q0 + e / d_rel) * heads + h) * d_rel + e % d_rel]
+                                                            : 0.f;
+    }
+    __syncthreads();
+    for (int kc = k0; kc <= qlast; kc += IKA_KB) {
         for (int e = threadIdx.x; e < IKA_KB * dim; e += 128) {
             const int s = kc + e / dim, d = e % dim;
-            ks[e / dim][d] = s <= tlast ? k[((size_t)s * nkv + kh) * dim + d] : 0.f;
-            vs[e / dim][d] = s <= tlast ? v[((size_t)s * nkv + kh) * dim + d] : 0.f;
+            ks[e / dim][d] = s <= qlast ? k[((size_t)s * nkv + kh) * dim + d] : 0.f;
+            vs[e / dim][d] = s <= qlast ? v[((size_t)s * nkv + kh) * dim + d] : 0.f;
+        }
+        // The bias tile: bt[iq][j] = rel[q0+iq] . proj[:, (q0+iq) - (kc+j)], zero outside the extent or the causal
+        // window of that row. `proj` is d_rel x extent and stays hot in L1, so it is read straight from global.
+        for (int e = threadIdx.x; e < IKA_TQ * IKA_KB; e += 128) {
+            const int iq = e / IKA_KB, j = e % IKA_KB, s = kc + j, t = q0 + iq;
+            float acc_b = 0.f;
+            const int d = t - s;
+            if (d >= 0 && d < extent && s <= t && t < T && (window == 0 || s >= t - window + 1)) {
+                for (int i = 0; i < d_rel; ++i) acc_b += rs[iq][i] * proj[(size_t)i * extent + d];
+            }
+            bt[iq][j] = acc_b;
         }
         __syncthreads();
-        if (live) {
+#pragma unroll 1
+        for (int i = 0; i < 4; ++i) {
+            const int t = qb + i;
+            if (t >= T) continue;
+            const int w0 = window > 0 ? max(0, t - window + 1) : 0;
+            const int row = wave * 4 + i;
+#pragma unroll
             for (int j = 0; j < IKA_KB; ++j) {
                 const int s = kc + j;
-                if (s > tq || s < w0) continue;
+                if (s > t || s < w0) continue;
                 const float4 kv = *(const float4*)&ks[j][4 * lane];
-                float d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+                float d = qv[i].x * kv.x + qv[i].y * kv.y + qv[i].z * kv.z + qv[i].w * kv.w;
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
-                const float sc = d * scale + bias[((size_t)h * T + tq) * T + s];
-                const float mn = fmaxf(m, sc), corr = expf(m - mn), p = expf(sc - mn);
+                const float sc = d * scale + bt[row][j];
+                const float mn = fmaxf(m[i], sc), corr = expf(m[i] - mn), p = expf(sc - mn);
                 const float4 vv = *(const float4*)&vs[j][4 * lane];
-                acc.x = acc.x * corr + p * vv.x;
-                acc.y = acc.y * corr + p * vv.y;
-                acc.z = acc.z * corr + p * vv.z;
-                acc.w = acc.w * corr + p * vv.w;
-                l = l * corr + p;
-                m = mn;
+                acc[i].x = acc[i].x * corr + p * vv.x;
+                acc[i].y = acc[i].y * corr + p * vv.y;
+                acc[i].z = acc[i].z * corr + p * vv.z;
+                acc[i].w = acc[i].w * corr + p * vv.w;
+                l[i] = l[i] * corr + p;
+                m[i] = mn;
             }
         }
         __syncthreads();
     }
-    if (!live) return;
-    const float inv = l > 0.f ? 1.f / l : 0.f;
-    float4 o = {acc.x * inv, acc.y * inv, acc.z * inv, acc.w * inv};
-    if (gate) {
-        const float4 g = *(const float4*)(gate + ((size_t)tq * heads + h) * dim + 4 * lane);
-        o.x /= 1.f + expf(-g.x);
-        o.y /= 1.f + expf(-g.y);
-        o.z /= 1.f + expf(-g.z);
-        o.w /= 1.f + expf(-g.w);
+    for (int i = 0; i < 4; ++i) {
+        const int t = qb + i;
+        if (t >= T) continue;
+        const float inv = l[i] > 0.f ? 1.f / l[i] : 0.f;
+        float4 o = {acc[i].x * inv, acc[i].y * inv, acc[i].z * inv, acc[i].w * inv};
+        if (gate) {
+            const float4 g = *(const float4*)(gate + ((size_t)t * heads + h) * dim + 4 * lane);
+            o.x /= 1.f + expf(-g.x);
+            o.y /= 1.f + expf(-g.y);
+            o.z /= 1.f + expf(-g.z);
+            o.w /= 1.f + expf(-g.w);
+        }
+        *(float4*)(out + ((size_t)t * heads + h) * dim + 4 * lane) = o;
     }
-    *(float4*)(out + ((size_t)tq * heads + h) * dim + 4 * lane) = o;
+}
+
+// The relative bias of one query row against `nk` cached keys, for the decode path: bias is [heads, nk], `rel` is
+// [heads, d_rel] of the single query row. One thread per (head, key).
+extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias_dec(float* bias, const float* rel,
+                                                                      const float* proj, int pos, int k0, int nk,
+                                                                      int heads, int d_rel, int extent) {
+    const long long idx = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (idx >= (long long)heads * nk) return;
+    const int h = (int)(idx / nk), s = (int)(idx % nk);
+    const int d = pos - (k0 + s);
+    float acc = 0.f;
+    if (d >= 0 && d < extent) {
+        const float* rp = rel + (size_t)h * d_rel;
+        for (int i = 0; i < d_rel; ++i) acc += rp[i] * proj[(size_t)i * extent + d];
+    }
+    bias[idx] = acc;
 }
 
 // The attention residual (issue #62): a learned query attends over the running stack of block states plus the
@@ -413,23 +447,6 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_sconv_dec(float* y, c
     past[c] = past[(size_t)C + c];
     past[(size_t)C + c] = past[(size_t)2 * C + c];
     past[(size_t)2 * C + c] = x[c];
-}
-
-// The relative-position bias of one query row at `pos`, over the `nk` keys starting at `k0`: bias is [heads, nk].
-// The keys outside the layer's relative extent get 0, like the whole-prompt kernel.
-extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias_dec(float* bias, const float* rel,
-                                                                      const float* proj, int pos, int k0, int nk,
-                                                                      int heads, int d_rel, int extent) {
-    const long long idx = (long long)blockIdx.x * 256 + threadIdx.x;
-    if (idx >= (long long)heads * nk) return;
-    const int h = (int)(idx / nk), s = (int)(idx % nk);
-    const int d = pos - (k0 + s);
-    float acc = 0.f;
-    if (d >= 0 && d < extent) {
-        const float* rp = rel + (size_t)h * d_rel;
-        for (int i = 0; i < d_rel; ++i) acc += rp[i] * proj[(size_t)i * extent + d];
-    }
-    bias[idx] = acc;
 }
 
 // One query against the cached keys: k and v are [max_ctx, nkv, dim] with `nk` valid rows from `k0`, q, gate and

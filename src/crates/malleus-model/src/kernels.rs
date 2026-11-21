@@ -206,7 +206,6 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "inkling2_sconv",
             "inkling2_l2_clip",
             "inkling2_rms_unnorm",
-            "inkling2_rel_bias",
             "inkling2_attn",
             "inkling2_attn_res",
             "inkling2_moe_route",

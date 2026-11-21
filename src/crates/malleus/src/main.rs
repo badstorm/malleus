@@ -2004,30 +2004,14 @@ fn kernel_test() -> Result<()> {
         }
         println!("inkling2_rms_unnorm dim=16 rel err {:.2e}", rel_err(&want, &got));
         // Relative bias and attention: one sliding-shaped case with a whole window.
+        // Relative bias and attention: the bias is computed inside the attention now, from `rel` and `proj`.
         let (t2, h2, nkv2, drel, extent) = (5usize, 2usize, 1usize, 4usize, 3usize);
         let rel: Vec<f32> = (0..t2 * h2 * drel).map(|_| rnd()).collect();
         let proj: Vec<f32> = (0..drel * extent).map(|_| rnd()).collect();
         let reld = DeviceBuffer::from_slice(&rel)?;
         let projd = DeviceBuffer::from_slice(&proj)?;
-        let biasd = DeviceBuffer::zeroed(h2 * t2 * t2 * 4)?;
-        k.get("inkling2_rel_bias").launch(
-            (((h2 * t2 * t2) as f32 / 256.0).ceil() as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            &s,
-            &[
-                (&biasd).into(),
-                (&reld).into(),
-                (&projd).into(),
-                t2.into(),
-                h2.into(),
-                drel.into(),
-                extent.into(),
-            ],
-        )?;
-        s.synchronize()?;
-        let bias = biasd.download::<f32>(h2 * t2 * t2)?;
-        let mut wantb = vec![0f32; h2 * t2 * t2];
+        // What the replica below expects the bias to be, for the assertions.
+        let mut bias = vec![0f32; h2 * t2 * t2];
         for hh in 0..h2 {
             for qq in 0..t2 {
                 for ss in 0..t2 {
@@ -2037,12 +2021,11 @@ fn kernel_test() -> Result<()> {
                         for i in 0..drel {
                             acc += rel[(qq * h2 + hh) * drel + i] * proj[i * extent + d as usize];
                         }
-                        wantb[(hh * t2 + qq) * t2 + ss] = acc;
+                        bias[(hh * t2 + qq) * t2 + ss] = acc;
                     }
                 }
             }
         }
-        println!("inkling2_rel_bias  rel err {:.2e}", rel_err(&wantb, &bias));
         let qa: Vec<f32> = (0..t2 * h2 * dim).map(|_| rnd()).collect();
         let ka: Vec<f32> = (0..t2 * nkv2 * dim).map(|_| rnd()).collect();
         let va: Vec<f32> = (0..t2 * nkv2 * dim).map(|_| rnd()).collect();
@@ -2058,7 +2041,7 @@ fn kernel_test() -> Result<()> {
         let oa = DeviceBuffer::zeroed(t2 * h2 * dim * 4)?;
         let scale = 1.0f32 / (dim as f32).sqrt();
         k.get("inkling2_attn").launch(
-            ((t2 * h2) as u32, 1, 1),
+            ((t2.div_ceil(16) * h2) as u32, 1, 1),
             (128, 1, 1),
             0,
             &s,
@@ -2067,13 +2050,16 @@ fn kernel_test() -> Result<()> {
                 (&qad).into(),
                 (&kad).into(),
                 (&vad).into(),
-                (&biasd).into(),
+                (&reld).into(),
+                (&projd).into(),
                 (&sad).into(),
                 (&gad).into(),
                 t2.into(),
                 h2.into(),
                 nkv2.into(),
                 dim.into(),
+                drel.into(),
+                extent.into(),
                 0.into(),
                 scale.into(),
             ],
@@ -2114,18 +2100,35 @@ fn kernel_test() -> Result<()> {
         let v3: Vec<f32> = (0..t3 * nkv3 * dim).map(|_| rnd()).collect();
         let g3: Vec<f32> = (0..t3 * h3 * dim).map(|_| rnd() * 3.0).collect();
         let s3: Vec<f32> = (0..t3 * h3).map(|_| rnd()).collect();
-        let b3: Vec<f32> = (0..h3 * t3 * t3).map(|_| rnd()).collect();
-        let (q3d, k3d, v3d, g3d, s3d, b3d) = (
+        let (drel3, extent3) = (4usize, 5usize);
+        let rel3: Vec<f32> = (0..t3 * h3 * drel3).map(|_| rnd()).collect();
+        let proj3: Vec<f32> = (0..drel3 * extent3).map(|_| rnd()).collect();
+        let rel3d = DeviceBuffer::from_slice(&rel3)?;
+        let proj3d = DeviceBuffer::from_slice(&proj3)?;
+        // The bias the replica expects for every (row, key) of the windowed case.
+        let bias3: Vec<f32> = (0..h3 * t3 * t3)
+            .map(|e| {
+                let (hh, qq, ss) = (e / (t3 * t3), (e / t3) % t3, e % t3);
+                let d = qq as isize - ss as isize;
+                if d >= 0 && (d as usize) < extent3 {
+                    (0..drel3)
+                        .map(|i| rel3[(qq * h3 + hh) * drel3 + i] * proj3[i * extent3 + d as usize])
+                        .sum()
+                } else {
+                    0f32
+                }
+            })
+            .collect();
+        let (q3d, k3d, v3d, g3d, s3d) = (
             DeviceBuffer::from_slice(&q3)?,
             DeviceBuffer::from_slice(&k3)?,
             DeviceBuffer::from_slice(&v3)?,
             DeviceBuffer::from_slice(&g3)?,
             DeviceBuffer::from_slice(&s3)?,
-            DeviceBuffer::from_slice(&b3)?,
         );
         let o3 = DeviceBuffer::zeroed(t3 * h3 * dim * 4)?;
         k.get("inkling2_attn").launch(
-            ((t3.div_ceil(4) * h3) as u32, 1, 1),
+            ((t3.div_ceil(16) * h3) as u32, 1, 1),
             (128, 1, 1),
             0,
             &s,
@@ -2134,13 +2137,16 @@ fn kernel_test() -> Result<()> {
                 (&q3d).into(),
                 (&k3d).into(),
                 (&v3d).into(),
-                (&b3d).into(),
+                (&rel3d).into(),
+                (&proj3d).into(),
                 (&s3d).into(),
                 (&g3d).into(),
                 t3.into(),
                 h3.into(),
                 nkv3.into(),
                 dim.into(),
+                drel3.into(),
+                extent3.into(),
                 w3.into(),
                 scale.into(),
             ],
@@ -2158,7 +2164,7 @@ fn kernel_test() -> Result<()> {
                         for i in 0..dim {
                             acc += q3[(tt * h3 + hh) * dim + i] * k3[(ss * nkv3 + kh) * dim + i];
                         }
-                        acc * scale + b3[(hh * t3 + tt) * t3 + ss]
+                        acc * scale + bias3[(hh * t3 + tt) * t3 + ss]
                     })
                     .collect();
                 let mx = sc.iter().copied().fold(s3[tt * h3 + hh], f32::max);

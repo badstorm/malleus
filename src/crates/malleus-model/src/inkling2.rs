@@ -1021,6 +1021,7 @@ pub struct Cache {
     max: usize,
     len: usize,
     slots: Vec<Slot>,
+    /// [heads, max_ctx] the relative-bias row of the decode query (the prefill computes it inside the attention).
     bias: DeviceBuffer,
     tau: DeviceBuffer,
 }
@@ -1193,7 +1194,6 @@ struct Graph {
     r: DeviceBuffer,
     gate: DeviceBuffer,
     sink: DeviceBuffer,
-    bias: DeviceBuffer,
     attn_out: DeviceBuffer,
     y: DeviceBuffer,
     moe_out: DeviceBuffer,
@@ -1266,7 +1266,6 @@ impl Graph {
             r: f32s(t * heads * i.d_rel)?,
             gate: f32s(t * qd)?,
             sink: f32s(t * heads)?,
-            bias: f32s(heads * t * t)?,
             attn_out: f32s(t * qd)?,
             y: f32s(t * h)?,
             moe_out: f32s(t * h)?,
@@ -1663,36 +1662,26 @@ impl Graph {
                 )?;
             }
             _ => {
-                rel_bias(
+                attn(
                     model,
                     st,
-                    &self.bias,
+                    &self.attn_out,
+                    &self.q,
+                    &self.k,
+                    &self.v,
                     &self.r,
                     &layer.rel_logits,
+                    &self.sink,
+                    &self.gate,
                     t,
                     heads,
+                    kv,
+                    hd,
                     d_rel,
                     i.rel_extent,
+                    window,
+                    scale,
                 )?;
-                {
-                    attn(
-                        model,
-                        st,
-                        &self.attn_out,
-                        &self.q,
-                        &self.k,
-                        &self.v,
-                        &self.bias,
-                        &self.sink,
-                        &self.gate,
-                        t,
-                        heads,
-                        kv,
-                        hd,
-                        window,
-                        scale,
-                    )?;
-                }
             }
         }
         lin(
@@ -2544,35 +2533,6 @@ fn rms_unnorm(
     Ok(())
 }
 
-fn rel_bias(
-    model: &Model,
-    st: &Stream,
-    bias: &DeviceBuffer,
-    rel: &DeviceBuffer,
-    proj: &DeviceBuffer,
-    t: usize,
-    heads: usize,
-    d_rel: usize,
-    extent: usize,
-) -> Result<()> {
-    model.k.get("inkling2_rel_bias").launch(
-        (((heads * t * t) as f32 / 256.0).ceil() as u32, 1, 1),
-        (256, 1, 1),
-        0,
-        st,
-        &[
-            bias.into(),
-            rel.into(),
-            proj.into(),
-            t.into(),
-            heads.into(),
-            d_rel.into(),
-            extent.into(),
-        ],
-    )?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn attn(
     model: &Model,
@@ -2581,18 +2541,21 @@ fn attn(
     q: &DeviceBuffer,
     k: &DeviceBuffer,
     v: &DeviceBuffer,
-    bias: &DeviceBuffer,
+    rel: &DeviceBuffer,
+    proj: &DeviceBuffer,
     sink: &DeviceBuffer,
     gate: &DeviceBuffer,
     t: usize,
     heads: usize,
     nkv: usize,
     dim: usize,
+    d_rel: usize,
+    extent: usize,
     window: usize,
     scale: f32,
 ) -> Result<()> {
     model.k.get("inkling2_attn").launch(
-        ((t.div_ceil(4) * heads) as u32, 1, 1),
+        ((t.div_ceil(16) * heads) as u32, 1, 1),
         (128, 1, 1),
         0,
         st,
@@ -2601,13 +2564,16 @@ fn attn(
             q.into(),
             k.into(),
             v.into(),
-            bias.into(),
+            rel.into(),
+            proj.into(),
             sink.into(),
             gate.into(),
             t.into(),
             heads.into(),
             nkv.into(),
             dim.into(),
+            d_rel.into(),
+            extent.into(),
             window.into(),
             scale.into(),
         ],
