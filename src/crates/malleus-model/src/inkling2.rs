@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::config::{Config, Family, Inkling2Config, Inkling2Mtp, Inkling2Vision, MixerKind, MoeConfig};
 use crate::upload::Uploader;
+use crate::weights::Linear;
 
 /// The `text_config` of an Inkling-2 checkpoint, as `Config` plus the Inkling-2 geometry.
 pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Config> {
@@ -437,30 +438,228 @@ pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-/// Everything the map names, uploaded to the device: the proof that the file loads, before the graph that reads it
-/// exists. The structures the forward will read are the next increment; this one holds the buffers and the bytes.
-pub struct Loaded {
-    pub tensors: Vec<(String, DeviceBuffer)>,
+/// The text graph, as the buffers the forward will read. The vision tower and the MTP head are still flat: their
+/// structures come with their own slices of the graph.
+pub struct Weights {
+    pub embed: DeviceBuffer,
+    pub embed_norm: DeviceBuffer,
+    pub norm: DeviceBuffer,
+    pub unembed: Linear,
+    pub output_query: DeviceBuffer,
+    /// One per layer after the first: `[hidden]`, or `[3, hidden]` in the full layers (q, k, v).
+    pub attn_queries: Vec<DeviceBuffer>,
+    pub mlp_queries: Vec<DeviceBuffer>,
+    pub cross_pass_q: DeviceBuffer,
+    pub cross_pass_kv: DeviceBuffer,
+    pub layers: Vec<Layer>,
+    pub vision: Vec<(String, DeviceBuffer)>,
+    pub mtp: Vec<(String, DeviceBuffer)>,
     pub bytes: usize,
 }
 
-impl Loaded {
-    /// Uploads every tensor of the map, in map order.
+pub struct Layer {
+    pub full: bool,
+    pub mlp_norm: DeviceBuffer,
+    pub attn_norm: Option<DeviceBuffer>,
+    pub attn_sconv: DeviceBuffer,
+    pub mlp_sconv: DeviceBuffer,
+    pub wq: Linear,
+    pub wk: Linear,
+    pub wv: Linear,
+    pub wo: Linear,
+    pub wr: Linear,
+    pub gate: Linear,
+    pub rel_logits: DeviceBuffer,
+    pub sink: DeviceBuffer,
+    pub q_clip: DeviceBuffer,
+    pub rel_clip: DeviceBuffer,
+    pub sconv: Sconv,
+    pub moe: Moe,
+    pub controller: Option<Controller>,
+}
+
+/// The short convolution of the keys and values. The sliding layers convolve with a fixed depthwise kernel; the full
+/// ones add per-token taps projected from the hidden state to a fixed kernel, one tap set per key/value head.
+pub enum Sconv {
+    Local {
+        k: DeviceBuffer,
+        v: DeviceBuffer,
+    },
+    Dynamic {
+        k_static: DeviceBuffer,
+        k_proj: DeviceBuffer,
+        v_static: DeviceBuffer,
+        v_proj: DeviceBuffer,
+        q_norm: DeviceBuffer,
+        k_norm: DeviceBuffer,
+        v_norm: DeviceBuffer,
+    },
+}
+
+pub struct Moe {
+    pub gate: DeviceBuffer,
+    pub bias: DeviceBuffer,
+    /// MLS4 `[experts, 2 * inter, hidden]` and its group scales.
+    pub gate_up: (DeviceBuffer, DeviceBuffer),
+    /// MLS4 `[experts, hidden, inter]` and its group scales.
+    pub down: (DeviceBuffer, DeviceBuffer),
+}
+
+pub struct Gate {
+    pub down: DeviceBuffer,
+    pub forget: DeviceBuffer,
+    pub gain: DeviceBuffer,
+}
+
+/// The loop's cross-pass controller: one low-rank gate per stream.
+pub struct Controller {
+    pub attn: Gate,
+    pub k: Gate,
+    pub v: Gate,
+    pub mlp: Gate,
+}
+
+impl Weights {
     pub fn load(src: &dyn TensorSource, c: &Config, progress: &dyn Fn(usize, usize)) -> Result<Self> {
-        let map = map(c)?;
-        let total = map.len();
+        let i = c.inkling2.as_ref().context("no inkling2 config")?;
         let mut up = Uploader::new()?;
-        let mut tensors = Vec::with_capacity(total);
-        for (i, e) in map.iter().enumerate() {
-            if i % 64 == 0 {
-                progress(i, total);
-            }
-            let buf = up.typed(src, &e.name, e.dtype, &e.shape)?;
-            tensors.push((e.name.clone(), buf));
+        let p = |s: &str| format!("model.llm.{s}");
+        let (h, qd, kvd) = (c.hidden, i.heads * i.head_dim, i.kv_heads * i.head_dim);
+        progress(0, c.n_layers);
+        let embed = up.tensor(src, &p("embed.weight"), &[c.vocab, h])?;
+        let embed_norm = up.tensor(src, &p("embed_norm.weight"), &[h])?;
+        let norm = up.tensor(src, &p("norm.weight"), &[h])?;
+        let unembed = up.linear(src, &p("unembed"), c.vocab, h)?;
+        let output_query = up.typed(src, &p("attn_res.output_query"), DType::F32, &[h])?;
+        let mut attn_queries = Vec::with_capacity(c.n_layers - 1);
+        for l in 1..c.n_layers {
+            let full = c.kind[l] == MixerKind::AttnFull;
+            let shape = if full { vec![3, h] } else { vec![h] };
+            attn_queries.push(up.typed(src, &p(&format!("attn_res.attn_queries.{}", l - 1)), DType::F32, &shape)?);
         }
-        progress(total, total);
-        Ok(Loaded {
-            tensors,
+        let mut mlp_queries = Vec::with_capacity(c.n_layers);
+        for l in 0..c.n_layers {
+            mlp_queries.push(up.typed(src, &p(&format!("attn_res.mlp_queries.{l}")), DType::F32, &[h])?);
+        }
+        let cross = 2 * (i.loop_end - i.loop_start);
+        let cross_pass_q = up.typed(src, &p("middle_cycle_cross_pass_queries"), DType::F32, &[cross, h])?;
+        let cross_pass_kv = up.typed(src, &p("middle_cycle_cross_pass_kv_queries"), DType::F32, &[cross, h])?;
+        let mut layers = Vec::with_capacity(c.n_layers);
+        for l in 0..c.n_layers {
+            progress(l, c.n_layers);
+            let p = |s: &str| format!("model.llm.layers.{l}.{s}");
+            let full = c.kind[l] == MixerKind::AttnFull;
+            let attn_norm = if full {
+                None
+            } else {
+                Some(up.tensor(src, &p("attn_norm.weight"), &[h])?)
+            };
+            let sconv = if full {
+                Sconv::Dynamic {
+                    k_static: up.tensor(src, &p("attn.k_sconv.static_w"), &[i.sconv_k, kvd])?,
+                    k_proj: up.tensor(src, &p("attn.k_sconv.weight_proj"), &[i.kv_heads * i.sconv_k, h])?,
+                    v_static: up.tensor(src, &p("attn.v_sconv.static_w"), &[i.sconv_k, kvd])?,
+                    v_proj: up.tensor(src, &p("attn.v_sconv.weight_proj"), &[i.kv_heads * i.sconv_k, h])?,
+                    q_norm: up.tensor(src, &p("q_input_norm.weight"), &[h])?,
+                    k_norm: up.tensor(src, &p("k_input_norm.weight"), &[h])?,
+                    v_norm: up.tensor(src, &p("v_input_norm.weight"), &[h])?,
+                }
+            } else {
+                Sconv::Local {
+                    k: up.tensor(src, &p("attn.k_sconv.weight"), &[kvd, 1, i.sconv_k])?,
+                    v: up.tensor(src, &p("attn.v_sconv.weight"), &[kvd, 1, i.sconv_k])?,
+                }
+            };
+            let stack = |up: &mut Uploader, name: &str, n: usize, k: usize| -> Result<(DeviceBuffer, DeviceBuffer)> {
+                let g = k / malleus_gguf::quant::BLOCK;
+                let mut q = DeviceBuffer::alloc(i.experts * n * k / 2)?;
+                let mut sc = DeviceBuffer::alloc(i.experts * n * g * 2)?;
+                up.into(src, &p(name), DType::Mls4, &[i.experts, n, k], &mut q, 0)?;
+                up.into(
+                    src,
+                    &p(&format!("{name}.scales")),
+                    DType::F16,
+                    &[i.experts, n, g],
+                    &mut sc,
+                    0,
+                )?;
+                Ok((q, sc))
+            };
+            let controller = if (i.loop_start..i.loop_end).contains(&l) {
+                let gate = |up: &mut Uploader, stream: &str| -> Result<Gate> {
+                    Ok(Gate {
+                        down: up.tensor(
+                            src,
+                            &p(&format!("controllers.{stream}.down_weight")),
+                            &[i.loop_rank, 2 * h],
+                        )?,
+                        forget: up.tensor(
+                            src,
+                            &p(&format!("controllers.{stream}.forget_weight")),
+                            &[h, i.loop_rank],
+                        )?,
+                        gain: up.tensor(src, &p(&format!("controllers.{stream}.gain_weight")), &[h, i.loop_rank])?,
+                    })
+                };
+                Some(Controller {
+                    attn: gate(&mut up, "attn")?,
+                    k: gate(&mut up, "k")?,
+                    v: gate(&mut up, "v")?,
+                    mlp: gate(&mut up, "mlp")?,
+                })
+            } else {
+                None
+            };
+            layers.push(Layer {
+                full,
+                mlp_norm: up.tensor(src, &p("mlp_norm.weight"), &[h])?,
+                attn_norm,
+                attn_sconv: up.tensor(src, &p("attn_sconv.weight"), &[h, 1, i.sconv_k])?,
+                mlp_sconv: up.tensor(src, &p("mlp_sconv.weight"), &[h, 1, i.sconv_k])?,
+                wq: up.linear(src, &p("attn.wq_du"), qd, h)?,
+                wk: up.linear(src, &p("attn.wk_dv"), kvd, h)?,
+                wv: up.linear(src, &p("attn.wv_dv"), kvd, h)?,
+                wo: up.linear(src, &p("attn.wo_ud"), h, qd)?,
+                wr: up.linear(src, &p("attn.wr_du"), i.heads * i.d_rel, h)?,
+                gate: up.linear(src, &p("attn.gate_attn"), qd, h)?,
+                rel_logits: up.tensor(src, &p("attn.rel_logits_proj.proj"), &[i.d_rel, i.rel_extent])?,
+                sink: up.tensor(src, &p("attn.attn_sink_proj.weight"), &[i.heads, h])?,
+                q_clip: up.tensor(src, &p("attn.q_l2_clip.scale"), &[i.heads, i.head_dim])?,
+                rel_clip: up.tensor(src, &p("attn.rel_l2_clip.scale"), &[i.heads, i.d_rel])?,
+                sconv,
+                moe: Moe {
+                    gate: up.tensor(src, &p("mlp.gate.weight"), &[i.experts, h])?,
+                    bias: up.typed(src, &p("mlp.gate.bias"), DType::F32, &[i.experts])?,
+                    gate_up: stack(&mut up, "mlp.experts.gate_up_proj", 2 * i.moe_inter, h)?,
+                    down: stack(&mut up, "mlp.experts.down_proj", h, i.moe_inter)?,
+                },
+                controller,
+            });
+        }
+        progress(c.n_layers, c.n_layers);
+        // The two halves that do not have a structure yet: their names and buffers, in map order.
+        let mut flat = |part: fn(&Config) -> Result<Vec<Expected>>| -> Result<Vec<(String, DeviceBuffer)>> {
+            let mut v = Vec::new();
+            for e in part(c)? {
+                v.push((e.name.clone(), up.typed(src, &e.name, e.dtype, &e.shape)?));
+            }
+            Ok(v)
+        };
+        let vision = flat(vision_map)?;
+        let mtp = flat(mtp_map)?;
+        Ok(Weights {
+            embed,
+            embed_norm,
+            norm,
+            unembed,
+            output_query,
+            attn_queries,
+            mlp_queries,
+            cross_pass_q,
+            cross_pass_kv,
+            layers,
+            vision,
+            mtp,
             bytes: up.bytes,
         })
     }
