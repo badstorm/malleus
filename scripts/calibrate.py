@@ -765,6 +765,8 @@ def main():
     ap.add_argument("--samples", type=int, default=128)
     ap.add_argument("--length", type=int, default=2048)
     ap.add_argument("--layers", type=int, default=0, help="stop after this many layers (0 = all)")
+    ap.add_argument("--start", type=int, default=0,
+                    help="resume: propagate bf16 through this many layers, then calibrate from there")
     ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--holdout", type=int, default=8, help="every n-th sample only measures the error (0 = none)")
@@ -823,14 +825,25 @@ def main():
     types = backend.types
     rot = rotation_matrix(dev)
     mls2_levels = torch.tensor(MLS2_GRIDS[args.mls2_grid], device=dev)
-    prefix = backend.prefix.rstrip(".") if is_hy4 else "model.language_model.layers"
+    prefix = "model.layers" if is_hy4 else "model.language_model.layers"
 
     hidden, kw = backend.capture(samples)
     print(f"captured inputs in {time.time() - t0:.0f}s", flush=True)
 
     report = []
     n_layers = args.layers or backend.n_layers()
-    for li in range(n_layers):
+    if args.start:
+        if not batched:
+            ap.error("--start resumes a hy4 calibration only")
+        # The prefix only has to produce the inputs of the first calibrated layer: run it with bf16 weights and
+        # release each layer, so a resumed run does not keep the Hessians of the layers it already wrote.
+        for li in range(args.start):
+            layer = backend.get(li)
+            with torch.no_grad():
+                hidden = layer(hidden, **kw[types[li]])
+            backend.free()
+            print(f"propagated layer {li}", flush=True)
+    for li in range(args.start, n_layers):
         tl = time.time()
         torch.cuda.empty_cache()
         layer = backend.get(li)
