@@ -199,10 +199,27 @@ the KV cache (48 slots, one per layer and pass).
 |---|---|
 | weights on the device | 14.41 GB text + 0.64 GB vision + 0.27 GB (MTP, loaded, not used yet) |
 | session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
-| prefill `pp512` / `pp2048` / `pp8192` | **251.5** / **184.4** / **126.8** tok/s |
-| decode `tg32` at ctx 512 / 2048 / 8192 | **16.5** / **15.6** / **13.6** tok/s |
+| prefill `pp512` / `pp4096` / `pp8192` | **282** / **159** / **129** tok/s |
+| decode `tg16` at ctx 512 / 2048 / 8192 | **16.7** / **15.4** / **14.0** tok/s |
 
-What the prefill costs, measured by ablation on a 2048-token chunk (70.8 s before, 11.1 s now):
+Three consecutive runs per point, spread under 2 %.
+
+What the prefill costs, and where it goes. The ablation below is from the 2048-token chunk before this session's
+work (70.8 s -> 11.1 s); the split of the 1.81 s a 512-token prompt now takes is from a `rocprofv3 --kernel-trace`
+summary (`percentage` of the GPU time, 48 layer visits):
+
+| kernel | calls | total | share | note |
+|---|---|---|---|---|
+| `inkling2_attn` | 48 | 503 ms | **27 %** | four query rows a block; the traffic is at the 80 GB/s wall, 16 rows a tile is the next 4x |
+| `moe_w4a8` + `moe_w4a8_m32` | 192 | 483 ms | **26 %** | 25 GB of expert weights a chunk (each of the 128 read once); at the wall |
+| `inkling2_control` | 96 | 213 ms | 12 % | scalar bf16 matvecs, 0.6 GFLOP in 2.2 ms; three GEMMs would be 18x fewer FLOPs |
+| `gemm_wmma` | 288 | 170 ms | 9 % | the dense projections: 7.7 TFLOPS, nothing to fix here |
+| `__amd_rocclr_copyBuffer` | 2119 | 107 ms | 6 % | the `mix` block-stack copies, one per call |
+| `inkling2_attn_res` | 120 | 63 ms | 3 % | |
+| `inkling2_rel_bias` | 48 | 37 ms | 2 % | O(heads x T^2) on every layer |
+| the rest (`moe_act`, `hadamard`, `combine`, `sconv`, `copy_nq`, `rmsnorm`, ...) | | ~290 ms | 15 % | |
+
+An earlier ablation on a 2048-token chunk, kept for the shape of it:
 
 | | before | now |
 |---|---|---|
@@ -241,11 +258,11 @@ removed by ablation — the rest of the graph, at the same weights:
 
 | depth | prefill, before | prefill, now | decode, before | decode, now |
 |---|---|---|---|---|
-| 512 | 214.3 tok/s | **251.5** | 12.9 tok/s | **16.5** |
-| 2 048 | 119.4 | **184.4** | 9.6 | **15.6** |
-| 4 096 | 91.6 | — | 8.5 | — |
-| 8 192 | 63.4 | **126.8** | 6.95 | **13.6** |
-| retention at 8 K | 30 % | **49 %** | 54 % | **85 %** |
+| 512 | 214.3 tok/s | **282** | 12.9 tok/s | **16.7** |
+| 2 048 | 119.4 | **191** | 9.6 | **15.4** |
+| 4 096 | 91.6 | **159** | 8.5 | **15.1** |
+| 8 192 | 63.4 | **129** | 6.95 | **14.1** |
+| retention at 8 K | 30 % | **46 %** | 54 % | **84 %** |
 
 Everything that is not attention is **flat with depth**: 289 tok/s at 512 tokens and 289 at 8 192, i.e. 3.46 ms per
 token for 8.7 GFLOP of experts and projections (2.5 TFLOPS). The degradation was one kernel reading the K and V of
