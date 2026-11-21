@@ -147,30 +147,47 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, cons
             bt[iq][j] = acc_b;
         }
         __syncthreads();
-#pragma unroll 1
+        // The softmax of a 16-key chunk in one shot: the sixteen dots of a row are independent, so they pipeline, and
+        // the row is rescaled once per chunk instead of once per key. Per-key the alternative was a chain of a
+        // shuffle tree, an exponential and an update, and it ran at 0.3 TFLOPS at a 32K prompt.
+#pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int t = qb + i;
             if (t >= T) continue;
             const int w0 = window > 0 ? max(0, t - window + 1) : 0;
             const int row = wave * 4 + i;
+            float sc[IKA_KB], mx = -INFINITY;
 #pragma unroll
             for (int j = 0; j < IKA_KB; ++j) {
                 const int s = kc + j;
-                if (s > t || s < w0) continue;
-                const float4 kv = *(const float4*)&ks[j][4 * lane];
-                float d = qv[i].x * kv.x + qv[i].y * kv.y + qv[i].z * kv.z + qv[i].w * kv.w;
+                float d = -INFINITY;
+                if (s <= t && s >= w0) {
+                    const float4 kv = *(const float4*)&ks[j][4 * lane];
+                    d = qv[i].x * kv.x + qv[i].y * kv.y + qv[i].z * kv.z + qv[i].w * kv.w;
 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
-                const float sc = d * scale + bt[row][j];
-                const float mn = fmaxf(m[i], sc), corr = expf(m[i] - mn), p = expf(sc - mn);
-                const float4 vv = *(const float4*)&vs[j][4 * lane];
-                acc[i].x = acc[i].x * corr + p * vv.x;
-                acc[i].y = acc[i].y * corr + p * vv.y;
-                acc[i].z = acc[i].z * corr + p * vv.z;
-                acc[i].w = acc[i].w * corr + p * vv.w;
-                l[i] = l[i] * corr + p;
-                m[i] = mn;
+                    for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
+                    d = d * scale + bt[row][j];
+                }
+                sc[j] = d;
+                mx = fmaxf(mx, d);
             }
+            const float mn = fmaxf(m[i], mx);
+            const float corr = mn == -INFINITY ? 1.f : expf(m[i] - mn);
+            float sum = l[i] * corr;
+            float4 o = {acc[i].x * corr, acc[i].y * corr, acc[i].z * corr, acc[i].w * corr};
+#pragma unroll
+            for (int j = 0; j < IKA_KB; ++j) {
+                const float p = sc[j] == -INFINITY ? 0.f : expf(sc[j] - mn);
+                const float4 vv = *(const float4*)&vs[j][4 * lane];
+                sum += p;
+                o.x += p * vv.x;
+                o.y += p * vv.y;
+                o.z += p * vv.z;
+                o.w += p * vv.w;
+            }
+            acc[i] = o;
+            l[i] = sum;
+            m[i] = mn;
         }
         __syncthreads();
     }
@@ -465,7 +482,9 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, 
     const int h = blockIdx.x, kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
     const float4 qv = *(const float4*)(q + (size_t)h * dim + 4 * lane);
-    // This warp's slice of the keys, contiguous so the reads of a warp stay in one L2 window.
+    // This warp's slice of the keys, contiguous so the reads of a warp stay in one L2 window: the per-key chain
+    // measured better here than the 16-key tile the prefill kernel uses, the opposite of the prefill — at a decode
+    // step there is one query row and the loads, not the exponentials, are what has to stay in flight.
     const int per = (nk + 3) / 4, i0 = wave * per, i1 = min(nk, i0 + per);
     float m = -INFINITY, l = 0.f;
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -474,7 +493,6 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, 
         float d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
-        // Every lane of the warp sees the same score (the tree leaves it in all of them).
         const float sc = d * scale + bias[(size_t)h * nk + i];
         const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
         const float4 vv = *(const float4*)(v + ((size_t)(k0 + i) * nkv + kh) * dim + 4 * lane);
