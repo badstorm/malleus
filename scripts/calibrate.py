@@ -832,6 +832,7 @@ def main():
     n_layers = args.layers or backend.n_layers()
     for li in range(n_layers):
         tl = time.time()
+        torch.cuda.empty_cache()
         layer = backend.get(li)
         experts = getattr(layer.mlp, "experts", None)
         # The 512 routed experts of a layer are already MLS4 in the shipped model, so GPTQ there buys quality but
@@ -911,6 +912,7 @@ def main():
                     print(f"  {li:2d} {name:28s} rtn {l_rtn / base:.3e} gptq {l_gptq / base:.3e} "
                           f"({l_rtn / max(l_gptq, 1e-30):.2f}x)", flush=True)
                 del hinv
+                torch.cuda.empty_cache()
             if routed is not None:
                 key = f"{prefix}.{li}.mlp.experts"
                 report.append({"tensor": key, "tokens_per_expert": moe.count.tolist()})
@@ -922,6 +924,7 @@ def main():
                     if "rtn2" in loss:
                         line += f" | rtn2 {loss['rtn2']:.3e} gptq2 {loss['gptq2']:.3e}"
                     print(line, flush=True)
+                    torch.cuda.empty_cache()
                 # The Hessians are done: the same fast loop now just propagates the dequantized weights, instead of
                 # the module's one_hot over 513 experts on a 65k-token batch.
                 moe.accumulate = False
