@@ -569,6 +569,7 @@ impl Model {
             idx_list: None,
             ple_snap: None,
             ngram_prev: vec![],
+            hy4_spec: None,
             ix_tk: vec![],
             ix_gk: vec![],
             ix_pooled: vec![],
@@ -746,6 +747,9 @@ impl Model {
         s.next_pos = snap.next_pos;
         s.ngram_ctx = snap.ngram_ctx.clone();
         s.ngram_prev.clear();
+        if self.hy4.is_some() {
+            crate::hy4::restored(self, s);
+        }
         s.mtp_len = snap.mtp_len;
         s.mtp_chain = 0;
         s.mtp_pos = snap.mtp_pos.clone();
@@ -1337,9 +1341,11 @@ impl Model {
         } else {
             (w.n.div_ceil(16) as u32, t.div_ceil(8) as u32, 1)
         };
-        if name == "gemv_mls4_l1" && w.n <= 4096 && w.k >= 8192 && self.hy4.is_some() {
-            // Hy4's o_proj (K = 8192 / 16384 on 3072 rows): the fused rotation redoes the Hadamard of the whole input
-            // in every one of the 384 blocks, which costs as much as decoding the weights. Rotate it once instead.
+        // Hy4's o_proj (K = 8192 / 16384 on 3072 rows): the fused rotation redoes the Hadamard of the whole input in
+        // every block, which costs as much as decoding the weights. Rotate once, then the same GEMV without it: r1
+        // for a decode step, L[t - 1] for every width of a verify, one row's arithmetic in both, so a verify row is
+        // the serial step bit for bit.
+        if name.starts_with("gemv_mls4_l") && w.n <= 4096 && w.k >= 8192 && self.hy4.is_some() {
             let rot = [xr.into(), x.into(), (&self.signs).into(), w.k.into()];
             self.k
                 .get("hadamard128")
@@ -1353,10 +1359,14 @@ impl Model {
                 w.n.into(),
                 w.k.into(),
                 (acc as i32).into(),
+                Arg::U64(0),
             ];
-            self.k
-                .get("hy4_gemv_long")
-                .launch((w.n.div_ceil(16) as u32, 1, 1), (256, 1, 1), 0, s, &args)?;
+            let (kname, g) = if t == 1 {
+                ("gemv_mls4_r1", w.n.div_ceil(8))
+            } else {
+                (name, w.n.div_ceil(32))
+            };
+            self.k.get(kname).launch((g as u32, 1, 1), (256, 1, 1), 0, s, &args)?;
             return Ok(());
         }
         if name == "gemv_mls4_l1" && w.n <= 4096 {
@@ -1596,7 +1606,7 @@ impl Model {
     /// token so `rollback` can drop the rejected tail. Returns the logits of every token.
     pub fn forward_verify(&self, sess: &mut Session, tokens: &[u32]) -> Result<Vec<f32>> {
         ensure!(
-            (2..=GEMV_MAX_T).contains(&tokens.len()) && self.mtp.is_some(),
+            (2..=GEMV_MAX_T).contains(&tokens.len()) && self.has_mtp(),
             "bad verify step"
         );
         self.forward_impl(sess, tokens, None, tokens.len(), &[], true, false)
@@ -1628,6 +1638,9 @@ impl Model {
 
     /// Drops the last `n` tokens of the preceding `forward_verify`.
     pub fn rollback(&self, sess: &mut Session, n: usize) -> Result<()> {
+        if self.hy4.is_some() {
+            return crate::hy4::rollback(self, sess, n);
+        }
         if n == 0 {
             return Ok(());
         }
@@ -1659,8 +1672,19 @@ impl Model {
         Ok(())
     }
 
+    /// Whether the model drafts and verifies: an MTP head, or Hy4's DFly2 block drafter.
     pub fn has_mtp(&self) -> bool {
-        self.mtp.is_some()
+        self.mtp.is_some() || self.has_block_draft()
+    }
+
+    /// Hy4's DFly2: the drafts of a block come in one call (`block_draft`), not one MTP step at a time.
+    pub fn has_block_draft(&self) -> bool {
+        crate::hy4::has_draft(self)
+    }
+
+    /// Up to `n` greedy drafts after `bonus`, the token the last call produced (DFly2).
+    pub fn block_draft(&self, sess: &mut Session, bonus: u32, n: usize) -> Result<Vec<u32>> {
+        crate::hy4::draft(self, sess, bonus, n)
     }
 
     /// Hidden rows waiting for their next token before the MTP head can use them.

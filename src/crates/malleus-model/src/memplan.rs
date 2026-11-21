@@ -214,10 +214,6 @@ fn uploaded(name: &str, prefill_int8: bool) -> bool {
     if name.ends_with("ngram_table") || name.ends_with("engram_layer.multi_head_embedding.embedding.weight") {
         return false;
     }
-    // Hy4's speculative draft (`model.dfly_layers.*`) is the last increment of #40 and is not loaded yet.
-    if name.starts_with("model.dfly_layers.") {
-        return false;
-    }
     if !prefill_int8 && (name.ends_with(".prefill") || name.ends_with(".prefill.scales")) {
         return false;
     }

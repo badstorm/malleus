@@ -877,77 +877,6 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_split_ix(float* part, 
     for (int i = 0; i < 16; ++i) dst[2 + d0 + i] = acc[i];
 }
 
-// MLS4 GEMV for a long K on few rows (Hy4's o_proj: K = 8192 / 16384, N = 3072), T <= 4 tokens. `xr` is already in
-// the rotated basis (f32, one `hadamard128` per step), so nothing is staged: each lane reads 32 weights (16 bytes) of
-// two rows and the 32 inputs they meet straight from the cache, two chunks per iteration, with no barrier. The staged
-// GEMV redid the Hadamard of the whole input in each of its blocks and waited on a barrier per 1024 weights (8.4 ms a
-// token on this shape against 7.7 here). Every token sums in the same order whatever T is, so a row of a verify
-// equals the same token decoded alone. LDS staging and a split over K were both measured slower: what is left is
-// how the 8 KB rows are read, not the number of loads in flight.
-extern "C" __global__ void __launch_bounds__(256) hy4_gemv_long(float* out, const float* xr, const unsigned char* q,
-                                                               const __half* sc, int T, int N, int K, int accumulate) {
-    constexpr int R = 2;
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int n0 = (blockIdx.x * 8 + warp) * R;
-    if (n0 >= N) return;
-    const int G = K / 128;
-    float acc[4][R];
-#pragma unroll
-    for (int a = 0; a < 4; ++a)
-#pragma unroll
-        for (int r = 0; r < R; ++r) acc[a][r] = 0.f;
-#pragma unroll 2
-    for (int k = lane * 32; k < K; k += 1024) {
-        uint4 v[R];
-        float s[R];
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const int n = min(n0 + r, N - 1);
-            v[r] = *(const uint4*)(q + (size_t)n * (K / 2) + k / 2);
-            s[r] = __half2float(sc[(size_t)n * G + k / 128]);
-        }
-#pragma unroll
-        for (int a = 0; a < 4; ++a) {
-            if (a >= T) break;
-            const float4* xp = (const float4*)(xr + (size_t)a * K + k);
-            float part[R];
-#pragma unroll
-            for (int r = 0; r < R; ++r) part[r] = 0.f;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float4 x0 = xp[2 * i], x1 = xp[2 * i + 1];
-                const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-#pragma unroll
-                for (int r = 0; r < R; ++r) {
-                    const unsigned w = i == 0 ? v[r].x : i == 1 ? v[r].y : i == 2 ? v[r].z : v[r].w;
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) part[r] += xv[j] * (float)(((int)(w << (28 - 4 * j))) >> 28);
-                }
-            }
-#pragma unroll
-            for (int r = 0; r < R; ++r) acc[a][r] += part[r] * s[r];
-        }
-    }
-#pragma unroll
-    for (int a = 0; a < 4; ++a) {
-        if (a >= T) break;
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            float v = acc[a][r];
-            for (int d = 16; d > 0; d >>= 1) v += __shfl_xor(v, d);
-            const int n = n0 + r;
-            if (lane == 0 && n < N) out[(size_t)a * N + n] = accumulate ? out[(size_t)a * N + n] + v : v;
-        }
-    }
-}
-
-// Engram gate of one stream, one block per token, the stream updated in place:
-//   m     = main + value_bias,                 gamma = pre_gamma * m * rsqrt(mean(m^2) + eps)
-//   q     = stream * rsqrt(mean(stream^2) + eps) * norm_query[s]
-//   k     = (key + key_bias[s]) * rsqrt(mean(.^2) + eps) * norm_key[s]
-//   g     = sigmoid(sign(d) * sqrt(max(|d|, 1e-6))),  d = (q . k) / sqrt(h)
-//   stream += gamma * (g + scale[s])           (nothing on an image placeholder)
-// params: [value_bias | pre_gamma | per stream (key_bias, norm_query, norm_key, scale)], each h wide.
 extern "C" __global__ void __launch_bounds__(256) hy4_engram_gate(float* streams, const float* main, const float* key,
                                                                  const float* params, const int* ids, int image_token,
                                                                  int hc, int s, int h, float eps) {
@@ -1243,4 +1172,10 @@ extern "C" __global__ void __launch_bounds__(256) hy4_ix_score_wmma(unsigned* ke
             }
         }
     }
+}
+
+// x[i] += g[i] * f[i]: DFly2's gated slot-0 fusion.
+extern "C" __global__ void __launch_bounds__(256) hy4_fma_vec(float* x, const float* g, const float* f, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += g[i] * f[i];
 }

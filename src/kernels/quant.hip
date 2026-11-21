@@ -192,7 +192,8 @@ template <int TT, int R>
 __device__ __forceinline__ void gemv4_hl(float* out, const float* xr, const uint8_t* q, const __half* sc, int T, int N,
                                          int K, int accumulate, float* o1 = nullptr, float* o2 = nullptr,
                                          float* o3 = nullptr, int b1 = 0, int b2 = 0, int b3 = 0,
-                                         const int8_t* rs = nullptr) {
+                                         const int8_t* rs = nullptr, const int* xrow = nullptr,
+                                         const int* orow = nullptr) {
     __shared__ __attribute__((aligned(16))) q_u4 xs[TT][128];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int n0 = (blockIdx.x * 8 + warp) * R;
@@ -208,7 +209,9 @@ __device__ __forceinline__ void gemv4_hl(float* out, const float* xr, const uint
         for (int it = threadIdx.x; it < TT * 128; it += 256) {
             const int a = it / 128, w = it % 128;
             const bool in = kc + 8 * w < K;
-            const q_f4* xp = (const q_f4*)(xr + (size_t)min(a, T - 1) * K + min(kc + 8 * w, K - 8));
+            // xrow: token a's input is row xrow[a] of xr (the rows of one expert, gathered without a copy).
+            const int xa = xrow ? xrow[min(a, T - 1)] : min(a, T - 1);
+            const q_f4* xp = (const q_f4*)(xr + (size_t)xa * K + min(kc + 8 * w, K - 8));
             q_f4 lo = xp[0], hi = xp[1];
             if (rs) {
                 // Lanes 16c .. 16c + 15 hold block c (w % 16 == lane % 16: 256 and 128 are multiples of 32).
@@ -308,7 +311,7 @@ __device__ __forceinline__ void gemv4_hl(float* out, const float* xr, const uint
             if (lane == 0 && a < T && n0 + r < N) {
                 const int n = n0 + r;
                 float* o;
-                if (!o1) o = out + (size_t)a * N + n;
+                if (!o1) o = out + (size_t)(orow ? orow[a] : a) * N + n;
                 else if (n < b1) o = out + (size_t)a * b1 + n;
                 else if (n < b2) o = o1 + (size_t)a * (b2 - b1) + n - b1;
                 else if (n < b3) o = o2 + (size_t)a * (b3 - b2) + n - b2;
@@ -730,3 +733,62 @@ extern "C" __global__ void __launch_bounds__(256) moe_combine_yh(float* x, const
     }
     *o = acc;
 }
+
+// Routed experts of a few tokens (a decode step, a speculative verify), each used expert read once: `tiles` holds
+// the experts `moe_sort` found (one tile of up to 6 rows each, blockIdx.y), `perm` the sorted (token, slot) pairs.
+// The rows of an expert go through gemv4_hl<rows, 4> with their input rows gathered by index, and every row sums in
+// the same order as a single-row GEMV would: a verify row equals the serial step bit for bit, and the expert's
+// weights cross the bus once instead of once per token that picked it.
+//   gate|up: out [P, N] from x [T, K] (unrotated; rs folds the rotation), row of pair p = p / slots
+//   down:    out [P, N] (expert-sorted rows) from x [P, K] (already rotated by moe_act)
+template <bool GU, int MAXT>
+__device__ __forceinline__ void moe_grp_core(float* out, const float* x, const uint8_t* q, const __half* sc,
+                                             const int* offs, const int* perm, const int* tiles, const int* ntiles,
+                                             int slots, int N, int K, const int8_t* rs) {
+    __shared__ int xrow[8], orow[8];
+    const int ti = blockIdx.y;
+    if (ti >= ntiles[0]) return;
+    const int e = tiles[2 * ti], r0 = tiles[2 * ti + 1];
+    const int rows = min(8, offs[e + 1] - offs[e] - r0);
+    if (threadIdx.x < 8) {
+        const int pr = perm[offs[e] + r0 + min((int)threadIdx.x, rows - 1)];
+        // gate|up: one output row per pair; down: the expert-sorted row `moe_combine` finds through `pos`.
+        xrow[threadIdx.x] = GU ? pr / slots : pr;
+        orow[threadIdx.x] = GU ? pr : offs[e] + r0 + min((int)threadIdx.x, rows - 1);
+    }
+    __syncthreads();
+    // One instantiation per row count: gemv4_hl stages and computes all TT rows, so an expert one token picked
+    // (every expert of a decode step) must not pay for eight.
+    const uint8_t* qe = q + (size_t)e * N * (K / 2);
+    const __half* se = sc + (size_t)e * N * (K / 128);
+    const int8_t* r = GU ? rs : nullptr;
+#define MOE_GRP(TT) gemv4_hl<TT, 4>(out, x, qe, se, rows, N, K, 0, nullptr, nullptr, nullptr, 0, 0, 0, r, xrow, orow)
+    if (MAXT == 1) {
+        MOE_GRP(1);
+        return;
+    }
+    switch (rows) {
+        case 1: MOE_GRP(1); break;
+        case 2: MOE_GRP(2); break;
+        case 3: MOE_GRP(3); break;
+        case 4: MOE_GRP(4); break;
+        case 5: MOE_GRP(5); break;
+        default: MOE_GRP(6); break;
+    }
+#undef MOE_GRP
+}
+#define MOE_GRP_KERNELS(SUF, MAXT)                                                                                     \
+    extern "C" __global__ void __launch_bounds__(256)                                                                 \
+        moe_gate_up_grp##SUF(float* out, const float* x, const uint8_t* q, const __half* sc, const int* offs,          \
+                             const int* perm, const int* tiles, const int* ntiles, int slots, int N, int K,            \
+                             const int8_t* rs) {                                                                      \
+        moe_grp_core<true, MAXT>(out, x, q, sc, offs, perm, tiles, ntiles, slots, N, K, rs);                          \
+    }                                                                                                                 \
+    extern "C" __global__ void __launch_bounds__(256)                                                                 \
+        moe_down_grp##SUF(float* out, const float* x, const uint8_t* q, const __half* sc, const int* offs,             \
+                          const int* perm, const int* tiles, const int* ntiles, int N, int K) {                       \
+        moe_grp_core<false, MAXT>(out, x, q, sc, offs, perm, tiles, ntiles, 1, N, K, nullptr);                        \
+    }
+// grp1: a decode step (every expert has one row); grp: a verify (up to 6 rows an expert). Same arithmetic per row.
+MOE_GRP_KERNELS(1, 1)
+MOE_GRP_KERNELS(, 6)

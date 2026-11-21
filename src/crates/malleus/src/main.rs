@@ -1337,6 +1337,19 @@ fn build_catalog(models_dir: &Path, ctx: usize, default_model: Option<String>) -
                 eos.push(id);
             }
         }
+        // The model's own end tokens (generation_config): Hy4 ends a turn with `<｜hy_end:opensource｜>`, which the
+        // two Qwen names above do not cover, so the server never stopped on it.
+        if is_converted(&path)
+            && let Ok(g) = open_converted(&path)
+            && let Ok(cfg) = g.meta_str("openmalleus.hf_config")
+            && let Ok(c) = Config::from_json(cfg, g.meta_str("openmalleus.generation_config").ok())
+        {
+            for id in c.eos {
+                if !eos.contains(&id) {
+                    eos.push(id);
+                }
+            }
+        }
         let spec = ModelSpec {
             id: Arc::from(id.as_str()),
             path,

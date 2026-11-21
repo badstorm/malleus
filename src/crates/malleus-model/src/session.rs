@@ -58,6 +58,8 @@ pub struct Session {
     /// and the n-gram context before the step with the step's tokens.
     pub(crate) ple_snap: Option<DeviceBuffer>,
     pub(crate) ngram_prev: Vec<u32>,
+    /// Hy4's DFly2: what the next draft block reads from the target's last call.
+    pub(crate) hy4_spec: Option<Box<crate::hy4::SpecState>>,
     /// Hy4 compressed indexer: per layer (None for the sliding layers) the token keys [`max_ctx`, `index_dim`] fp16
     /// and the pooled group keys [`max_ctx / pool`, `index_dim`] fp16, the groups already pooled (host side: a
     /// closed group never changes again), and the 3-D position of every token slot, shared by the layers.

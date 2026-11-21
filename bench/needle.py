@@ -20,6 +20,8 @@ import urllib.request
 NEEDLE = "\n\nConfidential note: the access code of the Vallechiara safe is ORNITH-4712.\n\n"
 QUESTION = "\n\nWhat is the access code of the Vallechiara safe? Answer with the code only."
 FACT = ("ORNITH-4712", "ORNITH 4712")
+NEUTRAL = ("\n\nLibrary note: the catalogue number of the Vallechiara herbarium is ORNITH-4712.\n\n",
+           "\n\nWhat is the catalogue number of the Vallechiara herbarium? Answer with the number only.")
 
 
 def ask(url, model, text, key, max_tokens):
@@ -45,6 +47,8 @@ def main():
     ap.add_argument("--pos", default="0.1,0.5,0.9", help="where to plant the fact, as a fraction of the text")
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--out", default="", help="write one row of JSON per request")
+    ap.add_argument("--neutral", action="store_true",
+                    help="plant a catalogue number instead of a safe's access code (some models refuse to give one)")
     a = ap.parse_args()
     if not a.filler:
         ap.error("--filler is required: paste the text to search (an English corpus of ~4.2 characters/token; "
@@ -66,7 +70,8 @@ def main():
         hay = (book * (chars // len(book) + 1))[:chars]
         for pos in [float(x) for x in a.pos.split(",")]:
             at = int(len(hay) * pos)
-            text = f"[{rng.random()}] " + hay[:at] + NEEDLE + hay[at:] + QUESTION
+            needle, question = (NEUTRAL if a.neutral else (NEEDLE, QUESTION))
+            text = f"[{rng.random()}] " + hay[:at] + needle + hay[at:] + question
             out, wall = ask(a.url, model, text, a.api_key, a.max_tokens)
             t = out.get("timings") or {}
             answer = (out["choices"][0]["message"].get("content") or "").strip().replace("\n", " ")
