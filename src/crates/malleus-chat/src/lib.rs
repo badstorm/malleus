@@ -77,6 +77,10 @@ impl Chat {
         }
         if let Some(r) = o.reasoning_effort {
             ctx["reasoning_effort"] = json!(r);
+        } else if o.enable_thinking == Some(false) && self.template.contains("'no_think'") {
+            // A template that switches reasoning off through `reasoning_effort == 'no_think'` (Hy4) ignores
+            // `enable_thinking`: the same request has to reach it as that effort.
+            ctx["reasoning_effort"] = json!("no_think");
         }
         if let Some(t) = o.tools {
             ctx["tools"] = t.clone();
