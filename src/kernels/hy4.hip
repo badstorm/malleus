@@ -489,7 +489,8 @@ extern "C" __global__ void __launch_bounds__(256) hy4_vhalf_gemv(float* out, con
 extern "C" __global__ void __launch_bounds__(256) hy4_mla_split(float* part, const float* qt, const float* q,
                                                                const __half* ckv, const __half* krot,
                                                                const float* sinh, int len, int t, int nh, int nope,
-                                                               int kv, int rd, float scale, int nsplit, int window) {
+                                                               int kv, int rd, float scale, int nsplit, int window,
+                                                               int ring) {
     __shared__ float qr[8][64];
     const int wl = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int th = blockIdx.x;
@@ -517,11 +518,13 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_split(float* part, con
 #pragma unroll
     for (int i = 0; i < 16; ++i) acc[i] = 0.f;
     for (int j = k0; j < k_end; ++j) {
-        const __half* ck = ckv + (size_t)j * kv + d0;
+        // A sliding layer's cache is a ring of `ring` rows (0: one row per position).
+        const int jr = ring > 0 ? j % ring : j;
+        const __half* ck = ckv + (size_t)jr * kv + d0;
         float s = 0.f;
 #pragma unroll
         for (int i = 0; i < 16; ++i) s += qtv[i] * h2f(ck[i]);
-        for (int r = lane * 2; r < (lane + 1) * 2 && r < rd; ++r) s += qr[wl][r] * h2f(krot[(size_t)j * rd + r]);
+        for (int r = lane * 2; r < (lane + 1) * 2 && r < rd; ++r) s += qr[wl][r] * h2f(krot[(size_t)jr * rd + r]);
         s = warp_sum(s) * scale;
         const float mn = fmaxf(m, s);
         const float f = expf(m - mn);
@@ -728,7 +731,7 @@ extern "C" __global__ void __launch_bounds__(256) hy4_ix_score(unsigned* keys, c
 extern "C" __global__ void __launch_bounds__(256) hy4_ix_select(int* list, const unsigned* keys, int len, int ti0,
                                                                int pool, int ncg, int nsel, int out_len) {
     __shared__ int hist[256];
-    __shared__ unsigned prefix_s, need_s, cnt_s;
+    __shared__ unsigned prefix_s, need_s;
     __shared__ int ties_before[256];
     const int i = blockIdx.x, tid = threadIdx.x;
     const int own = min((len + ti0 + i) / pool, ncg);
@@ -777,17 +780,36 @@ extern "C" __global__ void __launch_bounds__(256) hy4_ix_select(int* list, const
             ties_before[j] = acc;
             acc += c;
         }
-        cnt_s = 0u;
     }
     __syncthreads();
-    int tb = ties_before[tid];
+    // Ordered compaction: each thread counts what it takes from its own contiguous range, a prefix sum gives it its
+    // first slot, and the list comes out in ascending group order. An atomic slot counter made the order depend on
+    // the schedule, and with it the summation order of the attention: two runs of one prompt gave different logits.
+    __shared__ int take_before[256];
+    int tb = ties_before[tid], took = 0;
     for (int g = g0; g < g1; ++g) {
         const unsigned v = x[g];
-        bool take = v > prefix;
-        if (v == prefix) take = tb++ < (int)need;
+        took += v > prefix || (v == prefix && tb++ < (int)need);
+    }
+    take_before[tid] = took;
+    __syncthreads();
+    if (tid == 0) {
+        int acc = 0;
+        for (int j = 0; j < 256; ++j) {
+            const int c = take_before[j];
+            take_before[j] = acc;
+            acc += c;
+        }
+    }
+    __syncthreads();
+    int o = take_before[tid];
+    tb = ties_before[tid];
+    for (int g = g0; g < g1; ++g) {
+        const unsigned v = x[g];
+        const bool take = v > prefix || (v == prefix && tb++ < (int)need);
         if (take) {
-            const unsigned o = atomicAdd(&cnt_s, 1);
-            if (o < (unsigned)out_len) row[o] = g;
+            if (o < out_len) row[o] = g;
+            ++o;
         }
     }
     __syncthreads();
@@ -1037,7 +1059,7 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_attn_wmma(float* lat, 
                                                                    const __half* ckv, const __half* krot,
                                                                    const float* sinh, int len, int nh, int nope, int kv,
                                                                    int rd, float scale, int window, const int* list,
-                                                                   int nsel, int pool) {
+                                                                   int nsel, int pool, int ring) {
     constexpr int KT = 16, KS = 584, VS = 24;
     __shared__ __attribute__((aligned(16))) _Float16 ks[KT][KS];
     __shared__ __attribute__((aligned(16))) _Float16 vt[512][VS];
@@ -1078,7 +1100,8 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_attn_wmma(float* lat, 
     for (int tile = 0; tile < ntiles; ++tile) {
         __syncthreads();
         for (int e = tid; e < KT * 72; e += 256) {
-            const int kk = e / 72, c = e % 72, kq = key_of(tile, kk), key = kq < 0 ? last : kq;
+            const int kk = e / 72, c = e % 72, kq = key_of(tile, kk);
+            const int key = ring > 0 ? (kq < 0 ? last : kq) % ring : (kq < 0 ? last : kq);
             const uint4 u = c < 64 ? ((const uint4*)(ckv + (size_t)key * kv))[c]
                                    : ((const uint4*)(krot + (size_t)key * rd))[c - 64];
             *(uint4*)&ks[kk][c * 8] = u;
@@ -1138,5 +1161,27 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_attn_wmma(float* lat, 
 #pragma unroll
         for (int f = 0; f < 8; ++f)
             lat[((size_t)ti * nh + h0 + g * 16 + r) * kv + qd * 128 + f * 16 + row] = o[f][i] / li;
+    }
+}
+
+// The cache row of each token of the step (the `mla_cache_write` of Ling, plus the ring of a sliding layer: position
+// p goes to row p % ring when ring > 0). RMSNorm(kv_a[0:kv]) as the fp16 latent, the rotated dims as fp16.
+extern "C" __global__ void __launch_bounds__(256) hy4_cache_write(__half* ckv, __half* krot, const float* kv_a,
+                                                                 const float* norm_w, float eps, int len, int t, int kv,
+                                                                 int rd, int ring) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ti = i / (kv + rd);
+    if (ti >= t) return;
+    const int d = i % (kv + rd);
+    const float* row = kv_a + (size_t)ti * (kv + rd);
+    const size_t at = ring > 0 ? (size_t)((len + ti) % ring) : (size_t)(len + ti);
+    if (d < kv) {
+        float ss = 0.f;
+        for (int c = threadIdx.x % 32; c < kv; c += 32) ss += row[c] * row[c];
+        __syncwarp();
+        const float inv = rsqrtf(warp_sum(ss) / (float)kv + eps);
+        ckv[at * kv + d] = __float2half(row[d] * inv * norm_w[d]);
+    } else {
+        krot[at * rd + (d - kv)] = __float2half(row[d]);
     }
 }

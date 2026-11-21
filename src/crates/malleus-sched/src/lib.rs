@@ -873,6 +873,7 @@ impl Worker {
                     .enumerate()
                     .filter(|(_, (toks, snap))| {
                         snap.len == toks.len()
+                            && model.can_restore(sess, snap)
                             && toks.len() <= lcp
                             && toks.len() < req.prompt.len()
                             && req.prompt.starts_with(toks)

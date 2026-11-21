@@ -705,6 +705,12 @@ impl Model {
         Ok(snap)
     }
 
+    /// Whether `snap` can still be restored on `s`: a model whose sliding layers keep a ring of positions has
+    /// overwritten the window behind the snapshot once the session moved far enough past it.
+    pub fn can_restore(&self, s: &Session, snap: &Snapshot) -> bool {
+        self.hy4.is_none() || crate::hy4::can_restore(&self.cfg, s, snap.len)
+    }
+
     /// Restarts a session from a snapshot taken on it; its KV rows [0, len) must still hold the same tokens.
     pub fn restore(&self, s: &mut Session, snap: &Snapshot) -> Result<()> {
         let st = Stream::null();

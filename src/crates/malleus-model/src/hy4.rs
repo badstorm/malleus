@@ -835,12 +835,60 @@ fn load_engram(
     })
 }
 
+/// The most tokens one forward call takes: a longer call is split, so that a sliding layer's ring always holds the
+/// window behind every query of the call.
+/// `MALLEUS_HY4_RING_CHUNK` lowers it (a small ring is how the wrap-around is tested on a short prompt).
+pub(crate) fn hy4_max_chunk() -> usize {
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("MALLEUS_HY4_RING_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32768)
+            .max(64)
+    });
+    *V
+}
+
+/// Rows of a layer's KV cache when it is a ring: a sliding layer sees the last `window` positions, so it keeps
+/// `window + hy4_max_chunk()` of them (position p in row p % ring). 0 for a layer that keeps the whole context, or
+/// when the context is no longer than the ring. At 1M tokens this takes the 30 sliding layers from 35 GB of cache
+/// to 1.1 GB.
+pub(crate) fn ring_rows(c: &Config, li: usize, max_ctx: usize) -> usize {
+    let Some(h) = &c.hy4 else { return 0 };
+    if c.kind[li] != crate::config::MixerKind::Hy4Sliding || h.window == 0 {
+        return 0;
+    }
+    let ring = (h.window + hy4_max_chunk()).next_multiple_of(32);
+    if crate::weights::kv_ctx(max_ctx) <= ring {
+        0
+    } else {
+        ring
+    }
+}
+
+/// A snapshot at `len` restored on `s` needs the window behind `len` still in every ring: nothing written more than
+/// `ring - window` positions past it (64 more for the rejected drafts of a verify).
+pub(crate) fn can_restore(c: &Config, s: &crate::session::Session, len: usize) -> bool {
+    let Some(h) = &c.hy4 else { return true };
+    (0..c.n_layers).all(|li| match ring_rows(c, li, s.max_ctx) {
+        0 => true,
+        r => s.len + 64 <= len + r - h.window,
+    })
+}
+
 /// KV bytes of one session: the latent and the rotated dims per layer, fp16, plus the sliding window's own copy.
 pub(crate) fn session_bytes(c: &Config, ctx: usize) -> u64 {
     let Some(h) = &c.hy4 else { return 0 };
     let per_token = h.kv_lora as u64 + h.rope as u64;
     let n = crate::weights::kv_ctx(ctx) as u64;
-    let mut t = n * per_token * 2 * c.n_layers as u64;
+    let mut t: u64 = (0..c.n_layers)
+        .map(|li| match ring_rows(c, li, ctx) {
+            0 => n,
+            r => r as u64,
+        })
+        .sum::<u64>()
+        * per_token
+        * 2;
     // The compressed indexer of every indexed layer keeps its token keys, the groups that closed, and the 3-D
     // position of every slot (shared by the layers).
     let indexed = c
@@ -2045,9 +2093,13 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
     let n = crate::weights::kv_ctx(max_ctx);
     let w = model.hy4.as_ref().context("no hy4 weights")?;
     for li in 0..c.n_layers {
+        let rows = match ring_rows(c, li, max_ctx) {
+            0 => n,
+            r => r,
+        };
         s.kv.push((
-            DeviceBuffer::zeroed(n * h.kv_lora * 2)?,
-            DeviceBuffer::zeroed(n * h.rope * 2)?,
+            DeviceBuffer::zeroed(rows * h.kv_lora * 2)?,
+            DeviceBuffer::zeroed(rows * h.rope * 2)?,
         ));
         // The compressed indexer caches the token keys of every indexed layer and the groups that closed; the
         // sliding layers have neither, so they hold `None` and the layer index stays the one of `s.kv`.
@@ -2429,6 +2481,25 @@ pub(crate) fn forward(
     }
     let t = tokens.len();
     ensure!(t > 0 && n_logits >= 1 && n_logits <= t, "bad hy4 step");
+    // A ring holds the window behind every query only up to `hy4_max_chunk()` tokens a call: a longer text prompt is
+    // split (an image prompt carries its own positions and features for the whole call, and is never that long).
+    if t > hy4_max_chunk() && positions.is_none() && std::env::var_os("MALLEUS_HY4_IMAGE_PNG").is_none() {
+        let (head, tail) = tokens.split_at(t - t % hy4_max_chunk());
+        let (head, tail) = if tail.len() >= n_logits {
+            (head, tail)
+        } else {
+            tokens.split_at(t - hy4_max_chunk())
+        };
+        for part in head.chunks(hy4_max_chunk()) {
+            forward(model, sess, part, None, 1)?;
+        }
+        return forward(model, sess, tail, None, n_logits);
+    }
+    ensure!(
+        t <= hy4_max_chunk() || (0..c.n_layers).all(|li| ring_rows(c, li, sess.max_ctx) == 0),
+        "a hy4 call of {t} tokens with positions is longer than the sliding ring allows ({})",
+        hy4_max_chunk()
+    );
     ensure!(
         sess.len + t <= sess.max_ctx,
         "context full ({} + {} > {})",
@@ -2682,7 +2753,9 @@ pub(crate) fn forward(
             ],
         )?;
         let (ckv, ckrot) = &sess.kv[li];
-        model.k.get("mla_cache_write").launch(
+        // A sliding layer keeps a ring of the last `ring` positions (0: the whole context).
+        let ring = ring_rows(c, li, sess.max_ctx);
+        model.k.get("hy4_cache_write").launch(
             ((t * (h.kv_lora + h.rope)).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
             0,
@@ -2697,6 +2770,7 @@ pub(crate) fn forward(
                 t.into(),
                 h.kv_lora.into(),
                 h.rope.into(),
+                ring.into(),
             ],
         )?;
         // Post-rope query and rotated key dims, for the score reconstruction against the reference replay.
@@ -2816,6 +2890,7 @@ pub(crate) fn forward(
                     ix_list.as_ref().map_or(Arg::U64(0), |l| l.into()),
                     ix_list.as_ref().map_or(0, |l| l.len() / (t * 4)).into(),
                     h.index_pool.into(),
+                    ring.into(),
                 ],
             )?;
         } else {
@@ -2871,6 +2946,7 @@ pub(crate) fn forward(
                         (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
                         nsplit.into(),
                         window.into(),
+                        ring.into(),
                     ],
                 )?;
             }
