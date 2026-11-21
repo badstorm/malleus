@@ -438,8 +438,7 @@ pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-/// The text graph and the vision tower, as the buffers the forward will read. The MTP head is still flat: its
-/// structure comes with its slice of the graph.
+/// The text graph, the vision tower and the MTP head, as the buffers the forward will read.
 /// The vision tower as the buffers its graph reads: 23 pre-norm blocks at 1024 wide, 16 heads of 64, a 4096-wide MLP
 /// with exact GELU, and the 2x2 merger projecting 4096 lanes to the text width.
 pub struct Vision {
@@ -543,6 +542,91 @@ impl Vision {
     }
 }
 
+/// The MTP head: three draft layers at the text width, the fuse of the four target hidden states, and the Markov
+/// correction that shapes the proposed logits. The names are the file's; the semantics are the next increment.
+pub struct Mtp {
+    pub fuse: DeviceBuffer,
+    pub mask_embed: DeviceBuffer,
+    pub norm: DeviceBuffer,
+    pub layers: Vec<MtpLayer>,
+    pub markov: Markov,
+}
+
+pub struct MtpLayer {
+    pub dflare_norm: DeviceBuffer,
+    pub input_norm: DeviceBuffer,
+    pub post_attention_norm: DeviceBuffer,
+    pub q: Linear,
+    pub k: Linear,
+    pub v: Linear,
+    pub o: Linear,
+    pub k_ctx: DeviceBuffer,
+    pub v_ctx: DeviceBuffer,
+    pub q_norm: DeviceBuffer,
+    pub k_norm: DeviceBuffer,
+    pub k_norm_ctx: DeviceBuffer,
+    pub gate: Linear,
+    pub up: Linear,
+    pub down: Linear,
+}
+
+pub struct Markov {
+    pub dflare_norm: DeviceBuffer,
+    pub hidden_out: (DeviceBuffer, DeviceBuffer),
+    pub w1: DeviceBuffer,
+    pub rnn_proj: (DeviceBuffer, DeviceBuffer),
+}
+
+impl Mtp {
+    fn load(src: &dyn TensorSource, c: &Config, up: &mut Uploader) -> Result<Option<Self>> {
+        let m = match c.inkling2.as_ref().and_then(|i| i.mtp.as_ref()) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let h = c.hidden;
+        let mut layers = Vec::with_capacity(m.layers);
+        for l in 0..m.layers {
+            let p = |s: &str| format!("layers.{l}.{s}");
+            let t = |up: &mut Uploader, s: &str, shape: &[usize]| up.tensor(src, &p(s), shape);
+            layers.push(MtpLayer {
+                dflare_norm: t(up, "dflare_norm.weight", &[h])?,
+                input_norm: t(up, "input_layernorm.weight", &[h])?,
+                post_attention_norm: t(up, "post_attention_layernorm.weight", &[h])?,
+                q: up.linear(src, &p("self_attn.q_proj"), m.heads * m.head_dim, h)?,
+                k: up.linear(src, &p("self_attn.k_proj"), m.kv_heads * m.head_dim, h)?,
+                v: up.linear(src, &p("self_attn.v_proj"), m.kv_heads * m.head_dim, h)?,
+                o: up.linear(src, &p("self_attn.o_proj"), h, m.heads * m.head_dim)?,
+                k_ctx: t(up, "self_attn.k_proj_ctx.weight", &[m.kv_heads * m.head_dim, h])?,
+                v_ctx: t(up, "self_attn.v_proj_ctx.weight", &[m.kv_heads * m.head_dim, h])?,
+                q_norm: t(up, "self_attn.q_norm.weight", &[m.head_dim])?,
+                k_norm: t(up, "self_attn.k_norm.weight", &[m.head_dim])?,
+                k_norm_ctx: t(up, "self_attn.k_norm_ctx.weight", &[m.head_dim])?,
+                gate: up.linear(src, &p("mlp.gate_proj"), m.inter, h)?,
+                up: up.linear(src, &p("mlp.up_proj"), m.inter, h)?,
+                down: up.linear(src, &p("mlp.down_proj"), h, m.inter)?,
+            });
+        }
+        Ok(Some(Mtp {
+            fuse: up.tensor(src, "fuse_weight", &[4, 4])?,
+            mask_embed: up.tensor(src, "mask_embed", &[h])?,
+            norm: up.tensor(src, "norm.weight", &[h])?,
+            layers,
+            markov: Markov {
+                dflare_norm: up.tensor(src, "markov_head.dflare_norm.weight", &[h])?,
+                hidden_out: (
+                    up.tensor(src, "markov_head.hidden_out.weight", &[h, m.markov_rank])?,
+                    up.tensor(src, "markov_head.hidden_out.bias", &[h])?,
+                ),
+                w1: up.tensor(src, "markov_head.markov_w1.weight", &[c.vocab, m.markov_rank])?,
+                rnn_proj: (
+                    up.tensor(src, "markov_head.rnn_proj.weight", &[3 * m.markov_rank, 5120])?,
+                    up.tensor(src, "markov_head.rnn_proj.bias", &[3 * m.markov_rank])?,
+                ),
+            },
+        }))
+    }
+}
+
 pub struct Weights {
     pub embed: DeviceBuffer,
     pub embed_norm: DeviceBuffer,
@@ -556,7 +640,7 @@ pub struct Weights {
     pub cross_pass_kv: DeviceBuffer,
     pub layers: Vec<Layer>,
     pub vision: Option<Vision>,
-    pub mtp: Vec<(String, DeviceBuffer)>,
+    pub mtp: Option<Mtp>,
     pub bytes: usize,
 }
 
@@ -741,11 +825,7 @@ impl Weights {
         }
         progress(c.n_layers, c.n_layers);
         let vision = Vision::load(src, c, &mut up)?;
-        // The MTP head has no structure yet: its names and buffers, in map order.
-        let mut mtp = Vec::new();
-        for e in mtp_map(c)? {
-            mtp.push((e.name.clone(), up.typed(src, &e.name, e.dtype, &e.shape)?));
-        }
+        let mtp = Mtp::load(src, c, &mut up)?;
         Ok(Weights {
             embed,
             embed_norm,
