@@ -1347,10 +1347,10 @@ impl Graph {
                 eps,
                 0,
             )?;
-            copy_nq(&self.mix_out, &self.qin, 0, t, h, nq, st)?;
+            copy_nq(model, &self.mix_out, &self.qin, 0, t, h, nq, st)?;
             if full {
-                copy_nq(&self.mix_out, &self.kin, 1, t, h, 3, st)?;
-                copy_nq(&self.mix_out, &self.vin, 2, t, h, 3, st)?;
+                copy_nq(model, &self.mix_out, &self.kin, 1, t, h, 3, st)?;
+                copy_nq(model, &self.mix_out, &self.vin, 2, t, h, 3, st)?;
             } else {
                 self.kin.copy_from_shared(0, &self.qin, 0, t * h * 4, st)?;
                 self.vin.copy_from_shared(0, &self.qin, 0, t * h * 4, st)?;
@@ -1379,7 +1379,7 @@ impl Graph {
                 0,
             )?;
             for qi in 0..4 {
-                copy_nq(&self.msg_out, &self.msg[qi], qi, t, h, 4, st)?;
+                copy_nq(model, &self.msg_out, &self.msg[qi], qi, t, h, 4, st)?;
             }
             let ctrl = layer.controller.as_ref().context("loop layer without controller")?;
             if full {
@@ -2335,6 +2335,7 @@ fn mix(
 
 /// Copies the `qi`-th of `nq` outputs of a mix (`[t, nq, h]`) into a `[t, h]` buffer.
 fn copy_nq(
+    model: &Model,
     src: &DeviceBuffer,
     dst: &DeviceBuffer,
     qi: usize,
@@ -2343,9 +2344,13 @@ fn copy_nq(
     nq: usize,
     st: &Stream,
 ) -> Result<()> {
-    for p in 0..t {
-        dst.copy_from_shared(p * h * 4, src, (p * nq + qi) * h * 4, h * 4, st)?;
-    }
+    model.k.get("inkling2_copy_nq").launch(
+        ((t * h).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[dst.into(), src.into(), nq.into(), qi.into(), h.into(), t.into()],
+    )?;
     Ok(())
 }
 

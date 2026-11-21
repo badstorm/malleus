@@ -374,6 +374,16 @@ extern "C" __global__ void __launch_bounds__(32) inkling2_quant_i8(int8_t* q, fl
     if (lane == 0) xsc[blockIdx.x] = sc;
 }
 
+// y[p, i] = x[p * nq * h + qi * h + i]: the qi-th of the `nq` outputs a mix wrote, for every row. One launch instead
+// of one memcpy per row, which at a long prompt was 2048 hipMemcpyAsync of h floats per layer visit.
+extern "C" __global__ void __launch_bounds__(256) inkling2_copy_nq(float* y, const float* x, int nq, int qi, int h,
+                                                                  int t) {
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (long long)t * h) return;
+    const int p = (int)(i / h), c = (int)(i % h);
+    y[i] = x[((size_t)p * nq + qi) * h + c];
+}
+
 // The final logit softcap: y = tanh(x / cap) * cap. One thread per element.
 extern "C" __global__ void inkling2_softcap(float* y, const float* x, long long n, float cap) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;

@@ -199,10 +199,10 @@ the KV cache (48 slots, one per layer and pass).
 |---|---|
 | weights on the device | 14.41 GB text + 0.64 GB vision + 0.27 GB (MTP, loaded, not used yet) |
 | session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
-| prefill `pp512` / `pp2048` / `pp8192` | **251.5** / **173.5** / **122.4** tok/s |
-| decode `tg32` at ctx 512 / 2048 / 8192 | **16.5** / **15.5** / **14.1** tok/s |
+| prefill `pp512` / `pp2048` / `pp8192` | **251.5** / **184.4** / **126.8** tok/s |
+| decode `tg32` at ctx 512 / 2048 / 8192 | **16.5** / **15.6** / **13.6** tok/s |
 
-What the prefill costs, measured by ablation on a 2048-token chunk (70.8 s before, 11.8 s now):
+What the prefill costs, measured by ablation on a 2048-token chunk (70.8 s before, 11.1 s now):
 
 | | before | now |
 |---|---|---|
@@ -242,9 +242,9 @@ removed by ablation — the rest of the graph, at the same weights:
 | depth | prefill, before | prefill, now | decode, before | decode, now |
 |---|---|---|---|---|
 | 512 | 214.3 tok/s | **251.5** | 12.9 tok/s | **16.5** |
-| 2 048 | 119.4 | **173.5** | 9.6 | **15.5** |
+| 2 048 | 119.4 | **184.4** | 9.6 | **15.6** |
 | 4 096 | 91.6 | — | 8.5 | — |
-| 8 192 | 63.4 | **122.4** | 6.95 | **14.1** |
+| 8 192 | 63.4 | **126.8** | 6.95 | **13.6** |
 | retention at 8 K | 30 % | **49 %** | 54 % | **85 %** |
 
 Everything that is not attention is **flat with depth**: 289 tok/s at 512 tokens and 289 at 8 192, i.e. 3.46 ms per
