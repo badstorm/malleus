@@ -66,7 +66,8 @@ class Shards:
                 j = i + 1
                 while j < len(idx) and idx[j] == idx[j - 1] + 1:
                     j += 1
-                runs.append(s[idx[i] : idx[j]].clone())
+                # The end of the slice is one past the run's last row: `idx[j]` is the next run (or out of range).
+                runs.append(s[idx[i] : idx[j - 1] + 1].clone())
                 i = j
             return torch.cat(runs)
 

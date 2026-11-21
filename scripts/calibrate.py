@@ -641,6 +641,85 @@ def families_for(backend, li, layer, experts, args):
     )
 
 
+
+def engram_ngrams(samples, cfg, dev):
+    """The shifted token windows the Engram hashes; the same thing Hy4Layerwise.capture builds."""
+    x = torch.tensor(samples, device=dev)
+    pad = cfg.engram_pad_id
+    b, t = x.shape
+    shifted = [x]
+    offset_of = torch.arange(t, device=dev).unsqueeze(0)
+    for o in range(1, cfg.engram_max_ngram_size):
+        prev = torch.nn.functional.pad(x, (o, 0), value=pad)[:, :t]
+        shifted.append(torch.where(offset_of < o, torch.tensor(pad, device=dev), prev))
+    return torch.stack(shifted, dim=-1)
+
+
+def calibrate_engram(args, backend, samples, out, rot):
+    """GPTQ for the Engram projections, whose input is the hashed memory and not the transformer state.
+
+    The value and the four key projections all read the same normalized rows, so one Hessian serves the five. The
+    table is the expensive part: each token touches 16 rows per n-gram order, which is why this pass defaults to a
+    small corpus and writes `engram_XX.safetensors` next to the layer files (the converter merges the directory).
+    """
+    from safetensors.torch import save_file
+
+    cfg, dev = backend.cfg, backend.dev
+    ngram = engram_ngrams(samples, cfg, dev)
+    print(f"engram: {ngram.shape[0]} samples x {ngram.shape[1]} tokens", flush=True)
+    report = []
+    for li in sorted(x - 1 for x in backend.engram_layers):
+        t0 = time.time()
+        layer = backend.get(li)
+        el = layer.engram_layer
+        if el is None:
+            print(f"layer {li} has no Engram", flush=True)
+            backend.free()
+            continue
+        width = el.value_proj.weight.shape[1]
+        with torch.no_grad():
+            hash_ids = el.hash_ngrams(ngram)
+            emb = el.multi_head_embedding(hash_ids).to(torch.bfloat16)
+            # `hy4::engram` does not round-trip the rows through fp8 (that branch is disabled), so the Hessian is
+            # accumulated on the same input the engine will see.
+            normed = torch.stack([n(emb[:, :, i]) for i, n in enumerate(el.lookup_per_head_norms)], dim=2)
+            flat = normed.flatten(start_dim=-2).reshape(-1, width).float()
+        x = rotate(flat, rot)
+        c = (16384.0 / (x * x).sum(0).max().clamp_min(1e-20)).sqrt()
+        xh = (x * c).half()
+        h = (xh.T @ xh).float() / (c * c)
+        hinv, dead = inverse_factor(h, args.damp)
+        tensors = {}
+        for name in HY4_ENGRAM_FAMILIES[0]:
+            lin = el.get_submodule(name.removeprefix("engram_layer."))
+            w = lin.weight.float()
+            wt = rotate(w, rot)
+            base = proxy_loss(wt, h)
+            qr, sr = rtn(wt)
+            l_rtn = proxy_loss(wt - qr * sr.repeat_interleave(BLOCK, -1), h)
+            qg, sg = gptq(wt, hinv, dead)
+            deq = qg * sg.repeat_interleave(BLOCK, -1)
+            l_gptq = proxy_loss(wt - deq, h)
+            lin.weight.data.copy_(unrotate(deq, rot).reshape(lin.weight.shape).to(lin.weight.dtype))
+            key = f"model.layers.{li}.{name}.weight"
+            tensors[key], tensors[key + ".scales"] = pack(qg, sg)
+            report.append({"tensor": key, "rtn": l_rtn / base, "gptq": l_gptq / base})
+            print(
+                f"  {li:2d} {name:28s} rtn {l_rtn / base:.3e} gptq {l_gptq / base:.3e} "
+                f"({l_rtn / max(l_gptq, 1e-30):.2f}x)",
+                flush=True,
+            )
+        save_file(tensors, str(out / f"engram_{li:02d}.safetensors"), metadata={"format": "mls4-gptq"})
+        json.dump(
+            {"samples": len(samples), "length": args.length, "damp": args.damp, "tensors": report},
+            open(out / "engram_report.json", "w"),
+            indent=1,
+        )
+        print(f"engram layer {li} done in {time.time() - t0:.0f}s", flush=True)
+        layer = el = None
+        backend.free()
+        torch.cuda.empty_cache()
+
 def checkpoint_bytes(model_dir):
     idx = Path(model_dir) / "model.safetensors.index.json"
     if idx.exists():
@@ -785,6 +864,8 @@ def main():
                          "output stays MLS4, this is a screen and not a conversion")
     ap.add_argument("--mls2-grid", default="e2m1", choices=sorted(MLS2_GRIDS),
                     help="MLS2 grid for --mls2-report")
+    ap.add_argument("--engram-only", action="store_true",
+                    help="hy4: calibrate only the Engram projections; adds engram_XX.safetensors to --out")
     ap.add_argument("--no-engram", action="store_true",
                     help="hy4: skip the Engram memory during calibration (it stays round-to-nearest) instead of "
                          "reading ~1M random table rows per layer")
@@ -813,8 +894,10 @@ def main():
     is_hy4 = family.startswith("hy_v4")
     if is_hy4 and not layerwise:
         ap.error("hy4-flash is 411 GB: it has to be calibrated layer by layer (--layerwise yes)")
+    if args.engram_only and not is_hy4:
+        ap.error("--engram-only is Hy4's Engram pass")
     backend = (
-        Hy4Layerwise(args.model, dev, args.no_engram)
+        Hy4Layerwise(args.model, dev, args.no_engram and not args.engram_only)
         if is_hy4
         else Layerwise(args.model, dev)
         if layerwise
@@ -827,6 +910,9 @@ def main():
     mls2_levels = torch.tensor(MLS2_GRIDS[args.mls2_grid], device=dev)
     prefix = "model.layers" if is_hy4 else "model.language_model.layers"
 
+    if args.engram_only:
+        calibrate_engram(args, backend, samples, out, rot)
+        return
     hidden, kw = backend.capture(samples)
     print(f"captured inputs in {time.time() - t0:.0f}s", flush=True)
 
