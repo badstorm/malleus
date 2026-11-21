@@ -191,6 +191,7 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
     ("mls2", &["gemv_mls2", "gemm_mls2", "moe_gate_up2", "moe_down2"]),
     ("mls3", &["gemv_mls3", "gemm_mls3", "moe_gate_up3", "moe_down3"]),
     ("kda", &["kda_scan", "kda_conv_norm"]),
+    ("inkling2", &["inkling2_sconv"]),
     (
         "hy4",
         &[
