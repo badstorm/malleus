@@ -10,9 +10,11 @@
 
 use anyhow::{Context, Result, ensure};
 use malleus_gguf::{DType, TensorSource};
+use malleus_hip::DeviceBuffer;
 use serde_json::Value;
 
 use crate::config::{Config, Family, Inkling2Config, Inkling2Mtp, Inkling2Vision, MixerKind, MoeConfig};
+use crate::upload::Uploader;
 
 /// The `text_config` of an Inkling-2 checkpoint, as `Config` plus the Inkling-2 geometry.
 pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Config> {
@@ -433,6 +435,35 @@ pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
         ));
     }
     Ok(lines)
+}
+
+/// Everything the map names, uploaded to the device: the proof that the file loads, before the graph that reads it
+/// exists. The structures the forward will read are the next increment; this one holds the buffers and the bytes.
+pub struct Loaded {
+    pub tensors: Vec<(String, DeviceBuffer)>,
+    pub bytes: usize,
+}
+
+impl Loaded {
+    /// Uploads every tensor of the map, in map order.
+    pub fn load(src: &dyn TensorSource, c: &Config, progress: &dyn Fn(usize, usize)) -> Result<Self> {
+        let map = map(c)?;
+        let total = map.len();
+        let mut up = Uploader::new()?;
+        let mut tensors = Vec::with_capacity(total);
+        for (i, e) in map.iter().enumerate() {
+            if i % 64 == 0 {
+                progress(i, total);
+            }
+            let buf = up.typed(src, &e.name, e.dtype, &e.shape)?;
+            tensors.push((e.name.clone(), buf));
+        }
+        progress(total, total);
+        Ok(Loaded {
+            tensors,
+            bytes: up.bytes,
+        })
+    }
 }
 
 /// The vision tower: 23 pre-norm ViT blocks at 1024 wide, 16 heads, 4x MLP, native patches of 20x20 at two frames,

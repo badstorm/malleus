@@ -134,7 +134,17 @@ impl Model {
             for line in crate::inkling2::check(src, c)? {
                 eprintln!("{line}");
             }
-            bail!("inkling2: text tensors mapped, the loader and the forward are the next increment of #62");
+            // The whole file on the device, to prove the footprint and that every tensor takes its buffer; the
+            // graph that reads them is the next increment.
+            let t0 = std::time::Instant::now();
+            let loaded = crate::inkling2::Loaded::load(src, c, progress)?;
+            let n = loaded.tensors.len();
+            let gb = loaded.bytes as f64 / (1u64 << 30) as f64;
+            drop(loaded);
+            bail!(
+                "inkling2: {n} tensors loaded, {gb:.1} GiB on the device in {:.0}s; the forward is the next increment of #62",
+                t0.elapsed().as_secs_f64()
+            );
         }
         // Read before `kernels` moves into the model: the int4 default for the MoE prefill depends on the GPU.
         let arch = kernels.arch.clone();
