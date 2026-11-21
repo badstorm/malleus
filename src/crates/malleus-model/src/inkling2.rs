@@ -1117,6 +1117,54 @@ fn keep_last3(st: &Stream, past: &DeviceBuffer, x: &DeviceBuffer, pos: usize, t:
     Ok(())
 }
 
+/// The buffers the grouped MoE of a whole chunk needs: the pairs sorted by expert, the gathered int8 activations,
+/// the expert outputs per sorted row. Allocated only when the chunk is long enough to take the grouped path.
+struct MoeGrouped {
+    /// [T, hidden] and [T, hidden / 128]: the rotated int8 activations of the tokens.
+    xq: DeviceBuffer,
+    xsc: DeviceBuffer,
+    /// [P, hidden] and [P, hidden / 128]: the same rows gathered once per (token, slot) pair, in sorted order.
+    xg: DeviceBuffer,
+    xgs: DeviceBuffer,
+    /// [E + 1] row offsets per expert, [P] sorted row → pair, [P] pair → sorted row, and the tiles of both sizes.
+    offs: DeviceBuffer,
+    perm: DeviceBuffer,
+    pos: DeviceBuffer,
+    tiles: DeviceBuffer,
+    ntiles: DeviceBuffer,
+    /// [P, 2 * inter] gate|up of every pair (the checkpoint's interleaved order), [P, inter] the activated rows,
+    /// [P, inter] + [P, inter / 128] the same quantized for the down GEMM, [P, hidden] the expert outputs.
+    gu: DeviceBuffer,
+    act: DeviceBuffer,
+    aq: DeviceBuffer,
+    aqs: DeviceBuffer,
+    y: DeviceBuffer,
+}
+
+impl MoeGrouped {
+    fn new(t: usize, h: usize, inter: usize, experts: usize, topk: usize) -> Result<Self> {
+        let p = t * topk;
+        let e1 = experts + 1;
+        Ok(Self {
+            xq: DeviceBuffer::alloc(t * h)?,
+            xsc: f32s(t * h / 128)?,
+            xg: DeviceBuffer::alloc(p * h)?,
+            xgs: f32s(p * h / 128)?,
+            offs: DeviceBuffer::alloc((e1 + 1) * 4)?,
+            perm: DeviceBuffer::alloc(p * 4)?,
+            pos: DeviceBuffer::alloc(p * 4)?,
+            // 64-row tiles, then the 32-row remainder of each expert after the `off2` slot of the first list.
+            tiles: DeviceBuffer::alloc((p.div_ceil(64) + 3 * e1 + 2) * 8)?,
+            ntiles: DeviceBuffer::alloc(8)?,
+            gu: f32s(p * 2 * inter)?,
+            act: f32s(p * inter)?,
+            aq: DeviceBuffer::alloc(p * inter)?,
+            aqs: f32s(p * inter / 128)?,
+            y: f32s(p * h)?,
+        })
+    }
+}
+
 /// The buffers a layer reads and writes, allocated once per `step` and reused by every layer and every pass. The
 /// graph runs on the whole sequence, so there is no per-layer state: the loop's extra passes replay the same
 /// buffers from the prelude's output.
@@ -1156,6 +1204,8 @@ struct Graph {
     act: DeviceBuffer,
     ones_k: DeviceBuffer,
     past: DeviceBuffer,
+    /// The grouped MoE of the prefill: None on the one-token path, where the per-pair kernels read each expert once.
+    moe: Option<MoeGrouped>,
     qin: DeviceBuffer,
     kin: DeviceBuffer,
     vin: DeviceBuffer,
@@ -1227,6 +1277,10 @@ impl Graph {
             act: f32s(t * i.top_k * i.moe_inter)?,
             ones_k: DeviceBuffer::from_slice(&vec![1.0f32; kvd])?,
             past: DeviceBuffer::zeroed(3 * h * 4)?,
+            moe: match t >= crate::weights::WMMA_MIN_TOKENS {
+                true => Some(MoeGrouped::new(t, h, i.moe_inter, i.experts, i.top_k)?),
+                false => None,
+            },
             qin: f32s(t * h)?,
             kin: f32s(t * h)?,
             vin: f32s(t * h)?,
@@ -1618,23 +1672,25 @@ impl Graph {
                     d_rel,
                     i.rel_extent,
                 )?;
-                attn(
-                    model,
-                    st,
-                    &self.attn_out,
-                    &self.q,
-                    &self.k,
-                    &self.v,
-                    &self.bias,
-                    &self.sink,
-                    &self.gate,
-                    t,
-                    heads,
-                    kv,
-                    hd,
-                    window,
-                    scale,
-                )?;
+                {
+                    attn(
+                        model,
+                        st,
+                        &self.attn_out,
+                        &self.q,
+                        &self.k,
+                        &self.v,
+                        &self.bias,
+                        &self.sink,
+                        &self.gate,
+                        t,
+                        heads,
+                        kv,
+                        hd,
+                        window,
+                        scale,
+                    )?;
+                }
             }
         }
         lin(
@@ -1731,55 +1787,62 @@ impl Graph {
                 i.route_scale.into(),
             ],
         )?;
-        model.k.get("moe_gate_up").launch(
-            ((2 * inter).div_ceil(32) as u32, (t * topk) as u32, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[
-                (&self.gu).into(),
-                (&self.normed).into(),
-                (&layer.moe.gate_up.0).into(),
-                (&layer.moe.gate_up.1).into(),
-                (&self.route_ids).into(),
-                topk.into(),
-                (2 * inter).into(),
-                h.into(),
-                (&model.signs).into(),
-            ],
-        )?;
-        model.k.get("inkling2_moe_act").launch(
-            ((t * topk * inter / 128) as u32, 1, 1),
-            (128, 1, 1),
-            0,
-            st,
-            &[
-                (&self.act).into(),
-                (&self.gu).into(),
-                (&model.signs).into(),
-                inter.into(),
-                i.gate_softcap.into(),
-                i.up_softcap.into(),
-            ],
-        )?;
-        model.k.get("moe_down").launch(
-            (h.div_ceil(32) as u32, t as u32, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[
-                (&self.moe_out).into(),
-                (&self.act).into(),
-                (&layer.moe.down.0).into(),
-                (&layer.moe.down.1).into(),
-                (&self.route_ids).into(),
-                (&self.route_w).into(),
-                topk.into(),
-                h.into(),
-                inter.into(),
-                0i32.into(),
-            ],
-        )?;
+        if self.moe.is_some() && std::env::var_os("MALLEUS_INKLING2_MOE_PAIRS").is_none() {
+            // A chunk: every expert's weights cross the bus once for all the tokens that picked it, not once per
+            // (token, slot) pair. `moe_gate_up`/`moe_down` below are the one-token path, and what
+            // `MALLEUS_INKLING2_MOE_PAIRS=1` keeps for an A/B (fp32 activations, no grouping).
+            self.moe_grouped(model, st, i, w, l)?;
+        } else {
+            model.k.get("moe_gate_up").launch(
+                ((2 * inter).div_ceil(32) as u32, (t * topk) as u32, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&self.gu).into(),
+                    (&self.normed).into(),
+                    (&layer.moe.gate_up.0).into(),
+                    (&layer.moe.gate_up.1).into(),
+                    (&self.route_ids).into(),
+                    topk.into(),
+                    (2 * inter).into(),
+                    h.into(),
+                    (&model.signs).into(),
+                ],
+            )?;
+            model.k.get("inkling2_moe_act").launch(
+                ((t * topk * inter / 128) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                st,
+                &[
+                    (&self.act).into(),
+                    (&self.gu).into(),
+                    (&model.signs).into(),
+                    inter.into(),
+                    i.gate_softcap.into(),
+                    i.up_softcap.into(),
+                ],
+            )?;
+            model.k.get("moe_down").launch(
+                (h.div_ceil(32) as u32, t as u32, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&self.moe_out).into(),
+                    (&self.act).into(),
+                    (&layer.moe.down.0).into(),
+                    (&layer.moe.down.1).into(),
+                    (&self.route_ids).into(),
+                    (&self.route_w).into(),
+                    topk.into(),
+                    h.into(),
+                    inter.into(),
+                    0i32.into(),
+                ],
+            )?;
+        }
         {
             let past = match place.as_ref() {
                 Some(p) => &p.slot.past_moe,
@@ -1805,6 +1868,204 @@ impl Graph {
         }
         self.moe_out.copy_from_shared(0, &self.yt, 0, t * h * 4, st)?;
         add(model, st, &self.x, &self.moe_out, t * h)?;
+        Ok(())
+    }
+
+    /// The routed experts of a whole chunk, grouped by expert: `moe_sort` orders the (token, slot) pairs so each
+    /// expert's weights cross the bus once for every token that picked it. `moe_gate_up`/`moe_down` read them once
+    /// per pair, which is the same traffic as a decode step per token and is what used to cap the prefill.
+    fn moe_grouped(&mut self, model: &Model, st: &Stream, i: &Inkling2Config, w: &Weights, l: usize) -> Result<()> {
+        let g = self.moe.as_ref().context("no grouped MoE scratch")?;
+        let layer = &w.layers[l];
+        let (t, h) = (self.t, self.h);
+        let (inter, experts, topk) = (i.moe_inter, i.experts, i.top_k);
+        let p = t * topk;
+        let e1 = experts + 1;
+        // Tile rows: 128 once experts average more than ~48 rows (the weights are read once per tile), 64 below,
+        // and the remainder of an expert on the next smaller kernel.
+        let rows = p / experts;
+        let bm = if rows >= *crate::engine::MOE_BM128_ROWS_ENV {
+            128
+        } else {
+            crate::engine::MOE_BM
+        };
+        let split = (bm == 64 || rows < 200) && std::env::var("MALLEUS_MOE_SPLIT").map_or(true, |v| v != "0");
+        let off2 = p.div_ceil(bm) + 1;
+        let max_tiles = if split { p / bm } else { p.div_ceil(bm) + e1 };
+        let (k1, k2) = match bm {
+            128 => ("moe_w4a8_m128", "moe_w4a8"),
+            _ => ("moe_w4a8", "moe_w4a8_m32"),
+        };
+        // 1. What the grouped GEMMs read: the activations rotated (the MLS4 weights are stored in that basis) and
+        //    quantized to int8, one scale per 128-wide group.
+        model.k.get("rot_quant_i8_w").launch(
+            ((t * h / 128) as u32, 1, 1),
+            (32, 1, 1),
+            0,
+            st,
+            &[
+                (&g.xq).into(),
+                (&g.xsc).into(),
+                (&self.normed).into(),
+                (&model.signs).into(),
+                h.into(),
+            ],
+        )?;
+        // 2. The pairs, grouped by expert: offsets, the two permutations, and the tiles of both sizes.
+        model.k.get("moe_sort").launch(
+            (1, 1, 1),
+            (1024, 1, 1),
+            0,
+            st,
+            &[
+                (&g.offs).into(),
+                (&g.perm).into(),
+                (&g.pos).into(),
+                (&g.tiles).into(),
+                (&g.ntiles).into(),
+                (&self.route_ids).into(),
+                p.into(),
+                e1.into(),
+                bm.into(),
+                (if split { bm / 2 } else { 0 }).into(),
+                off2.into(),
+            ],
+        )?;
+        // 3. One copy of the token's activations per pair, in sorted order, with its 128-wide scales.
+        model.k.get("moe_gather_g").launch(
+            (p as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[
+                (&g.xg).into(),
+                (&g.xgs).into(),
+                (&g.xq).into(),
+                (&g.xsc).into(),
+                (&g.perm).into(),
+                topk.into(),
+                h.into(),
+            ],
+        )?;
+        // 4. gate|up: `w13` is interleaved (gate at 2j, up at 2j+1), so N = 2 * inter keeps the checkpoint's order
+        //    and the activation reads it as it is.
+        self.moe_gemm(
+            model,
+            st,
+            &g.gu,
+            &g.xg,
+            &g.xgs,
+            &layer.moe.gate_up,
+            2 * inter,
+            h,
+            off2,
+            max_tiles,
+            e1,
+            k1,
+            k2,
+        )?;
+        model.k.get("inkling2_moe_act").launch(
+            ((p * inter / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[
+                (&g.act).into(),
+                (&g.gu).into(),
+                (&model.signs).into(),
+                inter.into(),
+                i.gate_softcap.into(),
+                i.up_softcap.into(),
+            ],
+        )?;
+        // 5. The activation is already in the rotated basis: quantize its rows, do not rotate them again.
+        model.k.get("inkling2_quant_i8").launch(
+            ((p * inter / 128) as u32, 1, 1),
+            (32, 1, 1),
+            0,
+            st,
+            &[(&g.aq).into(), (&g.aqs).into(), (&g.act).into()],
+        )?;
+        // 6. down, then the pair weights fold the sorted rows back into their tokens.
+        self.moe_gemm(
+            model,
+            st,
+            &g.y,
+            &g.aq,
+            &g.aqs,
+            &layer.moe.down,
+            h,
+            inter,
+            off2,
+            max_tiles,
+            e1,
+            k1,
+            k2,
+        )?;
+        model.k.get("moe_combine").launch(
+            (t as u32, h.div_ceil(1024) as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&self.moe_out).into(),
+                (&g.y).into(),
+                (&self.route_w).into(),
+                (&g.pos).into(),
+                topk.into(),
+                h.into(),
+                0i32.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One grouped W4A8 GEMM: the 64-row tiles, then the 32-row remainders.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemm(
+        &self,
+        model: &Model,
+        st: &Stream,
+        out: &DeviceBuffer,
+        x: &DeviceBuffer,
+        xs: &DeviceBuffer,
+        w: &(DeviceBuffer, DeviceBuffer),
+        n: usize,
+        k: usize,
+        off2: usize,
+        max_tiles: usize,
+        e1: usize,
+        k1: &str,
+        k2: &str,
+    ) -> Result<()> {
+        let g = self.moe.as_ref().context("no grouped MoE scratch")?;
+        let nb = n.div_ceil(128) as u32;
+        let launch = |name: &str, tiles: u64, cnt: u64, nt: usize| -> Result<()> {
+            if nt == 0 {
+                return Ok(());
+            }
+            model.k.get(name).launch(
+                (nt as u32 * nb, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    out.into(),
+                    x.into(),
+                    xs.into(),
+                    (&w.0).into(),
+                    (&w.1).into(),
+                    (&g.offs).into(),
+                    Arg::U64(tiles),
+                    Arg::U64(cnt),
+                    n.into(),
+                    k.into(),
+                ],
+            )?;
+            Ok(())
+        };
+        launch(k1, g.tiles.addr(), g.ntiles.addr(), max_tiles)?;
+        launch(k2, g.tiles.addr() + 8 * off2 as u64, g.ntiles.addr() + 4, 2 * e1)?;
         Ok(())
     }
 }

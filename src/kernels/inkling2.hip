@@ -104,51 +104,75 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias(float* bias,
 }
 
 // Causal attention with the relative bias, the learned sink and the output gate: one block per (token, head).
-// q, k, v, out and gate are [T, heads|nkv, dim] (kh = h / (heads / nkv) for k and v); bias is [heads, T, T]; `sink`
-// is [T, heads] or null. The window is the number of keys a token sees (0 = all of them, the full layers), and the
-// scores live in shared memory, so a full layer with a long context needs the tiling of `attention_split` — this
-// kernel is the correctness path used to check the pieces, not the long-context one.
+// q, k, v and gate are [T, heads|nkv, dim] (kh = h / (heads / nkv) for k and v); bias is [heads, T, T]; `sink` is
+// [T, heads] or null. The window is the number of keys a token sees (0 = all of them, the full layers).
+//
+// The four warps of the block take four keys at a time: lane l holds the four dims [4l, 4l+4), the dot of a key is
+// one `__shfl_xor` tree inside its warp, and the block crosses the barrier once per four keys instead of once per
+// key. The softmax runs online, so a full layer at a long context does not need the scores in shared memory; what is
+// left is the O(keys) read of K and V per query row, i.e. the flash-attention traffic without the query tiling.
 extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, const float* q, const float* k,
                                                                 const float* v, const float* bias, const float* sink,
                                                                 const float* gate, int T, int heads, int nkv, int dim,
                                                                 int window, float scale) {
-    __shared__ float red[128];
-    __shared__ float sc[4096];
-    __shared__ float sinkv;
+    __shared__ float sc[4];
     const int t = blockIdx.x / heads, h = blockIdx.x % heads;
     const int kh = h / (heads / nkv);
-    const int r = threadIdx.x;
+    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int w0 = window > 0 ? max(0, t - window + 1) : 0;
     const int n = t - w0 + 1;
-    if (r == 0) sinkv = sink ? sink[(size_t)t * heads + h] : -INFINITY;
-    __syncthreads();
-    for (int i = 0; i < n; ++i) {
-        const int s = w0 + i;
-        red[r] = q[((size_t)t * heads + h) * dim + r] * k[((size_t)s * nkv + kh) * dim + r];
-        __syncthreads();
-        for (int o = 64; o > 0; o >>= 1) {
-            if (r < o) red[r] += red[r + o];
-            __syncthreads();
+    const float4 qv = *(const float4*)(q + ((size_t)t * heads + h) * dim + 4 * lane);
+    // The sink is the score of a virtual key whose value is zero: it only enters the denominator.
+    float m = sink ? sink[(size_t)t * heads + h] : -INFINITY, l = sink ? 1.f : 0.f;
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int i0 = 0; i0 < n; i0 += 4) {
+        const int i = i0 + wave;
+        float d = 0.f;
+        if (i < n) {
+            const float4 kv = *(const float4*)(k + ((size_t)(w0 + i) * nkv + kh) * dim + 4 * lane);
+            d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
         }
-        if (r == 0) sc[i] = red[0] * scale + bias[((size_t)h * T + t) * T + s];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
+        if (lane == 0) {
+            sc[wave] = i < n ? d * scale + bias[((size_t)h * T + t) * T + w0 + i] : -INFINITY;
+        }
+        __syncthreads();
+        float mn = m;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) mn = fmaxf(mn, sc[j]);
+        const float corr = mn == -INFINITY ? 1.f : expf(m - mn);
+        float sum = l * corr;
+        float4 ns = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (i0 + j < n) {
+                const float p = mn == -INFINITY ? 0.f : expf(sc[j] - mn);
+                sum += p;
+                const float4 vv = *(const float4*)(v + ((size_t)(w0 + i0 + j) * nkv + kh) * dim + 4 * lane);
+                ns.x += p * vv.x;
+                ns.y += p * vv.y;
+                ns.z += p * vv.z;
+                ns.w += p * vv.w;
+            }
+        }
+        acc.x = acc.x * corr + ns.x;
+        acc.y = acc.y * corr + ns.y;
+        acc.z = acc.z * corr + ns.z;
+        acc.w = acc.w * corr + ns.w;
+        l = sum;
+        m = mn;
         __syncthreads();
     }
-    if (r == 0) {
-        float mx = sink ? sinkv : -INFINITY;
-        for (int i = 0; i < n; ++i) mx = fmaxf(mx, sc[i]);
-        float sum = 0.f;
-        for (int i = 0; i < n; ++i) {
-            sc[i] = expf(sc[i] - mx);
-            sum += sc[i];
-        }
-        if (sink) sum += expf(sinkv - mx);
-        for (int i = 0; i < n; ++i) sc[i] /= sum;
-    }
-    __syncthreads();
-    float acc = 0.f;
-    for (int i = 0; i < n; ++i) acc += sc[i] * v[((size_t)(w0 + i) * nkv + kh) * dim + r];
-    const float g = gate ? gate[((size_t)t * heads + h) * dim + r] : 1.f;
-    out[((size_t)t * heads + h) * dim + r] = acc / (1.f + expf(-g));
+    const float inv = l > 0.f ? 1.f / l : 0.f;
+    const float* gp = gate + ((size_t)t * heads + h) * dim + 4 * lane;
+    float4 o = {acc.x * inv, acc.y * inv, acc.z * inv, acc.w * inv};
+    const float4 g = gate ? *(const float4*)gp : make_float4(0.f, 0.f, 0.f, 0.f);
+    o.x = gate ? o.x / (1.f + expf(-g.x)) : o.x;
+    o.y = gate ? o.y / (1.f + expf(-g.y)) : o.y;
+    o.z = gate ? o.z / (1.f + expf(-g.z)) : o.z;
+    o.w = gate ? o.w / (1.f + expf(-g.w)) : o.w;
+    *(float4*)(out + ((size_t)t * heads + h) * dim + 4 * lane) = o;
 }
 
 // The attention residual (issue #62): a learned query attends over the running stack of block states plus the
@@ -332,6 +356,24 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, c
         }
         out[(size_t)t * hidden + i] = cp[i] * (1.f - tanhf(f)) + tanhf(g) * mp[i];
     }
+}
+
+// int8 quantization of the rows of `x`, one scale per 128-wide group, in the layout the grouped W4A8 GEMMs read
+// (`rot_quant_i8_w`) but **without** the Hadamard: the Inkling-2 expert activation leaves its rows already rotated
+// (its own signs), so re-rotating here would undo it and the down GEMM would see the wrong basis.
+extern "C" __global__ void __launch_bounds__(32) inkling2_quant_i8(int8_t* q, float* xsc, const float* x) {
+    const size_t base = (size_t)blockIdx.x * 128;
+    const int lane = threadIdx.x;
+    const float4 xv = *(const float4*)(x + base + 4 * lane);
+    float m = fmaxf(fmaxf(fabsf(xv.x), fabsf(xv.y)), fmaxf(fabsf(xv.z), fabsf(xv.w)));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
+    const float sc = m > 0.f ? m / 127.f : 1.f;
+    const char4 o = {(char)__float2int_rn(fminf(fmaxf(xv.x / sc, -128.f), 127.f)),
+                     (char)__float2int_rn(fminf(fmaxf(xv.y / sc, -128.f), 127.f)),
+                     (char)__float2int_rn(fminf(fmaxf(xv.z / sc, -128.f), 127.f)),
+                     (char)__float2int_rn(fminf(fmaxf(xv.w / sc, -128.f), 127.f))};
+    *(char4*)(q + base + 4 * lane) = o;
+    if (lane == 0) xsc[blockIdx.x] = sc;
 }
 
 // The final logit softcap: y = tanh(x / cap) * cap. One thread per element.

@@ -199,18 +199,33 @@ the KV cache (48 slots, one per layer and pass).
 |---|---|
 | weights on the device | 14.41 GB text + 0.64 GB vision + 0.27 GB (MTP, loaded, not used yet) |
 | session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
-| prefill `pp512` / `pp2048` | **38.3** / **28.9** tok/s |
-| decode `tg32` at ctx 512 / ctx 2048 | **12.8** / **9.6** tok/s |
+| prefill `pp512` / `pp2048` | **214.1** / **120.1** tok/s |
+| decode `tg32` at ctx 512 / ctx 2048 | **12.8** / **9.5** tok/s |
 
-The prefill is the open problem: the attention is one block per (token, head) with the scores in shared memory, and
-the relative bias costs a 16-term dot product per (head, query, key) pair on every layer, so the two are the wall at
-depth. There is no tiling yet and no chunked prefill: a prompt goes through one forward (`malleus eval` and the
-server use the whole prompt), so a context past ~8K needs more GTT than the graph asks for at 4K.
+What the prefill costs, measured by ablation on a 2048-token chunk (70.8 s before, 17.1 s now):
 
-**Against the production model** (Ornith-1.5-35B-A3B, same machine, `malleus bench`): prefill 38.3 against 968.5
-tok/s at depth 0, decode 12.8 against 29.08 (MTP off on both sides). The loop explains most of it — 48 layer visits
-instead of 40 — and the rest is the un-tiled attention; it is a smaller file (15.3 GB against 20.3 GB) with a
-smaller active set (8 of 128 experts, 1152-wide), so the bytes per token are not the limit.
+| | before | now |
+|---|---|---|
+| MoE experts, read once per (token, slot) pair | 40.9 s | **1.7 s** — `moe_sort` groups the pairs, so each expert crosses the bus once |
+| attention (`inkling2_attn`) | 24.8 s | **10.3 s** — still 60 % of the chunk, and the next wall |
+| everything else (dense MLS4 GEMMs, convolutions, mixes, head) | 5.1 s | 5.1 s |
+
+The expert traffic was the first wall and it was pure redundancy: `moe_gate_up` reads an expert once per pair, so a
+512-token chunk read 1.58 GB per token — the same as a decode step — and the prefill sat on the bandwidth wall
+(38.3 tok/s × 2.24 GB/token = 86 GB/s, above the 80 GB/s `bench-bw` measures). Grouping the pairs (the kernels the
+other families already use: `moe_sort`, `moe_gather_g`, `moe_w4a8`, `moe_combine`, plus `inkling2_quant_i8` for the
+expert activation, which is already in the rotated basis) moved the wall to the attention.
+
+The attention is one block per (token, head): the four warps take four keys at a time and the softmax runs online,
+which made it 1.6× faster, but every query row still reads all of its K and V. What is left is the query tiling of a
+flash-attention: 16 rows per tile reuse one K/V read, which is where the other ~5× are. It also needs a real tile
+loop to lift the `[heads, T, T]` bias buffer (6.4 GB at 8K tokens) and to allow chunked prefill — today a prompt goes
+through one forward and the server uses the whole prompt.
+
+**Against the production model** (Ornith-1.5-35B-A3B, same machine, `malleus bench`): prefill 214.1 against 968.5
+tok/s at depth 0, decode 12.8 against 29.08 (MTP off on both sides). The prefill gap is now all in the attention;
+the decode gap is the bandwidth of 2.24 GB per token against Ornith's ~0.7, i.e. the loop reading the core layers
+three times.
 
 ### Quality: the gates against the bf16 checkpoint
 
@@ -219,27 +234,29 @@ the looped forward), greedy off:
 
 | metric | prefill (one forward) | decode (one token at a time, through the cache) |
 |---|---|---|
-| last-token top-1 against bf16 | **20/20** | **20/20** |
-| all-position argmax | 68.09 % (495/727) | 67.81 % (493/727) |
-| worst KL | 0.345 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.302 |
+| last-token top-1 against bf16 | **19/20** | **20/20** |
+| all-position argmax | 71.39 % (519/727) | 67.81 % (493/727) |
+| worst KL | 0.578 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.302 |
 
 `raw-continue` is the one prompt of the set that is not rendered through the chat template, and the only one whose
-KL is not in the 1e-5 range: it is where the file's 4 bits show. The prefill and the decode path agree on it, which
-is the property `--decode` exists to check.
+KL is not in the 1e-5 range: it is where the file's 4 bits show. It is also the prompt the grouped prefill's int8
+activations move (the W4A8 GEMM against the per-pair GEMV's fp32), and the reason the prefill column reads 19/20
+while the decode path keeps 20/20: `MALLEUS_INKLING2_MOE_PAIRS=1` runs the old path, and the two differ by that one
+prompt.
 
 `eval` on the 8 documents of the eval set (four Gutenberg books, two source files, two chat continuations):
 
 | document | ppl (ref) | top-1 | KL |
 |---|---|---|---|
-| it-pg56775 | 13.044 (12.723) | 90.92 % | 0.0274 |
-| it-pg18456 | 9.133 (8.979) | 91.50 % | 0.0262 |
-| en-pg48320 | 7.319 (6.949) | 91.60 % | 0.0492 |
-| en-pg11 | 5.452 (5.257) | 92.09 % | 0.0266 |
-| code-utils | 1.982 (1.912) | 96.19 % | 0.0296 |
-| code-module | 2.234 (2.182) | 95.51 % | 0.0236 |
-| chat-it | 55.195 (29.000) | 76.46 % | 0.4075 |
-| chat-en | 45.716 (40.006) | 83.01 % | 0.1727 |
-| **total** | **9.240 (8.188, +12.85 %)** | **89.66 %** | **0.0954** |
+| it-pg56775 | 13.040 (12.723) | 90.53 % | 0.0273 |
+| it-pg18456 | 9.093 (8.979) | 91.60 % | 0.0259 |
+| en-pg48320 | 7.302 (6.949) | 91.80 % | 0.0485 |
+| en-pg11 | 5.432 (5.257) | 91.99 % | 0.0266 |
+| code-utils | 1.983 (1.912) | 96.00 % | 0.0278 |
+| code-module | 2.242 (2.182) | 96.00 % | 0.0217 |
+| chat-it | 55.261 (29.000) | 78.91 % | 0.3542 |
+| chat-en | 45.184 (40.006) | 83.40 % | 0.1771 |
+| **total** | **9.220 (8.188, +12.60 %)** | **90.03 %** | **0.0887** |
 
 The two chat documents are the outliers (+90 % and +14 % perplexity against +1.7…+5.3 % for the six plain ones) and
 they are the only documents over 1 000 tokens whose tokens are *not* plain prose: they open with the reasoning-effort
