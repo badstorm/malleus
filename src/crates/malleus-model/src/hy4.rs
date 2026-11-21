@@ -1096,8 +1096,14 @@ fn grouped_experts(
         Ok(())
     };
     let gu = (&m.gu.0, &m.gu.1);
-    grouped("moe_w4a8", &ms.gu, &ms.xg, &ms.xgs, gu, 2 * inter, latent, false)?;
-    grouped("moe_w4a8_m32", &ms.gu, &ms.xg, &ms.xgs, gu, 2 * inter, latent, true)?;
+    // The kernels follow the tile height `moe_sort` cut: a 64-row kernel on a 128-row tile computes half of it.
+    let (big, small) = if bm == 128 {
+        ("moe_w4a8_m128", "moe_w4a8")
+    } else {
+        ("moe_w4a8", "moe_w4a8_m32")
+    };
+    grouped(big, &ms.gu, &ms.xg, &ms.xgs, gu, 2 * inter, latent, false)?;
+    grouped(small, &ms.gu, &ms.xg, &ms.xgs, gu, 2 * inter, latent, true)?;
     model.k.get("hy4_glu_rows").launch(
         (inter.div_ceil(256) as u32, p as u32, 1),
         (256, 1, 1),
@@ -1119,8 +1125,8 @@ fn grouped_experts(
         ],
     )?;
     let dn = (&m.down.0, &m.down.1);
-    grouped("moe_w4a8", &ms.y, &ms.aq, &ms.aqs, dn, latent, inter, false)?;
-    grouped("moe_w4a8_m32", &ms.y, &ms.aq, &ms.aqs, dn, latent, inter, true)?;
+    grouped(big, &ms.y, &ms.aq, &ms.aqs, dn, latent, inter, false)?;
+    grouped(small, &ms.y, &ms.aq, &ms.aqs, dn, latent, inter, true)?;
     model.k.get("moe_combine").launch(
         (t as u32, latent.div_ceil(1024) as u32, 1),
         (256, 1, 1),
@@ -1417,6 +1423,7 @@ fn engram(
     model: &crate::engine::Model,
     e: &Engram,
     streams: &mut DeviceBuffer,
+    hist: &[u32],
     tokens: &[u32],
     t: usize,
     sc: &mut crate::session::Scratch,
@@ -1435,12 +1442,15 @@ fn engram(
         offsets.push(off);
         off += n;
     }
-    // One row of the shared table per (token, hash head).
+    // One row of the shared table per (token, hash head). An n-gram reaches back into the tokens of earlier calls
+    // (`hist`, the session's last ones): a decode step or a later prefill chunk sees the same n-grams as one prefill.
+    let seq: Vec<u32> = hist.iter().chain(tokens).copied().collect();
+    let base = hist.len();
     let mut ids = Vec::with_capacity(t * e.head_vocab.len());
     for ti in 0..t {
         let mut mixed = [0i64; 3];
         for (o, m) in mixed.iter_mut().enumerate().take(e.hash_mult.len()) {
-            let id = if ti >= o { tokens[ti - o] } else { e.pad };
+            let id = if base + ti >= o { seq[base + ti - o] } else { e.pad };
             let id = if (id as usize) < e.lookup.len() { id } else { e.pad };
             *m = (e.lookup[id as usize] as i64).wrapping_mul(e.hash_mult[o]);
         }
@@ -2504,13 +2514,21 @@ pub(crate) fn forward(
     let attn_out = crate::session::f32s(t * vd)?;
     let o = crate::session::f32s(t * hidden)?;
     let _ = (sess.len + t, kvd);
+    // The tokens before this call that the Engram n-grams reach (`engram_max_ngram_size - 1` of them).
+    let hist: Vec<u32> = if sess.len == 0 {
+        Vec::new()
+    } else {
+        sess.ngram_ctx.clone()
+    };
     for (li, layer) in w.layers.iter().take(layers).enumerate() {
         let a = &layer.attn;
         // Debug: take the streams from a file (`MALLEUS_HY4_STREAMS_IN`), so the Engram can be compared against
         // the reference on the reference's own input instead of the layer-0 output the engine happens to have.
-        if li == 1
-            && let Ok(f) = std::env::var("MALLEUS_HY4_STREAMS_IN")
-        {
+        let streams_in = match std::env::var("MALLEUS_HY4_STREAMS_IN_DIR") {
+            Ok(d) if li > 0 => Some(format!("{d}/L{}.f32", li - 1)),
+            _ => std::env::var("MALLEUS_HY4_STREAMS_IN").ok().filter(|_| li == 1),
+        };
+        if let Some(f) = streams_in {
             let bytes = std::fs::read(&f)?;
             let v: Vec<f32> = bytes
                 .as_chunks::<4>()
@@ -2522,7 +2540,7 @@ pub(crate) fn forward(
             streams.upload(&v[..t * sd])?;
         }
         if let Some(e) = &layer.engram {
-            engram(model, e, &mut streams, tokens, t, &mut sc)?;
+            engram(model, e, &mut streams, &hist, tokens, t, &mut sc)?;
             dump("engram_out", li, &streams, t * sd)?;
         }
         // iHC pre-mix of the mixer, its norm, and the MLA projections.
@@ -2563,7 +2581,9 @@ pub(crate) fn forward(
             None => None,
         };
         model.k.get("hy4_rope").launch(
-            ((t * (h.heads + 1) * (h.rope / 2)).div_ceil(256) as u32, 1, 1),
+            // The layer's own geometry: a sliding layer has twice the heads of an indexed one, so the indexed
+            // shape would leave half of its query unrotated and the rest rotated at the wrong token's position.
+            ((t * (a.heads + 1) * (a.rope / 2)).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
             0,
             st,
@@ -2572,10 +2592,10 @@ pub(crate) fn forward(
                 (&kva).into(),
                 (&sc.pos).into(),
                 t.into(),
-                h.heads.into(),
-                h.nope.into(),
+                a.heads.into(),
+                a.nope.into(),
                 h.kv_lora.into(),
-                h.rope.into(),
+                a.rope.into(),
                 h.mrope_section[1].into(),
                 h.mrope_section[2].into(),
                 // The sliding layers rotate with the short base, the global ones with the long one.
@@ -2889,6 +2909,9 @@ pub(crate) fn forward(
     }
     sess.len += t;
     sess.next_pos = max_pos + 1;
+    let keep = h.engram.as_ref().map_or(0, |e| e.max_ngram.saturating_sub(1));
+    let all: Vec<u32> = hist.iter().chain(tokens).copied().collect();
+    sess.ngram_ctx = all[all.len().saturating_sub(keep)..].to_vec();
     // The head: the streams mixed down, the final norm and the logits.
     let normed = crate::session::f32s(t * hidden)?;
     model.k.get("ihc_head").launch(
