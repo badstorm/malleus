@@ -2106,6 +2106,74 @@ fn kernel_test() -> Result<()> {
             }
         }
         println!("inkling2_attn      rel err {:.2e}", rel_err(&want, &got));
+        // The same with a sliding window and two KV heads: the block is four query rows, so partial tiles, the
+        // window's per-row start and the causal mask inside a chunk all have to hold.
+        let (t3, h3, nkv3, w3) = (7usize, 4usize, 2usize, 3usize);
+        let q3: Vec<f32> = (0..t3 * h3 * dim).map(|_| rnd()).collect();
+        let k3: Vec<f32> = (0..t3 * nkv3 * dim).map(|_| rnd()).collect();
+        let v3: Vec<f32> = (0..t3 * nkv3 * dim).map(|_| rnd()).collect();
+        let g3: Vec<f32> = (0..t3 * h3 * dim).map(|_| rnd() * 3.0).collect();
+        let s3: Vec<f32> = (0..t3 * h3).map(|_| rnd()).collect();
+        let b3: Vec<f32> = (0..h3 * t3 * t3).map(|_| rnd()).collect();
+        let (q3d, k3d, v3d, g3d, s3d, b3d) = (
+            DeviceBuffer::from_slice(&q3)?,
+            DeviceBuffer::from_slice(&k3)?,
+            DeviceBuffer::from_slice(&v3)?,
+            DeviceBuffer::from_slice(&g3)?,
+            DeviceBuffer::from_slice(&s3)?,
+            DeviceBuffer::from_slice(&b3)?,
+        );
+        let o3 = DeviceBuffer::zeroed(t3 * h3 * dim * 4)?;
+        k.get("inkling2_attn").launch(
+            ((t3.div_ceil(4) * h3) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            &s,
+            &[
+                (&o3).into(),
+                (&q3d).into(),
+                (&k3d).into(),
+                (&v3d).into(),
+                (&b3d).into(),
+                (&s3d).into(),
+                (&g3d).into(),
+                t3.into(),
+                h3.into(),
+                nkv3.into(),
+                dim.into(),
+                w3.into(),
+                scale.into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let got3 = o3.download::<f32>(t3 * h3 * dim)?;
+        let mut want3 = vec![0f32; t3 * h3 * dim];
+        for tt in 0..t3 {
+            let w0 = (tt + 1).saturating_sub(w3);
+            for hh in 0..h3 {
+                let kh = hh / (h3 / nkv3);
+                let sc: Vec<f32> = (w0..=tt)
+                    .map(|ss| {
+                        let mut acc = 0f32;
+                        for i in 0..dim {
+                            acc += q3[(tt * h3 + hh) * dim + i] * k3[(ss * nkv3 + kh) * dim + i];
+                        }
+                        acc * scale + b3[(hh * t3 + tt) * t3 + ss]
+                    })
+                    .collect();
+                let mx = sc.iter().copied().fold(s3[tt * h3 + hh], f32::max);
+                let sum: f32 = sc.iter().map(|x| (x - mx).exp()).sum::<f32>() + (s3[tt * h3 + hh] - mx).exp();
+                for i in 0..dim {
+                    let mut acc = 0f32;
+                    for (j, ss) in (w0..=tt).enumerate() {
+                        acc += (sc[j] - mx).exp() / sum * v3[(ss * nkv3 + kh) * dim + i];
+                    }
+                    let g = g3[(tt * h3 + hh) * dim + i];
+                    want3[(tt * h3 + hh) * dim + i] = acc / (1.0 + (-g).exp());
+                }
+            }
+        }
+        println!("inkling2_attn win  rel err {:.2e}", rel_err(&want3, &got3));
         // Attention residual: 4 states, 3 queries, 2304 wide, at 2 positions.
         let (tr, nr, hd, nqr) = (2usize, 4usize, 2304usize, 3usize);
         let xr: Vec<f32> = (0..tr * nr * hd).map(|_| rnd()).collect();

@@ -103,76 +103,74 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias(float* bias,
     bias[idx] = acc;
 }
 
-// Causal attention with the relative bias, the learned sink and the output gate: one block per (token, head).
+// Causal attention with the relative bias, the learned sink and the output gate.
 // q, k, v and gate are [T, heads|nkv, dim] (kh = h / (heads / nkv) for k and v); bias is [heads, T, T]; `sink` is
 // [T, heads] or null. The window is the number of keys a token sees (0 = all of them, the full layers).
 //
-// The four warps of the block take four keys at a time: lane l holds the four dims [4l, 4l+4), the dot of a key is
-// one `__shfl_xor` tree inside its warp, and the block crosses the barrier once per four keys instead of once per
-// key. The softmax runs online, so a full layer at a long context does not need the scores in shared memory; what is
-// left is the O(keys) read of K and V per query row, i.e. the flash-attention traffic without the query tiling.
+// A block is four query rows of one head and the four warps each own one of them: the keys are staged in shared in
+// chunks of KBATCH, so one read of K and V serves four query rows instead of one, and the block crosses the barrier
+// once per chunk instead of twice per key. That ratio — 4x less traffic, 8x fewer barriers — is the whole depth
+// curve: the kernel used to read `depth x 8 KiB` per slot per query row.
+#define IKA_KB 16
 extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, const float* q, const float* k,
                                                                 const float* v, const float* bias, const float* sink,
                                                                 const float* gate, int T, int heads, int nkv, int dim,
                                                                 int window, float scale) {
-    __shared__ float sc[4];
-    const int t = blockIdx.x / heads, h = blockIdx.x % heads;
+    __shared__ float ks[IKA_KB][128];
+    __shared__ float vs[IKA_KB][128];
+    const int h = blockIdx.x % heads, tq0 = (blockIdx.x / heads) * 4;
     const int kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int w0 = window > 0 ? max(0, t - window + 1) : 0;
-    const int n = t - w0 + 1;
-    const float4 qv = *(const float4*)(q + ((size_t)t * heads + h) * dim + 4 * lane);
-    // The sink is the score of a virtual key whose value is zero: it only enters the denominator.
-    float m = sink ? sink[(size_t)t * heads + h] : -INFINITY, l = sink ? 1.f : 0.f;
+    const int tq = tq0 + wave, tlast = min(T - 1, tq0 + 3);
+    // The block's key window: the union of the four rows' windows, capped at the last row (causal).
+    const int k0 = window > 0 ? max(0, tq0 - window + 1) : 0;
+    // This warp's own limits; keys outside them are loaded (the block shares one chunk) but not used.
+    const int w0 = window > 0 ? max(0, tq - window + 1) : 0;
+    float m = sink ? sink[(size_t)tq * heads + h] : -INFINITY, l = sink ? 1.f : 0.f;
+    const int live = tq < T;
+    const float4 qv = live ? *(const float4*)(q + ((size_t)tq * heads + h) * dim + 4 * lane)
+                           : make_float4(0.f, 0.f, 0.f, 0.f);
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-    for (int i0 = 0; i0 < n; i0 += 4) {
-        const int i = i0 + wave;
-        float d = 0.f;
-        if (i < n) {
-            const float4 kv = *(const float4*)(k + ((size_t)(w0 + i) * nkv + kh) * dim + 4 * lane);
-            d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
-        }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
-        if (lane == 0) {
-            sc[wave] = i < n ? d * scale + bias[((size_t)h * T + t) * T + w0 + i] : -INFINITY;
+    for (int kc = k0; kc <= tlast; kc += IKA_KB) {
+        // One copy of the chunk for the whole block: KBATCH keys x dim, both streams.
+        for (int e = threadIdx.x; e < IKA_KB * dim; e += 128) {
+            const int s = kc + e / dim, d = e % dim;
+            ks[e / dim][d] = s <= tlast ? k[((size_t)s * nkv + kh) * dim + d] : 0.f;
+            vs[e / dim][d] = s <= tlast ? v[((size_t)s * nkv + kh) * dim + d] : 0.f;
         }
         __syncthreads();
-        float mn = m;
+        if (live) {
+            for (int j = 0; j < IKA_KB; ++j) {
+                const int s = kc + j;
+                if (s > tq || s < w0) continue;
+                const float4 kv = *(const float4*)&ks[j][4 * lane];
+                float d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) mn = fmaxf(mn, sc[j]);
-        const float corr = mn == -INFINITY ? 1.f : expf(m - mn);
-        float sum = l * corr;
-        float4 ns = make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            if (i0 + j < n) {
-                const float p = mn == -INFINITY ? 0.f : expf(sc[j] - mn);
-                sum += p;
-                const float4 vv = *(const float4*)(v + ((size_t)(w0 + i0 + j) * nkv + kh) * dim + 4 * lane);
-                ns.x += p * vv.x;
-                ns.y += p * vv.y;
-                ns.z += p * vv.z;
-                ns.w += p * vv.w;
+                for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
+                const float sc = d * scale + bias[((size_t)h * T + tq) * T + s];
+                const float mn = fmaxf(m, sc), corr = expf(m - mn), p = expf(sc - mn);
+                const float4 vv = *(const float4*)&vs[j][4 * lane];
+                acc.x = acc.x * corr + p * vv.x;
+                acc.y = acc.y * corr + p * vv.y;
+                acc.z = acc.z * corr + p * vv.z;
+                acc.w = acc.w * corr + p * vv.w;
+                l = l * corr + p;
+                m = mn;
             }
         }
-        acc.x = acc.x * corr + ns.x;
-        acc.y = acc.y * corr + ns.y;
-        acc.z = acc.z * corr + ns.z;
-        acc.w = acc.w * corr + ns.w;
-        l = sum;
-        m = mn;
         __syncthreads();
     }
+    if (!live) return;
     const float inv = l > 0.f ? 1.f / l : 0.f;
-    const float* gp = gate + ((size_t)t * heads + h) * dim + 4 * lane;
     float4 o = {acc.x * inv, acc.y * inv, acc.z * inv, acc.w * inv};
-    const float4 g = gate ? *(const float4*)gp : make_float4(0.f, 0.f, 0.f, 0.f);
-    o.x = gate ? o.x / (1.f + expf(-g.x)) : o.x;
-    o.y = gate ? o.y / (1.f + expf(-g.y)) : o.y;
-    o.z = gate ? o.z / (1.f + expf(-g.z)) : o.z;
-    o.w = gate ? o.w / (1.f + expf(-g.w)) : o.w;
-    *(float4*)(out + ((size_t)t * heads + h) * dim + 4 * lane) = o;
+    if (gate) {
+        const float4 g = *(const float4*)(gate + ((size_t)tq * heads + h) * dim + 4 * lane);
+        o.x /= 1.f + expf(-g.x);
+        o.y /= 1.f + expf(-g.y);
+        o.z /= 1.f + expf(-g.z);
+        o.w /= 1.f + expf(-g.w);
+    }
+    *(float4*)(out + ((size_t)tq * heads + h) * dim + 4 * lane) = o;
 }
 
 // The attention residual (issue #62): a learned query attends over the running stack of block states plus the
@@ -425,34 +423,69 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias_dec(float* b
 }
 
 // One query against the cached keys: k and v are [max_ctx, nkv, dim] with `nk` valid rows from `k0`, q, gate and
-// out are [heads, dim], bias is [heads, nk] and sink is [heads]. The softmax runs online (max and running sum
-// rescaled per key), so the cache length is not bounded by the shared memory the whole-prompt kernel needs.
+// out are [heads, dim], bias is [heads, nk] and sink is [heads].
+//
+// The wall here is neither bandwidth nor arithmetic but the barrier: a block per (head) with a reduction per key ran
+// at 5-6 GB/s of effective traffic where the machine does 80. Each of the four warps now owns a quarter of the keys,
+// keeps its own (max, sum, output) in registers and never crosses a barrier inside the loop; the four partials are
+// merged once at the end. The sink is the score of a virtual key whose value is zero, so it enters the denominator
+// only, and the output gate is applied after the merge.
 extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, const float* q, const float* k,
                                                                   const float* v, const float* bias, const float* sink,
                                                                   const float* gate, int k0, int nk, int heads,
                                                                   int nkv, int dim, float scale) {
-    __shared__ float red[128];
-    const int h = blockIdx.x, kh = h / (heads / nkv), r = threadIdx.x;
-    const float qv = q[(size_t)h * dim + r];
-    const float g = gate ? gate[(size_t)h * dim + r] : 1.f;
-    // The sink is the score of a virtual key whose value is zero: it only enters the denominator.
-    float m = sink ? sink[h] : -INFINITY, l = sink ? 1.f : 0.f, acc = 0.f;
-    for (int i = 0; i < nk; ++i) {
-        const size_t s = (size_t)(k0 + i) * nkv + kh;
-        red[r] = qv * k[s * dim + r];
-        __syncthreads();
-        for (int o = 64; o > 0; o >>= 1) {
-            if (r < o) red[r] += red[r + o];
-            __syncthreads();
-        }
-        const float sc = red[0] * scale + bias[(size_t)h * nk + i];
-        const float mn = fmaxf(m, sc), k1 = __expf(m - mn), e = __expf(sc - mn);
-        l = l * k1 + e;
-        acc = acc * k1 + e * v[s * dim + r];
+    __shared__ float sm[4], sl[4], sa[4][128];
+    const int h = blockIdx.x, kh = h / (heads / nkv);
+    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const float4 qv = *(const float4*)(q + (size_t)h * dim + 4 * lane);
+    // This warp's slice of the keys, contiguous so the reads of a warp stay in one L2 window.
+    const int per = (nk + 3) / 4, i0 = wave * per, i1 = min(nk, i0 + per);
+    float m = -INFINITY, l = 0.f;
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int i = i0; i < i1; ++i) {
+        const float4 kv = *(const float4*)(k + ((size_t)(k0 + i) * nkv + kh) * dim + 4 * lane);
+        float d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
+        // Every lane of the warp sees the same score (the tree leaves it in all of them).
+        const float sc = d * scale + bias[(size_t)h * nk + i];
+        const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
+        const float4 vv = *(const float4*)(v + ((size_t)(k0 + i) * nkv + kh) * dim + 4 * lane);
+        acc.x = acc.x * corr + p * vv.x;
+        acc.y = acc.y * corr + p * vv.y;
+        acc.z = acc.z * corr + p * vv.z;
+        acc.w = acc.w * corr + p * vv.w;
+        l = l * corr + p;
         m = mn;
-        __syncthreads();
     }
-    out[(size_t)h * dim + r] = acc / l / (1.f + expf(-g));
+    if (lane == 0) sm[wave] = m, sl[wave] = l;
+    sa[wave][4 * lane] = acc.x;
+    sa[wave][4 * lane + 1] = acc.y;
+    sa[wave][4 * lane + 2] = acc.z;
+    sa[wave][4 * lane + 3] = acc.w;
+    __syncthreads();
+    // Merge: the sink rides in as one more split of weight exp(sink - mn) with a zero output.
+    float mn = sink ? sink[h] : -INFINITY;
+    for (int w = 0; w < 4; ++w) mn = fmaxf(mn, sm[w]);
+    float sum = sink ? __expf(sink[h] - mn) : 0.f, o[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int w = 0; w < 4; ++w) {
+        const float c = sm[w] == -INFINITY ? 0.f : __expf(sm[w] - mn);
+        sum += sl[w] * c;
+        o[0] += sa[w][4 * lane] * c;
+        o[1] += sa[w][4 * lane + 1] * c;
+        o[2] += sa[w][4 * lane + 2] * c;
+        o[3] += sa[w][4 * lane + 3] * c;
+    }
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+    float4 res = {o[0] * inv, o[1] * inv, o[2] * inv, o[3] * inv};
+    if (gate) {
+        const float4 g = *(const float4*)(gate + (size_t)h * dim + 4 * lane);
+        res.x /= 1.f + __expf(-g.x);
+        res.y /= 1.f + __expf(-g.y);
+        res.z /= 1.f + __expf(-g.z);
+        res.w /= 1.f + __expf(-g.w);
+    }
+    *(float4*)(out + (size_t)h * dim + 4 * lane) = res;
 }
 
 // MoE combine: y[t][i] += w[t] * x[t][i]. The route weight of one expert for every token, applied as the expert's

@@ -199,16 +199,20 @@ the KV cache (48 slots, one per layer and pass).
 |---|---|
 | weights on the device | 14.41 GB text + 0.64 GB vision + 0.27 GB (MTP, loaded, not used yet) |
 | session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
-| prefill `pp512` / `pp2048` | **214.1** / **120.1** tok/s |
-| decode `tg32` at ctx 512 / ctx 2048 | **12.8** / **9.5** tok/s |
+| prefill `pp512` / `pp2048` / `pp8192` | **251.5** / **173.5** / **122.4** tok/s |
+| decode `tg32` at ctx 512 / 2048 / 8192 | **16.5** / **15.5** / **14.1** tok/s |
 
-What the prefill costs, measured by ablation on a 2048-token chunk (70.8 s before, 17.1 s now):
+What the prefill costs, measured by ablation on a 2048-token chunk (70.8 s before, 11.8 s now):
 
 | | before | now |
 |---|---|---|
 | MoE experts, read once per (token, slot) pair | 40.9 s | **1.7 s** — `moe_sort` groups the pairs, so each expert crosses the bus once |
-| attention (`inkling2_attn`) | 24.8 s | **10.3 s** — still 60 % of the chunk, and the next wall |
-| everything else (dense MLS4 GEMMs, convolutions, mixes, head) | 5.1 s | 5.1 s |
+| attention (`inkling2_attn`) | 24.8 s | **2.5 s** — four query rows per block, K/V staged once per chunk of keys |
+| everything else (dense MLS4 GEMMs, convolutions, mixes, head) | 5.1 s | 4.6 s |
+
+The head was the other waste: `unembed` is 201 024 x 2304 and ran on every position of the prompt even when the caller
+wanted one row (`forward(..., n_logits)`); at 8 192 tokens that was a 1.65 GB download per prompt. It now runs on the
+rows asked for: +8 % of prefill and a fixed cost instead of a linear one.
 
 The expert traffic was the first wall and it was pure redundancy: `moe_gate_up` reads an expert once per pair, so a
 512-token chunk read 1.58 GB per token — the same as a decode step — and the prefill sat on the bandwidth wall
@@ -235,20 +239,20 @@ the bandwidth, and that is where the number becomes reachable.
 Fresh prompt at every depth (one forward, as the graph runs today), and the same prompt with the attention kernel
 removed by ablation — the rest of the graph, at the same weights:
 
-| depth | prefill today | prefill without the attention kernel | decode today |
-|---|---|---|---|
-| 512 | 214.3 tok/s | **288.3** | 12.9 tok/s |
-| 2 048 | 119.4 | **289.1** | 9.6 |
-| 4 096 | 91.6 | — | 8.5 |
-| 8 192 | 63.4 | 289.1 | 6.95 |
+| depth | prefill, before | prefill, now | decode, before | decode, now |
+|---|---|---|---|---|
+| 512 | 214.3 tok/s | **251.5** | 12.9 tok/s | **16.5** |
+| 2 048 | 119.4 | **173.5** | 9.6 | **15.5** |
+| 4 096 | 91.6 | — | 8.5 | — |
+| 8 192 | 63.4 | **122.4** | 6.95 | **14.1** |
+| retention at 8 K | 30 % | **49 %** | 54 % | **85 %** |
 
 Everything that is not attention is **flat with depth**: 289 tok/s at 512 tokens and 289 at 8 192, i.e. 3.46 ms per
-token for 8.7 GFLOP of experts and projections (2.5 TFLOPS). The degradation is one kernel: `inkling2_attn` reads the
-K and V of every visible key for every query row, with no reuse across the 16 rows a tile could share, so its traffic
-is `depth × 8 KiB` per slot per token — 832 MiB per token at 8 192 tokens over the 48 slots, which is 10.4 ms of
-bandwidth against the 15.8 ms a token takes. Tiling the queries would divide that traffic by 16 and make the
-attention compute-bound: ~0.2 ms per token at 8 K, so the projection is ~270 tok/s at 8 K (retention 95 % instead of
-30 %) and ~200 at 32 K.
+token for 8.7 GFLOP of experts and projections (2.5 TFLOPS). The degradation was one kernel reading the K and V of
+every visible key once per query row — `depth × 8 KiB` per slot per token, 832 MiB per token at 8 192 over the 48
+slots. The block now holds four query rows, one per warp, and stages the keys in shared memory once per 16-key chunk:
+four times less traffic and eight times fewer barriers. What is left of the slope is the 8 full-attention slots, which
+really do read the whole context — the next factor there is 16 query rows per tile (WMMA), not another barrier trick.
 
 Decode has the same shape of problem from the other side: 78 ms per token at a 512-token context, of which 28 is the
 2.24 GB of weights at the bandwidth wall, ~4 the sliding layers' 1024-key window and the rest the decode attention
@@ -256,8 +260,8 @@ kernel, which runs at ~5 GB/s of effective traffic where the machine does 80. At
 ~30 tok/s to 8 K and ~23 at 32 K with fp16 keys and values (halving the full slots' traffic); today the eight
 full-attention slots read `32 KiB` per position per token in fp32.
 
-**Against the production model** (Ornith-1.5-35B-A3B, same machine, `malleus bench`): prefill 214.1 against 968.5
-tok/s at depth 0, decode 12.8 against 29.08 (MTP off on both sides). The prefill gap is now all in the attention;
+**Against the production model** (Ornith-1.5-35B-A3B, same machine, `malleus bench`): prefill 251.5 against 968.5
+tok/s at depth 0, decode 16.5 against 29.08 (MTP off on both sides). The prefill gap is now all in the attention;
 the decode gap is the bandwidth of 2.24 GB per token against Ornith's ~0.7, i.e. the loop reading the core layers
 three times.
 
@@ -268,9 +272,9 @@ the looped forward), greedy off:
 
 | metric | prefill (one forward) | decode (one token at a time, through the cache) |
 |---|---|---|
-| last-token top-1 against bf16 | **19/20** | **20/20** |
-| all-position argmax | 71.39 % (519/727) | 67.81 % (493/727) |
-| worst KL | 0.578 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.302 |
+| last-token top-1 against bf16 | **20/20** | **20/20** |
+| all-position argmax | 67.81 % (493/727) | 68.78 % (500/727) |
+| worst KL | 0.370 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.344 |
 
 `raw-continue` is the one prompt of the set that is not rendered through the chat template, and the only one whose
 KL is not in the 1e-5 range: it is where the file's 4 bits show. It is also the prompt the grouped prefill's int8
@@ -288,9 +292,9 @@ prompt.
 | en-pg11 | 5.432 (5.257) | 91.99 % | 0.0266 |
 | code-utils | 1.983 (1.912) | 96.00 % | 0.0278 |
 | code-module | 2.242 (2.182) | 96.00 % | 0.0217 |
-| chat-it | 55.261 (29.000) | 78.91 % | 0.3542 |
-| chat-en | 45.184 (40.006) | 83.40 % | 0.1771 |
-| **total** | **9.220 (8.188, +12.60 %)** | **90.03 %** | **0.0887** |
+| chat-it | 53.712 (29.000) | 78.52 % | 0.3485 |
+| chat-en | 45.852 (40.006) | 83.20 % | 0.1799 |
+| **total** | **9.209 (8.188, +12.47 %)** | **89.92 %** | **0.0884** |
 
 The two chat documents are the outliers (+90 % and +14 % perplexity against +1.7…+5.3 % for the six plain ones) and
 they are the only documents over 1 000 tokens whose tokens are *not* plain prose: they open with the reasoning-effort

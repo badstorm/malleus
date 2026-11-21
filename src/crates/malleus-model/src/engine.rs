@@ -1496,7 +1496,7 @@ impl Model {
         // generic path's layer/state bookkeeping does not describe its 48 KV slots.
         if self.inkling2.is_some() {
             let cache = sess.inkling2.as_deref_mut().context("inkling2 session")?;
-            let all = crate::inkling2::logits(self, Some(cache), tokens)?;
+            let all = crate::inkling2::logits(self, Some(cache), tokens, n_logits)?;
             let vocab = self.cfg.vocab;
             let start = all.len().saturating_sub(n_logits * vocab);
             return Ok(all[start..].to_vec());

@@ -1345,6 +1345,7 @@ impl Graph {
                 t,
                 h,
                 eps,
+                0,
             )?;
             copy_nq(&self.mix_out, &self.qin, 0, t, h, nq, st)?;
             if full {
@@ -1375,6 +1376,7 @@ impl Graph {
                 t,
                 h,
                 eps,
+                0,
             )?;
             for qi in 0..4 {
                 copy_nq(&self.msg_out, &self.msg[qi], qi, t, h, 4, st)?;
@@ -1753,6 +1755,7 @@ impl Graph {
             t,
             h,
             eps,
+            0,
         )?;
         if messages.is_some() {
             let ctrl = layer.controller.as_ref().context("loop layer without controller")?;
@@ -2074,7 +2077,7 @@ impl Graph {
 ///
 /// With a `cache` the keys, the values and the convolution histories land in the session, and a single token runs
 /// the one-token kernels against them instead of the whole prompt again.
-fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>) -> Result<Vec<f32>> {
+fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>, n_logits: usize) -> Result<Vec<f32>> {
     let c = &model.cfg;
     let i = c.inkling2.as_ref().context("no inkling2 config")?;
     let w = model.inkling2.as_ref().context("no inkling2 weights")?;
@@ -2168,7 +2171,10 @@ fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>) -> Result<Vec<f
         k.len += t;
     }
 
-    // The final attention residual, the norm and the head.
+    // The final attention residual, the norm and the head, on the last `out_rows` rows only: a generation step
+    // wants one row, and the head is 201 024 x 2304 — running it on a whole prompt is a 1.65 GB download at 8K.
+    let out_rows = n_logits.clamp(1, t);
+    let row0 = t - out_rows;
     mix(
         model,
         st,
@@ -2178,13 +2184,13 @@ fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>) -> Result<Vec<f
         &g.x,
         &w.output_query,
         1,
-        t,
+        out_rows,
         h,
         c.eps,
+        row0,
     )?;
-    rms(model, st, &g.normed, &g.mix_out, &w.norm, t, h, c.eps)?;
-    // The whole sequence's logits: the golden and eval gates compare every position's argmax.
-    let logits_out = f32s(t * c.vocab)?;
+    rms(model, st, &g.normed, &g.mix_out, &w.norm, out_rows, h, c.eps)?;
+    let logits_out = f32s(out_rows * c.vocab)?;
     lin(
         model,
         st,
@@ -2194,15 +2200,15 @@ fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>) -> Result<Vec<f
         &logits_out,
         &g.normed,
         &w.unembed,
-        t,
+        out_rows,
     )?;
-    softcap(model, st, &logits_out, t * c.vocab, i.logit_softcap)?;
-    Ok(logits_out.download(t * c.vocab)?)
+    softcap(model, st, &logits_out, out_rows * c.vocab, i.logit_softcap)?;
+    Ok(logits_out.download(out_rows * c.vocab)?)
 }
 
-/// The logits of every position of `tokens`, appending to the session's cache when there is one.
-pub fn logits(model: &Model, cache: Option<&mut Cache>, tokens: &[u32]) -> Result<Vec<f32>> {
-    run(model, tokens, cache)
+/// The logits of the last `n_logits` positions of `tokens`, appending to the session's cache when there is one.
+pub fn logits(model: &Model, cache: Option<&mut Cache>, tokens: &[u32], n_logits: usize) -> Result<Vec<f32>> {
+    run(model, tokens, cache, n_logits)
 }
 
 /// `Place` for one layer of the session's cache, or `None` without a cache.
@@ -2288,6 +2294,7 @@ fn raw_gemm(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `row0` selects the first row of the block stack this call reads: the head of a prompt only needs its last rows.
 fn mix(
     model: &Model,
     st: &Stream,
@@ -2300,12 +2307,13 @@ fn mix(
     t: usize,
     h: usize,
     eps: f32,
+    row0: usize,
 ) -> Result<()> {
     let n = blocks.len() + 1;
     for (j, b) in blocks.iter().enumerate() {
-        states.copy_from_shared(j * t * h * 4, b, 0, t * h * 4, st)?;
+        states.copy_from_shared(j * t * h * 4, b, row0 * h * 4, t * h * 4, st)?;
     }
-    states.copy_from_shared((n - 1) * t * h * 4, partial, 0, t * h * 4, st)?;
+    states.copy_from_shared((n - 1) * t * h * 4, partial, row0 * h * 4, t * h * 4, st)?;
     model.k.get("inkling2_attn_res").launch(
         ((t * nq) as u32, 1, 1),
         (256, 1, 1),
@@ -2579,7 +2587,7 @@ fn attn(
     scale: f32,
 ) -> Result<()> {
     model.k.get("inkling2_attn").launch(
-        ((t * heads) as u32, 1, 1),
+        ((t.div_ceil(4) * heads) as u32, 1, 1),
         (128, 1, 1),
         0,
         st,
@@ -2619,14 +2627,14 @@ pub fn generate(model: &Model, tokens: &[u32], n: usize) -> Result<Vec<u32>> {
     let i = c.inkling2.as_ref().context("no inkling2 config")?;
     let mut cache = Cache::new(model, tokens.len() + n + 1)?;
     let mut out = Vec::with_capacity(n);
-    let all = run(model, tokens, Some(&mut cache))?;
+    let all = run(model, tokens, Some(&mut cache), 1)?;
     let mut next = argmax(&all[all.len() - c.vocab..], i.unpadded_vocab);
     for _ in 0..n {
         out.push(next);
         if c.eos.contains(&next) {
             break;
         }
-        next = argmax(&run(model, &[next], Some(&mut cache))?, i.unpadded_vocab);
+        next = argmax(&run(model, &[next], Some(&mut cache), 1)?, i.unpadded_vocab);
     }
     Ok(out)
 }
