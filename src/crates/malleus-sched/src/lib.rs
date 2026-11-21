@@ -781,10 +781,20 @@ impl Worker {
         let mut image_inserts: Vec<(usize, DeviceBuffer)> = Vec::new();
         if image_req {
             let token = req.image_token.context("images without an <|image_pad|> token id")?;
-            let vision = self.model.vision.as_ref().context("model has no vision tower")?;
-            let merge = vision.cfg.merge;
+            // Hy4 owns its tower in `hy4_vision` and its own preprocessing/positions; the carried Qwen models use
+            // the generic `vision`. The two differ in the merge grid (Hy4 has a newline column per merged row) and
+            // in the image token count, so the expansion below is family-specific.
+            let hy4_merge = self.model.hy4_vision_merge();
+            let (merge, patch) = match hy4_merge {
+                Some(m) => (m, 16),
+                None => {
+                    let v = self.model.vision.as_ref().context("model has no vision tower")?;
+                    (v.cfg.merge, v.cfg.patch)
+                }
+            };
             let mut expanded = Vec::with_capacity(req.prompt.len() + 256);
             let mut grids = Vec::new();
+            let mut hgrids: Vec<(usize, usize, usize)> = Vec::new();
             let mut starts = Vec::new();
             let mut merged = Vec::new();
             let mut images = req.images.iter();
@@ -798,7 +808,28 @@ impl Worker {
                 // The tower's attention is quadratic in the patches, so the image is reduced to a patch budget
                 // instead of the 16.7 Mpx the processor would accept (~65 000 patches, hours of GPU).
                 let max_patches = env_or("MALLEUS_VISION_MAX_PATCHES", DEFAULT_VISION_MAX_PATCHES).max(1);
-                let patch = vision.cfg.patch;
+                let start = expanded.len();
+                if hy4_merge.is_some() {
+                    let (feat, gh, gw) = self.model.hy4_image_features(&rgb, h, w, max_patches)?;
+                    anyhow::ensure!(
+                        gh % merge == 0 && gw % merge == 0,
+                        "image grid {gh}x{gw} is not a multiple of merge {merge}"
+                    );
+                    let (hm, wm) = (gh / merge, gw / merge);
+                    let rows = hm * (wm + 1);
+                    anyhow::ensure!(
+                        feat.len() == rows * self.model.cfg.hidden,
+                        "hy4 image features: {} values, {rows} rows of {}",
+                        feat.len(),
+                        self.model.cfg.hidden
+                    );
+                    expanded.extend(std::iter::repeat_n(token, rows));
+                    hgrids.push((1, gh, gw));
+                    starts.push(start);
+                    merged.push(DeviceBuffer::from_slice(&feat)?);
+                    continue;
+                }
+                let vision = self.model.vision.as_ref().context("model has no vision tower")?;
                 let pre = preprocess_rgb(
                     &rgb,
                     h,
@@ -830,7 +861,6 @@ impl Worker {
                     pre.grid_w
                 );
                 let (gh, gw) = (pre.grid_h / merge, pre.grid_w / merge);
-                let start = expanded.len();
                 expanded.extend(std::iter::repeat_n(token, gh * gw));
                 grids.push((gh, gw));
                 starts.push(start);
@@ -839,7 +869,10 @@ impl Worker {
             }
             anyhow::ensure!(images.next().is_none(), "more images than image placeholders");
             req.prompt = expanded;
-            let (pos, _) = mrope::positions(&req.prompt, token, &grids, 0)?;
+            let pos = match hy4_merge {
+                Some(_) => self.model.hy4_image_positions(&req.prompt, token, &hgrids)?,
+                None => mrope::positions(&req.prompt, token, &grids, 0)?.0,
+            };
             image_pos = Some(pos);
             image_inserts = starts.into_iter().zip(merged).collect();
         }

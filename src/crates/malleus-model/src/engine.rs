@@ -1957,7 +1957,7 @@ impl Model {
         argmax_only: bool,
     ) -> Result<Vec<f32>> {
         if self.hy4.is_some() {
-            let logits = crate::hy4::forward(self, sess, tokens, positions, n_logits)?;
+            let logits = crate::hy4::forward(self, sess, tokens, positions, n_logits, inserts)?;
             // `argmax_only` callers read the token id from the first element, not a row of logits.
             if argmax_only {
                 let v = &logits[logits.len() - self.cfg.vocab..];
