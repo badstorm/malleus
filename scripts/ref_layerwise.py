@@ -494,6 +494,7 @@ def hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev):
     import transformers
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
     from transformers.models.hy_v4.modeling_hy_v4 import HYV4HyperHead
+    from transformers.models.hy_v4_flash import modeling_hy_v4_flash as H
     from transformers.models.hy_v4_vl import modeling_hy_v4_vl as V
 
     pre = "model."

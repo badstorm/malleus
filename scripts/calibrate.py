@@ -23,7 +23,14 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from golden import load_on_gpu  # noqa: E402
-from ref_layerwise import ShardedRows, Shards, load_module  # noqa: E402
+from ref_layerwise import (  # noqa: E402
+    HY4_RENAME,
+    KEEP_FP32,
+    HostEngramEmbedding,
+    ShardedRows,
+    Shards,
+    load_module,
+)
 
 BLOCK = 128
 HADAMARD_SEED = 0x4D4C_5334_0001
@@ -56,6 +63,33 @@ MLS4_FAMILIES = {
 }
 MLP_FAMILIES = [("mlp.gate_proj", "mlp.up_proj"), ("mlp.down_proj",)]
 MOE_FAMILIES = [("mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj"), ("mlp.shared_expert.down_proj",)]
+
+# Hy4-flash (`hy_v4_flash`). The attention reads the layer input in three projections at once (`q_a`, `kv_a` and the
+# output gate), while `q_b` and `kv_b` read the two normed latents and `o_proj` the attention output: five Hessians.
+# The latent MoE reads the full-width input in `shared_experts.gate/up` and `pre_expert_proj`, `post_expert_proj`
+# reads the experts' output. The Engram's value and four key projections all read the same flattened memory.
+HY4_ATTN_FAMILIES = [
+    ("self_attn.q_a_proj", "self_attn.kv_a_proj_with_mqa", "self_attn.gate_proj"),
+    ("self_attn.q_b_proj",),
+    ("self_attn.kv_b_proj",),
+    ("self_attn.o_proj",),
+]
+HY4_DENSE_FAMILIES = [("mlp.gate_proj", "mlp.up_proj"), ("mlp.down_proj",)]
+HY4_MOE_FAMILIES = [
+    ("mlp.shared_experts.gate_proj", "mlp.shared_experts.up_proj", "mlp.pre_expert_proj"),
+    ("mlp.shared_experts.down_proj",),
+    ("mlp.post_expert_proj",),
+]
+HY4_ENGRAM_FAMILIES = [
+    ("engram_layer.value_proj", "engram_layer.key_projs.0", "engram_layer.key_projs.1",
+     "engram_layer.key_projs.2", "engram_layer.key_projs.3"),
+]
+# Module name -> checkpoint name, for the tensors the converter reads by their source name.
+HY4_OUT_NAME = {
+    "self_attn.gate_proj.weight": "self_attn.linear_gate.weight",
+    "mlp.pre_expert_proj.weight": "mlp.routed_expert_down_proj.weight",
+    "mlp.post_expert_proj.weight": "mlp.routed_expert_up_proj.weight",
+}
 # Hyper-connection mixing, --hc. GatedResidual reads one normalized state: down and block_inject both take
 # hyper_input_normed, so they share one Hessian, while up takes silu(down(...) / hc_count) and needs its own.
 # They are ~0.8 GB per decode token, a large enough share of what a decode step reads that they get their own
@@ -461,6 +495,147 @@ class Layerwise:
         torch.cuda.empty_cache()
 
 
+class Hy4Layerwise:
+    """Layer-by-layer backend for Hy4-flash, whose 411 GB checkpoint never fits.
+
+    The layer, its Engram table and its non-persistent buffers are built exactly as scripts/ref_layerwise.py
+    builds them, so the captured inputs are the ones `malleus golden` compares against.
+    """
+
+    def __init__(self, model_dir, dev):
+        from transformers import AutoConfig
+        from transformers.models.hy_v4_flash import modeling_hy_v4_flash as H
+
+        self.H, self.dev = H, dev
+        self.cfg = AutoConfig.from_pretrained(model_dir).text_config
+        self.cfg._attn_implementation = "eager"
+        self.shards = Shards(Path(model_dir), dev)
+        self.prefix = "model."
+        self.types = self.cfg.layer_types
+        self.cur = (-1, None)
+        self.engram_layers = set(self.cfg.engram_layer_ids or ())
+
+    def n_layers(self):
+        return self.cfg.num_hidden_layers
+
+    def capture(self, samples):
+        """Input of layer 0 plus the per-type call arguments (masks, positions, n-grams), batched.
+
+        Every calibration sample has the same length, so one batch is valid and makes the expert statistics loop
+        once over the 512 experts instead of once per sample (which would take hours on 411 GB).
+        """
+        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+        cfg, dev = self.cfg, self.dev
+        pad = cfg.engram_pad_id
+        n = {len(s) for s in samples}
+        assert len(n) == 1, f"batched capture needs equal lengths, got {sorted(n)}"
+        with default_dtype(torch.bfloat16), torch.no_grad():
+            emb = self.shards.get(self.prefix + "embed_tokens.weight").to(dev)
+            rot = self.H.HYV4FlashRotaryEmbedding(cfg).to(dev).eval()
+            x = torch.tensor(samples, device=dev)
+            b, t = x.shape
+            e = emb[x]
+            pos = torch.arange(t, device=dev).view(1, 1, -1).expand(3, b, -1)
+            pe = {lt: rot(e, position_ids=pos, layer_type=lt) for lt in rot.layer_types}
+            mask_kwargs = {
+                "config": cfg,
+                "inputs_embeds": e,
+                "attention_mask": None,
+                "cache": None,
+                "position_ids": pos[0],
+                "allow_is_causal_skip": False,
+            }
+            masks = {
+                "indexed_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
+            shifted = [x]
+            offset_of = torch.arange(t, device=dev).unsqueeze(0)
+            for o in range(1, cfg.engram_max_ngram_size):
+                prev = torch.nn.functional.pad(x, (o, 0), value=pad)[:, :t]
+                shifted.append(torch.where(offset_of < o, torch.tensor(pad, device=dev), prev))
+            kw = {
+                k: {
+                    "attention_mask": masks[k],
+                    "position_ids": pos,
+                    "cache": None,
+                    "position_embeddings": pe[k],
+                    "indexer_position_ids": pos,
+                    "ngram_tokens": torch.stack(shifted, dim=-1),
+                    "engram_mask": x != pad,
+                }
+                for k in set(self.types)
+            }
+            hidden = e.unsqueeze(2).expand(-1, -1, cfg.hc_mult, -1).contiguous()
+            del emb, rot
+        torch.cuda.empty_cache()
+        return hidden, kw
+
+    def get(self, li):
+        if self.cur[0] == li:
+            return self.cur[1]
+        self.free()
+        H, cfg, dev = self.H, self.cfg, self.dev
+        with default_dtype(torch.bfloat16):
+            with torch.device("meta"):
+                layer = H.HYV4FlashDecoderLayer(cfg, li)
+            layer = layer.to_empty(device=dev)
+            for name, p in layer.named_parameters():
+                if any(k in name for k in KEEP_FP32):
+                    p.data = p.data.float()
+            prefix = f"{self.prefix}layers.{li}."
+            skip = ()
+            el = layer.engram_layer
+            if el is not None:
+                sizes = [s for order in cfg.engram_layer_head_vocab_sizes[str(li + 1)] for s in order]
+                name = prefix + "engram_layer.multi_head_embedding.embedding.weight"
+                el.multi_head_embedding = HostEngramEmbedding(
+                    self.shards, name, sizes, cfg.engram_n_embed_per_ngram // cfg.engram_n_head_per_ngram, dev
+                )
+                skip = ("multi_head_embedding.embedding.weight",)
+            load_module(layer, self.shards, prefix, skip, HY4_RENAME)
+            if el is not None:
+                # Non-persistent buffers are computed in `__init__`, which ran on the meta device: rebuild them
+                # from the loaded map exactly as `_init_weights` does, or every Engram lookup reads a wrong row.
+                el.head_vocab_sizes = torch.tensor(sizes, device=dev)
+                el.multi_head_embedding.offsets = (
+                    torch.tensor([0] + sizes[:-1], device=dev).cumsum(0).to(torch.long)
+                )
+                el.multi_head_embedding.head_vocab_sizes = el.head_vocab_sizes
+                el.lookup_table = self.shards.get(prefix + "engram_layer.lookup_table").to(dev)
+                el.hash_multipliers = el.draw_hash_multipliers(int(el.lookup_table.max()) + 1).to(dev)
+        layer.eval()
+        self.cur = (li, layer)
+        return layer
+
+    def free(self):
+        self.cur = (-1, None)
+        torch.cuda.empty_cache()
+
+    def out_name(self, key):
+        for module, checkpoint in HY4_OUT_NAME.items():
+            if key.endswith(module):
+                return key[: -len(module)] + checkpoint
+        return key
+
+
+# The families a layer is calibrated on, given its attention type and whether it carries routed experts.
+def families_for(backend, li, layer, experts, args):
+    if isinstance(backend, Hy4Layerwise):
+        groups = () if args.only_routed_experts else (
+            tuple(HY4_ATTN_FAMILIES)
+            + (tuple(HY4_ENGRAM_FAMILIES) if layer.engram_layer is not None else ())
+            + tuple(HY4_MOE_FAMILIES if experts is not None else HY4_DENSE_FAMILIES)
+        )
+        return groups
+    return () if args.only_routed_experts else (
+        MLS4_FAMILIES[backend.types[li]]
+        + (HC_FAMILIES if args.hc else [])
+        + (MOE_FAMILIES if experts is not None else MLP_FAMILIES)
+    )
+
+
 def checkpoint_bytes(model_dir):
     idx = Path(model_dir) / "model.safetensors.index.json"
     if idx.exists():
@@ -496,8 +671,12 @@ class expert_stats:
             x = hidden_states[tok_idx]
             xr = rotate(x.float(), self.rot)
             self.h_gu[e] += xr.T @ xr
-            gate, up = torch.nn.functional.linear(x, m.gate_up_proj[e]).chunk(2, dim=-1)
-            a = m.act_fn(gate) * up
+            gu = torch.nn.functional.linear(x, m.gate_up_proj[e])
+            if hasattr(m, "_apply_gate"):  # Hy4 clamps its SwiGLU; the module owns the exact gate.
+                a = m._apply_gate(gu)
+            else:
+                gate, up = gu.chunk(2, dim=-1)
+                a = m.act_fn(gate) * up
             ar = rotate(a.float(), self.rot)
             self.h_dn[e] += ar.T @ ar
             self.count[e] += x.shape[0]
@@ -618,12 +797,17 @@ def main():
     t0 = time.time()
     size = checkpoint_bytes(args.model)
     layerwise = args.layerwise == "yes" or (args.layerwise == "auto" and size > LAYERWISE_BYTES)
-    backend = Layerwise(args.model, dev) if layerwise else Whole(args.model, dev)
+    family = json.loads((Path(args.model) / "config.json").read_text()).get("model_type", "")
+    is_hy4 = family.startswith("hy_v4")
+    if is_hy4 and not layerwise:
+        ap.error("hy4-flash is 411 GB: it has to be calibrated layer by layer (--layerwise yes)")
+    backend = Hy4Layerwise(args.model, dev) if is_hy4 else Layerwise(args.model, dev) if layerwise else Whole(args.model, dev)
     print(f"{size >> 30} GB checkpoint, {'layer by layer' if layerwise else 'whole model'}", flush=True)
+    batched = is_hy4  # one forward for the whole calibration set (see Hy4Layerwise.capture)
     types = backend.types
     rot = rotation_matrix(dev)
     mls2_levels = torch.tensor(MLS2_GRIDS[args.mls2_grid], device=dev)
-    prefix = "model.language_model.layers"
+    prefix = backend.prefix.rstrip(".") if is_hy4 else "model.language_model.layers"
 
     hidden, kw = backend.capture(samples)
     print(f"captured inputs in {time.time() - t0:.0f}s", flush=True)
@@ -638,11 +822,7 @@ def main():
         # no traffic, and it is ~95% of both the runtime and the output size. --no-routed-experts leaves them in
         # bf16 for the propagation and calibrates only the dense families and the shared expert.
         routed = None if args.no_routed_experts else experts
-        groups = () if args.only_routed_experts else (
-            MLS4_FAMILIES[types[li]]
-            + (HC_FAMILIES if args.hc else [])
-            + (MOE_FAMILIES if experts is not None else MLP_FAMILIES)
-        )
+        groups = families_for(backend, li, layer, experts, args)
         if routed is not None:
             moe = expert_stats(routed, rot, mls2_levels if args.mls2_report else None)
         mods = {name: layer.get_submodule(name) for g in groups for name in g}
@@ -670,9 +850,12 @@ def main():
 
         hooks = [mods[g[0]].register_forward_pre_hook(acc(g[0])) for g in groups]
         with torch.no_grad():
-            for j, x in enumerate(hidden):
-                cur[0] = j
-                layer(x, **kw[j][types[li]])
+            if batched:
+                layer(hidden, **kw[types[li]])
+            else:
+                for j, x in enumerate(hidden):
+                    cur[0] = j
+                    layer(x, **kw[j][types[li]])
         for h in hooks:
             h.remove()
         if routed is not None:
@@ -708,7 +891,7 @@ def main():
                         extra = {"rtn2": l2 / base, "gptq2": lg2 / base}
                     # Drop the padding again: the propagation runs the real module, whose K is unpadded.
                     lin.weight.copy_(unrotate(deq, rot)[:, :k0].to(lin.weight.dtype))
-                    key = f"{prefix}.{li}.{name}.weight"
+                    key = backend.out_name(f"{prefix}.{li}.{name}.weight")
                     tensors[key], tensors[key + ".scales"] = pack(qg, sg)
                     report.append({"tensor": key, "rtn": l_rtn / base, "gptq": l_gptq / base, **extra})
                     print(f"  {li:2d} {name:28s} rtn {l_rtn / base:.3e} gptq {l_gptq / base:.3e} "
@@ -730,8 +913,11 @@ def main():
             from safetensors.torch import save_file
             save_file(tensors, str(out / f"layer_{li:02d}.safetensors"), metadata={"format": "mls4-gptq"})
 
-            for j, x in enumerate(hidden):
-                hidden[j] = layer(x, **kw[j][types[li]])
+            if batched:
+                hidden = layer(hidden, **kw[types[li]])
+            else:
+                for j, x in enumerate(hidden):
+                    hidden[j] = layer(x, **kw[j][types[li]])
         meta = {"samples": len(samples), "length": args.length, "damp": args.damp, "holdout": args.holdout}
         json.dump({**meta, "tensors": report}, open(out / "report.json", "w"), indent=1)
         print(f"layer {li} done in {time.time() - tl:.0f}s (stats {t_h:.0f}s, gptq {t_q:.0f}s, "
