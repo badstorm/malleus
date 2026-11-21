@@ -972,9 +972,10 @@ pub fn mtp_map(c: &Config) -> Result<Vec<Expected>> {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The text forward. One pass over the 24 layers per call (the base graph: the loop's cross-pass messages are the
-// next increment), on the whole token sequence. `generate` re-runs it for every new token, which is O(n^2) but is
-// the correctness path: no KV cache, no session state.
+// The text forward: the 24 layers, the loop's extra passes, then the head. The whole prompt runs as one graph with
+// `T` rows (`Graph`); one token at a time runs the same layer code with `T = 1` against `Cache`, which carries the
+// keys and values of every slot and the three-row histories of the four short convolutions. The prefill writes the
+// cache too, so decode starts where the prompt ended.
 // ---------------------------------------------------------------------------------------------------------------
 
 use crate::engine::Model;
@@ -994,6 +995,126 @@ fn argmax(v: &[f32], n: usize) -> u32 {
         }
     }
     bi
+}
+
+/// One KV stream's state across tokens: the keys and the values it has produced, and the three-row input histories
+/// of its short convolutions (`sconv` reads them for its taps, the decode path shifts them in place).
+///
+/// The release runs the 12 core layers three times, and every pass has its own attention: 24 physical layers plus
+/// two extra passes over the core (`n_layers + (passes - 1) * core`). Keys and values are fp32 like the rest of the
+/// graph; at 24 heads x 8 KV heads x 128 that is 8 KiB per token per slot (393 KiB per token over the 48 slots).
+pub struct Slot {
+    /// [`max`, kv_heads * head_dim] fp32, the keys after the convolution, the clip and the L2 norm.
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    /// [3, kv_heads * head_dim] the convolution input of the last three positions, oldest first.
+    past_k: DeviceBuffer,
+    past_v: DeviceBuffer,
+    /// [3, hidden] the same for the attention output and the MLP output.
+    past_y: DeviceBuffer,
+    past_moe: DeviceBuffer,
+}
+
+/// The session state of the decode path: one [`Slot`] per KV stream, the bias row of the current query, and the
+/// log-scaled position factor of the current position (`tau`, 1 below the floor).
+pub struct Cache {
+    max: usize,
+    len: usize,
+    slots: Vec<Slot>,
+    bias: DeviceBuffer,
+    tau: DeviceBuffer,
+}
+
+impl Cache {
+    pub fn new(model: &Model, max_ctx: usize) -> Result<Self> {
+        let c = &model.cfg;
+        let i = c.inkling2.as_ref().context("no inkling2 config")?;
+        let core = i.loop_end - i.loop_start;
+        let slots = c.n_layers + (i.loop_passes.max(1) - 1) * core;
+        let kvd = i.kv_heads * i.head_dim;
+        let mut out = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            out.push(Slot {
+                k: f32s(max_ctx * kvd)?,
+                v: f32s(max_ctx * kvd)?,
+                // Zeroed: the taps before the first token are the reference's left padding.
+                past_k: DeviceBuffer::zeroed(3 * kvd * 4)?,
+                past_v: DeviceBuffer::zeroed(3 * kvd * 4)?,
+                past_y: DeviceBuffer::zeroed(3 * c.hidden * 4)?,
+                past_moe: DeviceBuffer::zeroed(3 * c.hidden * 4)?,
+            });
+        }
+        Ok(Self {
+            max: max_ctx,
+            len: 0,
+            slots: out,
+            bias: f32s(i.heads * max_ctx)?,
+            tau: f32s(1)?,
+        })
+    }
+
+    /// Back to an empty context: no position, no key, no history (zeros are the reference's left padding).
+    pub fn reset(&mut self) -> Result<()> {
+        let st = Stream::null();
+        for s in &self.slots {
+            for b in [&s.past_k, &s.past_v, &s.past_y, &s.past_moe] {
+                b.memset(0, &st)?;
+            }
+        }
+        st.synchronize()?;
+        self.len = 0;
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The slot a layer's attention writes to: the physical layer in the first pass, then one of the extra passes'
+/// slots after the 24 physical ones.
+fn slot_of(i: &Inkling2Config, n_layers: usize, pass: usize, l: usize) -> usize {
+    if pass == 0 || l < i.loop_start || l >= i.loop_end {
+        return l;
+    }
+    n_layers + (pass - 1) * (i.loop_end - i.loop_start) + (l - i.loop_start)
+}
+
+/// Where a layer's keys, values and history go, and (on the one-token path) the query row of the relative bias and
+/// the position factor. Taken per layer, so the borrow of the session's cache lasts one layer.
+struct Place<'a> {
+    slot: &'a mut Slot,
+    bias: &'a DeviceBuffer,
+    tau: &'a DeviceBuffer,
+    /// Position of the first row of this call.
+    pos: usize,
+    /// One token: the decode kernels (sconv with the history shift, attention over the cache) run instead of the
+    /// whole-sequence ones.
+    one: bool,
+}
+
+/// Keeps the last three rows of a convolution's input in `past` ([3, C], oldest first), so the next call convolves
+/// across the boundary. `pos` is the position of the first row of `x`; rows before the sequence stay zero.
+fn keep_last3(st: &Stream, past: &DeviceBuffer, x: &DeviceBuffer, pos: usize, t: usize, c: usize) -> Result<()> {
+    for i in 0..3 {
+        // The row of the new history is global position pos + t - 3 + i: from `x` when the call has it, from the old
+        // history otherwise. Increasing i keeps every read ahead of the write that would clobber it.
+        let g = pos as isize + t as isize - 3 + i as isize;
+        if g < 0 {
+            continue;
+        }
+        let (src, off) = if g >= pos as isize {
+            (x, (g as usize - pos) * c * 4)
+        } else {
+            (past, (g as usize + 3 - pos) * c * 4)
+        };
+        past.copy_from_shared(i * c * 4, src, off, c * 4, st)?;
+    }
+    Ok(())
 }
 
 /// The buffers a layer reads and writes, allocated once per `step` and reused by every layer and every pass. The
@@ -1121,6 +1242,8 @@ impl Graph {
 
     /// Runs one decoder layer. `messages` is `Some((previous core blocks, previous pass output))` on the loop's
     /// extra passes: the four cross-pass queries then mix a message bank into the attention and MLP inputs.
+    /// `place` is the session's slot for this layer's attention when the caller has a cache: the keys and values
+    /// are written there and, with `place.one`, the convolution and the attention run on the one-token path.
     #[allow(clippy::too_many_arguments)]
     fn layer(
         &mut self,
@@ -1130,7 +1253,9 @@ impl Graph {
         w: &Weights,
         l: usize,
         messages: Option<(&[DeviceBuffer], &DeviceBuffer)>,
+        mut place: Option<Place<'_>>,
     ) -> Result<()> {
+        let one = place.as_ref().is_some_and(|p| p.one);
         let layer = &w.layers[l];
         let full = layer.full;
         let t = self.t;
@@ -1374,59 +1499,144 @@ impl Graph {
             Sconv::Dynamic { k_static, v_static, .. } => (k_static, v_static),
         };
         let div = if full { 3.0 } else { (i.sconv_k as f32 + 1.0).sqrt() };
-        sconv2(
-            model,
-            st,
-            &self.kt,
-            &self.k,
-            &self.vt,
-            &self.v,
-            k_w,
-            v_w,
-            dyn_k.as_ref(),
-            dyn_v.as_ref(),
-            &self.past,
-            t,
-            kvd,
-            kv,
-            div,
-        )?;
+        {
+            // The history of a chunk is the last three rows of its input; the one-token kernel shifts it itself.
+            let (past_k, past_v) = match place.as_ref() {
+                Some(p) => (&p.slot.past_k, &p.slot.past_v),
+                None => (&self.past, &self.past),
+            };
+            sconv2(
+                model,
+                st,
+                &self.kt,
+                &self.k,
+                &self.vt,
+                &self.v,
+                k_w,
+                v_w,
+                dyn_k.as_ref(),
+                dyn_v.as_ref(),
+                past_k,
+                past_v,
+                t,
+                kvd,
+                kv,
+                div,
+                one,
+            )?;
+        }
+        if let Some(p) = place.as_mut()
+            && !one
+        {
+            keep_last3(st, &p.slot.past_k, &self.k, p.pos, t, kvd)?;
+            keep_last3(st, &p.slot.past_v, &self.v, p.pos, t, kvd)?;
+        }
         self.k.copy_from_shared(0, &self.kt, 0, t * kvd * 4, st)?;
         self.v.copy_from_shared(0, &self.vt, 0, t * kvd * 4, st)?;
-        let tau = if full { self.taud.as_ref() } else { None };
+        let tau = match &place {
+            Some(p) if full && p.one => Some(p.tau),
+            _ => {
+                if full {
+                    self.taud.as_ref()
+                } else {
+                    None
+                }
+            }
+        };
         clip(model, st, &self.q, &layer.q_clip, tau, t, heads, hd, i.qk_clip)?;
         clip(model, st, &self.k, &self.ones_k, None, t, kv, hd, i.qk_clip)?;
         rms_unnorm(model, st, &self.v, t, kv, hd, eps)?;
         clip(model, st, &self.r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
-        rel_bias(
-            model,
-            st,
-            &self.bias,
-            &self.r,
-            &layer.rel_logits,
-            t,
-            heads,
-            d_rel,
-            i.rel_extent,
-        )?;
+        // The keys and values of this layer, as attention reads them, across every position the session holds.
+        if let Some(p) = place.as_mut() {
+            p.slot
+                .k
+                .copy_from_shared(p.pos * kvd * 4, &self.k, 0, t * kvd * 4, st)?;
+            p.slot
+                .v
+                .copy_from_shared(p.pos * kvd * 4, &self.v, 0, t * kvd * 4, st)?;
+        }
         let window = if full { 0 } else { i.window };
-        attn(
-            model,
-            st,
-            &self.attn_out,
-            &self.q,
-            &self.k,
-            &self.v,
-            &self.bias,
-            &self.sink,
-            &self.gate,
-            t,
-            heads,
-            kv,
-            hd,
-            window,
-            1.0 / (hd as f32).sqrt(),
-        )?;
+        let scale = 1.0 / (hd as f32).sqrt();
+        match &place {
+            Some(p) if p.one => {
+                // One query: the bias of this row over the keys the window leaves visible, then the cache.
+                let k0 = if window > 0 {
+                    (p.pos + 1).saturating_sub(window)
+                } else {
+                    0
+                };
+                let nk = p.pos + 1 - k0;
+                model.k.get("inkling2_rel_bias_dec").launch(
+                    ((heads * nk).div_ceil(256) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    st,
+                    &[
+                        p.bias.into(),
+                        (&self.r).into(),
+                        (&layer.rel_logits).into(),
+                        p.pos.into(),
+                        k0.into(),
+                        nk.into(),
+                        heads.into(),
+                        d_rel.into(),
+                        i.rel_extent.into(),
+                    ],
+                )?;
+                model.k.get("inkling2_attn_dec").launch(
+                    (heads as u32, 1, 1),
+                    (128, 1, 1),
+                    0,
+                    st,
+                    &[
+                        (&self.attn_out).into(),
+                        (&self.q).into(),
+                        (&p.slot.k).into(),
+                        (&p.slot.v).into(),
+                        p.bias.into(),
+                        (&self.sink).into(),
+                        (&self.gate).into(),
+                        k0.into(),
+                        nk.into(),
+                        heads.into(),
+                        kv.into(),
+                        hd.into(),
+                        scale.into(),
+                    ],
+                )?;
+            }
+            _ => {
+                rel_bias(
+                    model,
+                    st,
+                    &self.bias,
+                    &self.r,
+                    &layer.rel_logits,
+                    t,
+                    heads,
+                    d_rel,
+                    i.rel_extent,
+                )?;
+                attn(
+                    model,
+                    st,
+                    &self.attn_out,
+                    &self.q,
+                    &self.k,
+                    &self.v,
+                    &self.bias,
+                    &self.sink,
+                    &self.gate,
+                    t,
+                    heads,
+                    kv,
+                    hd,
+                    window,
+                    scale,
+                )?;
+            }
+        }
         lin(
             model,
             st,
@@ -1438,17 +1648,29 @@ impl Graph {
             &layer.wo,
             t,
         )?;
-        sconv_one(
-            model,
-            st,
-            &self.yt,
-            &self.y,
-            &layer.attn_sconv,
-            &self.past,
-            t,
-            h,
-            (i.sconv_k as f32 + 1.0).sqrt(),
-        )?;
+        {
+            let past = match place.as_ref() {
+                Some(p) => &p.slot.past_y,
+                None => &self.past,
+            };
+            sconv_one(
+                model,
+                st,
+                &self.yt,
+                &self.y,
+                &layer.attn_sconv,
+                past,
+                t,
+                h,
+                (i.sconv_k as f32 + 1.0).sqrt(),
+                one,
+            )?;
+        }
+        if let Some(p) = place.as_mut()
+            && !one
+        {
+            keep_last3(st, &p.slot.past_y, &self.y, p.pos, t, h)?;
+        }
         self.y.copy_from_shared(0, &self.yt, 0, t * h * 4, st)?;
 
         // 4. The block bookkeeping.
@@ -1558,17 +1780,29 @@ impl Graph {
                 0i32.into(),
             ],
         )?;
-        sconv_one(
-            model,
-            st,
-            &self.yt,
-            &self.moe_out,
-            &layer.mlp_sconv,
-            &self.past,
-            t,
-            h,
-            (i.sconv_k as f32 + 1.0).sqrt(),
-        )?;
+        {
+            let past = match place.as_ref() {
+                Some(p) => &p.slot.past_moe,
+                None => &self.past,
+            };
+            sconv_one(
+                model,
+                st,
+                &self.yt,
+                &self.moe_out,
+                &layer.mlp_sconv,
+                past,
+                t,
+                h,
+                (i.sconv_k as f32 + 1.0).sqrt(),
+                one,
+            )?;
+        }
+        if let Some(p) = place.as_mut()
+            && !one
+        {
+            keep_last3(st, &p.slot.past_moe, &self.moe_out, p.pos, t, h)?;
+        }
         self.moe_out.copy_from_shared(0, &self.yt, 0, t * h * 4, st)?;
         add(model, st, &self.x, &self.moe_out, t * h)?;
         Ok(())
@@ -1576,13 +1810,41 @@ impl Graph {
 }
 
 /// Runs `tokens` through the whole graph and returns the logits of every position, `[t, vocab]` row-major.
-fn step_logits(model: &Model, tokens: &[u32]) -> Result<Vec<f32>> {
+///
+/// With a `cache` the keys, the values and the convolution histories land in the session, and a single token runs
+/// the one-token kernels against them instead of the whole prompt again.
+fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>) -> Result<Vec<f32>> {
     let c = &model.cfg;
     let i = c.inkling2.as_ref().context("no inkling2 config")?;
     let w = model.inkling2.as_ref().context("no inkling2 weights")?;
     let st = &model.stream;
     let t = tokens.len();
+    ensure!(t > 0, "inkling2: empty input");
     let h = c.hidden;
+    let mut cache = cache;
+    let (pos, one) = match cache.as_deref() {
+        Some(k) => {
+            ensure!(
+                k.len() + t <= k.max,
+                "inkling2: {} tokens over the {} a session holds",
+                k.len() + t,
+                k.max
+            );
+            ensure!(
+                k.is_empty() || t == 1,
+                "inkling2: the prefill is not chunked yet, feed the prompt in one forward"
+            );
+            (k.len(), t == 1)
+        }
+        None => (0, false),
+    };
+    if let Some(k) = cache.as_deref_mut()
+        && one
+    {
+        // The log-scaled position factor of this token, 1 below the floor.
+        let tau = 1.0 + i.log_alpha * (((pos + 1) as f32) / i.log_floor as f32).max(1.0).ln();
+        k.tau.upload(&[tau])?;
+    }
     let mut g = Graph::new(model, t)?;
 
     let ids32: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
@@ -1612,30 +1874,37 @@ fn step_logits(model: &Model, tokens: &[u32]) -> Result<Vec<f32>> {
 
     // The prelude, then the first pass over the core layers.
     for l in 0..i.loop_start {
-        g.layer(model, st, i, w, l, None)?;
+        let place = place_of(cache.as_deref_mut(), slot_of(i, c.n_layers, 0, l), pos, one);
+        g.layer(model, st, i, w, l, None, place)?;
     }
     g.pre_loop_hidden.copy_from_shared(0, &g.x, 0, t * h * 4, st)?;
     let num_pre_blocks = (0..i.loop_start).filter(|l| l.is_multiple_of(i.attn_res_block)).count();
     for l in i.loop_start..i.loop_end {
-        g.layer(model, st, i, w, l, None)?;
+        let place = place_of(cache.as_deref_mut(), slot_of(i, c.n_layers, 0, l), pos, one);
+        g.layer(model, st, i, w, l, None, place)?;
     }
 
     // The extra passes restart from the prelude's output and its block stack, and read the previous pass's core
     // blocks (everything after the first one) and its output as the message bank.
-    for _pass in 1..i.loop_passes {
+    for pass in 1..i.loop_passes {
         let prev_blocks: Vec<DeviceBuffer> = g.blocks.split_off(num_pre_blocks + 1);
         let prev_hidden = f32s(t * h)?;
         prev_hidden.copy_from_shared(0, &g.x, 0, t * h * 4, st)?;
         g.x.copy_from_shared(0, &g.pre_loop_hidden, 0, t * h * 4, st)?;
         g.blocks.truncate(num_pre_blocks);
         for l in i.loop_start..i.loop_end {
-            g.layer(model, st, i, w, l, Some((&prev_blocks, &prev_hidden)))?;
+            let place = place_of(cache.as_deref_mut(), slot_of(i, c.n_layers, pass, l), pos, one);
+            g.layer(model, st, i, w, l, Some((&prev_blocks, &prev_hidden)), place)?;
         }
     }
 
     // The tail.
     for l in i.loop_end..c.n_layers {
-        g.layer(model, st, i, w, l, None)?;
+        let place = place_of(cache.as_deref_mut(), slot_of(i, c.n_layers, 0, l), pos, one);
+        g.layer(model, st, i, w, l, None, place)?;
+    }
+    if let Some(k) = cache.as_mut() {
+        k.len += t;
     }
 
     // The final attention residual, the norm and the head.
@@ -1670,13 +1939,23 @@ fn step_logits(model: &Model, tokens: &[u32]) -> Result<Vec<f32>> {
     Ok(logits_out.download(t * c.vocab)?)
 }
 
-/// Runs `tokens` through the whole graph and returns the argmax of the last position's logits.
-fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
-    let c = &model.cfg;
-    let i = c.inkling2.as_ref().context("no inkling2 config")?;
-    let all = step_logits(model, tokens)?;
-    let t = tokens.len();
-    Ok(argmax(&all[(t - 1) * c.vocab..], i.unpadded_vocab))
+/// The logits of every position of `tokens`, appending to the session's cache when there is one.
+pub fn logits(model: &Model, cache: Option<&mut Cache>, tokens: &[u32]) -> Result<Vec<f32>> {
+    run(model, tokens, cache)
+}
+
+/// `Place` for one layer of the session's cache, or `None` without a cache.
+fn place_of(cache: Option<&mut Cache>, slot: usize, pos: usize, one: bool) -> Option<Place<'_>> {
+    cache.map(|c| {
+        let Cache { slots, bias, tau, .. } = c;
+        Place {
+            slot: &mut slots[slot],
+            bias: &*bias,
+            tau: &*tau,
+            pos,
+            one,
+        }
+    })
 }
 
 fn rms(
@@ -1848,19 +2127,44 @@ fn sconv2(
     v_w: &DeviceBuffer,
     dyn_k: Option<&DeviceBuffer>,
     dyn_v: Option<&DeviceBuffer>,
+    past_k: &DeviceBuffer,
+    past_v: &DeviceBuffer,
+    t: usize,
+    c: usize,
+    heads: usize,
+    div: f32,
+    one: bool,
+) -> Result<()> {
+    for (y, x, w, dyn_w, past) in [(yk, xk, k_w, dyn_k, past_k), (yv, xv, v_w, dyn_v, past_v)] {
+        sconv_launch(model, st, y, x, w, dyn_w, past, t, c, heads, div, one)?;
+    }
+    Ok(())
+}
+
+/// One short convolution: the whole-sequence kernel, or the one-token one that shifts the history itself.
+#[allow(clippy::too_many_arguments)]
+fn sconv_launch(
+    model: &Model,
+    st: &Stream,
+    y: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &DeviceBuffer,
+    dyn_w: Option<&DeviceBuffer>,
     past: &DeviceBuffer,
     t: usize,
     c: usize,
     heads: usize,
     div: f32,
+    one: bool,
 ) -> Result<()> {
-    for (y, x, w, dyn_w) in [(yk, xk, k_w, dyn_k), (yv, xv, v_w, dyn_v)] {
-        let d: Arg = match dyn_w {
-            Some(x) => x.into(),
-            None => Arg::Ptr(0),
-        };
-        model.k.get("inkling2_sconv").launch(
-            ((t * c).div_ceil(256) as u32, 1, 1),
+    let d: Arg = match dyn_w {
+        Some(x) => x.into(),
+        None => Arg::Ptr(0),
+    };
+    if one {
+        // The one-token kernel has no `T`: one row, and the history shifts in place.
+        model.k.get("inkling2_sconv_dec").launch(
+            (c.div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
             0,
             st,
@@ -1870,16 +2174,34 @@ fn sconv2(
                 w.into(),
                 d,
                 past.into(),
-                t.into(),
                 c.into(),
                 heads.into(),
                 div.into(),
             ],
         )?;
+        return Ok(());
     }
+    model.k.get("inkling2_sconv").launch(
+        ((t * c).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            y.into(),
+            x.into(),
+            w.into(),
+            d,
+            past.into(),
+            t.into(),
+            c.into(),
+            heads.into(),
+            div.into(),
+        ],
+    )?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sconv_one(
     model: &Model,
     st: &Stream,
@@ -1890,25 +2212,9 @@ fn sconv_one(
     t: usize,
     c: usize,
     div: f32,
+    one: bool,
 ) -> Result<()> {
-    model.k.get("inkling2_sconv").launch(
-        ((t * c).div_ceil(256) as u32, 1, 1),
-        (256, 1, 1),
-        0,
-        st,
-        &[
-            y.into(),
-            x.into(),
-            w.into(),
-            Arg::Ptr(0),
-            past.into(),
-            t.into(),
-            c.into(),
-            1usize.into(),
-            div.into(),
-        ],
-    )?;
-    Ok(())
+    sconv_launch(model, st, y, x, w, None, past, t, c, 1, div, one)
 }
 
 fn clip(
@@ -2046,22 +2352,20 @@ fn softcap(model: &Model, st: &Stream, y: &DeviceBuffer, n: usize, cap: f32) -> 
     Ok(())
 }
 
-/// The graph has no KV cache: every new token re-runs the whole sequence.
-pub fn logits(model: &Model, tokens: &[u32]) -> Result<Vec<f32>> {
-    step_logits(model, tokens)
-}
-
+/// `n` greedy tokens after `tokens`, on a cache of its own: the prompt in one forward, then a token at a time.
 pub fn generate(model: &Model, tokens: &[u32], n: usize) -> Result<Vec<u32>> {
     let c = &model.cfg;
-    let mut ids = tokens.to_vec();
+    let i = c.inkling2.as_ref().context("no inkling2 config")?;
+    let mut cache = Cache::new(model, tokens.len() + n + 1)?;
     let mut out = Vec::with_capacity(n);
+    let all = run(model, tokens, Some(&mut cache))?;
+    let mut next = argmax(&all[all.len() - c.vocab..], i.unpadded_vocab);
     for _ in 0..n {
-        let next = step(model, &ids)?;
-        ids.push(next);
         out.push(next);
         if c.eos.contains(&next) {
             break;
         }
+        next = argmax(&run(model, &[next], Some(&mut cache))?, i.unpadded_vocab);
     }
     Ok(out)
 }
