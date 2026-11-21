@@ -1476,7 +1476,7 @@ fn moe(
             a.push(n.into());
             a.push(k.into());
             if gu {
-                a.push((&model.signs).into());
+                a.push(malleus_hip::Arg::U64(0));
             }
             model
                 .k
@@ -1485,10 +1485,18 @@ fn moe(
             Ok(())
         };
         let one = if t == 1 { "1" } else { "" };
+        // The latent rows rotated once, not by every expert's block for every row it reads.
+        model.k.get("hadamard128").launch(
+            ((t * latent / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[(&sc.xr).into(), (&rout_in).into(), (&model.signs).into(), latent.into()],
+        )?;
         grp(
             &format!("moe_gate_up_grp{one}"),
             &ms.gu,
-            &rout_in,
+            &sc.xr,
             &m.gu,
             2 * inter,
             latent,
@@ -2259,6 +2267,7 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
         ple_snap: None,
         ngram_prev: Vec::new(),
         hy4_spec: None,
+        hy4_draft: Default::default(),
         ix_tk: Vec::new(),
         ix_gk: Vec::new(),
         ix_pooled: Vec::new(),
@@ -3434,6 +3443,38 @@ pub(crate) struct SpecState {
     src: usize,
 }
 
+/// How a session's drafts have fared: a moving average of the drafts accepted per round sets the next block's
+/// length, and a session whose drafts keep failing stops drafting (one probe every `PROBE` rounds) so that it never
+/// decodes slower than without them.
+#[derive(Clone, Copy)]
+pub(crate) struct DraftStats {
+    accepted: f32,
+    last: usize,
+    rounds: usize,
+}
+
+impl Default for DraftStats {
+    fn default() -> Self {
+        DraftStats {
+            accepted: 2.0,
+            last: 0,
+            rounds: 0,
+        }
+    }
+}
+
+const PROBE: usize = 16;
+
+/// The drafts the next block proposes, at most `max`: none while the average says a verify would not pay.
+pub(crate) fn draft_len(sess: &mut crate::session::Session, max: usize) -> usize {
+    let s = &mut sess.hy4_draft;
+    s.rounds += 1;
+    if s.accepted < 0.6 {
+        return if s.rounds.is_multiple_of(PROBE) { 2.min(max) } else { 0 };
+    }
+    ((s.accepted + 1.0).ceil() as usize).clamp(1, max)
+}
+
 /// Rows of the last call the speculative state keeps: a verify is at most this wide.
 const SPEC_ROWS: usize = crate::weights::GEMV_MAX_T;
 
@@ -3453,6 +3494,12 @@ pub(crate) fn rollback(model: &crate::engine::Model, sess: &mut crate::session::
     if let Some(sp) = sess.hy4_spec.as_mut() {
         ensure!(n <= sp.src, "hy4 rollback past the verify");
         sp.src -= n;
+    }
+    let d = &mut sess.hy4_draft;
+    if d.last > 0 {
+        let acc = d.last.saturating_sub(n) as f32;
+        d.accepted = 0.7 * d.accepted + 0.3 * acc;
+        d.last = 0;
     }
     Ok(())
 }
@@ -3530,8 +3577,13 @@ pub(crate) fn draft(
     let dc = h.dfly.as_ref().context("no DFly2 config")?;
     let st = &model.stream;
     let hd = c.hidden;
+    let n = draft_len(sess, n);
+    if n == 0 {
+        return Ok(vec![]);
+    }
+    sess.hy4_draft.last = n;
     let wdt = n + 1;
-    ensure!(n >= 1 && wdt <= SPEC_ROWS + 2, "dfly block of {n} drafts");
+    ensure!(wdt <= SPEC_ROWS + 2, "dfly block of {n} drafts");
     ensure!(sess.len + wdt <= sess.max_ctx, "context full for a draft block");
     let sp = sess.hy4_spec.take().context("dfly: no target state to draft from")?;
     let mut sc = model.take_scratch(wdt.max(2))?;

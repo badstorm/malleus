@@ -570,6 +570,7 @@ impl Model {
             ple_snap: None,
             ngram_prev: vec![],
             hy4_spec: None,
+            hy4_draft: Default::default(),
             ix_tk: vec![],
             ix_gk: vec![],
             ix_pooled: vec![],
@@ -1341,11 +1342,11 @@ impl Model {
         } else {
             (w.n.div_ceil(16) as u32, t.div_ceil(8) as u32, 1)
         };
-        // Hy4's o_proj (K = 8192 / 16384 on 3072 rows): the fused rotation redoes the Hadamard of the whole input in
-        // every block, which costs as much as decoding the weights. Rotate once, then the same GEMV without it: r1
-        // for a decode step, L[t - 1] for every width of a verify, one row's arithmetic in both, so a verify row is
-        // the serial step bit for bit.
-        if name.starts_with("gemv_mls4_l") && w.n <= 4096 && w.k >= 8192 && self.hy4.is_some() {
+        // Hy4: the fused rotation redoes the Hadamard of all t inputs in every block (for o_proj, K = 16384, it cost as
+        // much as decoding the weights, and a verify of six paid it six times). Rotate once, then the same GEMV
+        // without it: r1 / l1 for a decode step, L[t - 1] for every width of a verify, one row's arithmetic in all,
+        // so a verify row is the serial step bit for bit.
+        if name.starts_with("gemv_mls4_l") && self.hy4.is_some() {
             let rot = [xr.into(), x.into(), (&self.signs).into(), w.k.into()];
             self.k
                 .get("hadamard128")
@@ -1361,8 +1362,16 @@ impl Model {
                 (acc as i32).into(),
                 Arg::U64(0),
             ];
-            let (kname, g) = if t == 1 {
-                ("gemv_mls4_r1", w.n.div_ceil(8))
+            const R: [&str; GEMV_MAX_T] = [
+                "gemv_mls4_r1",
+                "gemv_mls4_r2",
+                "gemv_mls4_r3",
+                "gemv_mls4_r4",
+                "gemv_mls4_r5",
+                "gemv_mls4_r6",
+            ];
+            let (kname, g) = if w.n <= 4096 {
+                (R[t - 1], w.n.div_ceil(if t == 1 { 8 } else { 16 }))
             } else {
                 (name, w.n.div_ceil(32))
             };
@@ -1606,7 +1615,9 @@ impl Model {
     /// token so `rollback` can drop the rejected tail. Returns the logits of every token.
     pub fn forward_verify(&self, sess: &mut Session, tokens: &[u32]) -> Result<Vec<f32>> {
         ensure!(
-            (2..=GEMV_MAX_T).contains(&tokens.len()) && self.has_mtp(),
+            // A block drafter may propose nothing (its drafts were not paying): then the verify is one step.
+            ((2..=GEMV_MAX_T).contains(&tokens.len()) || (tokens.len() == 1 && self.has_block_draft()))
+                && self.has_mtp(),
             "bad verify step"
         );
         self.forward_impl(sess, tokens, None, tokens.len(), &[], true, false)

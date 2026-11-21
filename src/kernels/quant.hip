@@ -188,13 +188,21 @@ typedef _Float16 q_h2 __attribute__((ext_vector_type(2)));
 // [T, rows of the segment] (projections sharing an input, merged into one matrix).
 // rs != null: xr is not rotated yet; the randomized Hadamard of every 128-block (signs rs) is applied while staging
 // (16 lanes per block: 8 elements each, then 4 shuffle stages), saving the separate rotation kernel.
-template <int TT, int R>
+template <int TT, int R, bool EXT = false>
 __device__ __forceinline__ void gemv4_hl(float* out, const float* xr, const uint8_t* q, const __half* sc, int T, int N,
                                          int K, int accumulate, float* o1 = nullptr, float* o2 = nullptr,
                                          float* o3 = nullptr, int b1 = 0, int b2 = 0, int b3 = 0,
                                          const int8_t* rs = nullptr, const int* xrow = nullptr,
-                                         const int* orow = nullptr) {
-    __shared__ __attribute__((aligned(16))) q_u4 xs[TT][128];
+                                         const int* orow = nullptr, q_u4* xs_ext = nullptr) {
+    // EXT: the staging buffer is the caller's, so a kernel that picks TT at run time pays for one buffer, not for
+    // the sum of all its instantiations.
+    q_u4 (*xs)[128];
+    if constexpr (EXT) {
+        xs = (q_u4 (*)[128])xs_ext;
+    } else {
+        __shared__ __attribute__((aligned(16))) q_u4 xs_s[TT][128];
+        xs = xs_s;
+    }
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int n0 = (blockIdx.x * 8 + warp) * R;
     const int G = K / 128;
@@ -338,6 +346,21 @@ extern "C" __global__ void __launch_bounds__(256) gemv_mls4_r1(float* out, const
                                                               const int8_t* rs) {
     gemv4_hl<1, 1>(out, xr, q, sc, T, N, K, acc, nullptr, nullptr, nullptr, 0, 0, 0, rs);
 }
+// One row per warp for TT tokens (a verify on few rows, N <= 4096): with four rows per warp a 3072-row matrix gave
+// the GPU 96 blocks and the verify of six ran at half the speed of a single r1 step.
+// RROWS rows per warp: 1 starves the LDS (six tokens' inputs read per 512 bytes of weights), 4 starves the GPU.
+#define RROWS 2
+#define GEMV4_R(TT)                                                                                                   \
+    extern "C" __global__ void __launch_bounds__(256)                                                                 \
+        gemv_mls4_r##TT(float* out, const float* xr, const uint8_t* q, const __half* sc, int T, int N, int K, int acc, \
+                        const int8_t* rs) {                                                                           \
+        gemv4_hl<TT, RROWS>(out, xr, q, sc, T, N, K, acc, nullptr, nullptr, nullptr, 0, 0, 0, rs);                    \
+    }
+GEMV4_R(2)
+GEMV4_R(3)
+GEMV4_R(4)
+GEMV4_R(5)
+GEMV4_R(6)
 GEMV4_HL(2)
 GEMV4_HL(3)
 GEMV4_HL(4)
@@ -757,23 +780,26 @@ __device__ __forceinline__ void moe_grp_core(float* out, const float* x, const u
         orow[threadIdx.x] = GU ? pr : offs[e] + r0 + min((int)threadIdx.x, rows - 1);
     }
     __syncthreads();
-    // One instantiation per row count: gemv4_hl stages and computes all TT rows, so an expert one token picked
-    // (every expert of a decode step) must not pay for eight.
+    // Four rows per warp (one per warp measured slower here: 8 rows a block is too little work per staging) and the instantiation
+    // for this expert's row count, staging in one shared buffer: the per-row sums depend on neither, so a verify row
+    // equals the single-row step bit for bit, and an expert one token picked computes one row.
+    __shared__ __attribute__((aligned(16))) q_u4 xbuf[MAXT][128];
     const uint8_t* qe = q + (size_t)e * N * (K / 2);
     const __half* se = sc + (size_t)e * N * (K / 128);
     const int8_t* r = GU ? rs : nullptr;
-#define MOE_GRP(TT) gemv4_hl<TT, 4>(out, x, qe, se, rows, N, K, 0, nullptr, nullptr, nullptr, 0, 0, 0, r, xrow, orow)
-    if (MAXT == 1) {
+#define MOE_GRP(TT)                                                                                                   \
+    gemv4_hl<TT, 4, true>(out, x, qe, se, rows, N, K, 0, nullptr, nullptr, nullptr, 0, 0, 0, r, xrow, orow, &xbuf[0][0])
+    if constexpr (MAXT == 1) {
         MOE_GRP(1);
-        return;
-    }
-    switch (rows) {
-        case 1: MOE_GRP(1); break;
-        case 2: MOE_GRP(2); break;
-        case 3: MOE_GRP(3); break;
-        case 4: MOE_GRP(4); break;
-        case 5: MOE_GRP(5); break;
-        default: MOE_GRP(6); break;
+    } else {
+        switch (rows) {
+            case 1: MOE_GRP(1); break;
+            case 2: MOE_GRP(2); break;
+            case 3: MOE_GRP(3); break;
+            case 4: MOE_GRP(4); break;
+            case 5: MOE_GRP(5); break;
+            default: MOE_GRP(6); break;
+        }
     }
 #undef MOE_GRP
 }
