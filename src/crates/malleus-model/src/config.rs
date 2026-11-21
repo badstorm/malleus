@@ -196,6 +196,18 @@ pub struct Hy4Config {
     pub vision: Option<Hy4Vision>,
     /// Token id of an image placeholder in the prompt; 0 when the checkpoint has no vision.
     pub image_token: u32,
+    /// The DFly2 speculative drafter the checkpoint carries (`model.dfly_layers.*`), if any.
+    pub dfly: Option<Hy4DFly>,
+}
+
+/// DFly2: `layers` MLA + SwiGLU blocks over a block of `mask`-filled slots, layer i reading the KV cache and the
+/// indexer selection of target layer `kv_layers[i]`.
+#[derive(Debug, Clone)]
+pub struct Hy4DFly {
+    pub layers: usize,
+    pub mask: u32,
+    pub kv_layers: Vec<usize>,
+    pub index_layers: Vec<usize>,
 }
 
 /// The vision tower's geometry (`vision_config`): HunYuan's ViT plus Hy4's patch merger.

@@ -180,6 +180,22 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         engram,
         vision,
         image_token: cfg["image_token_id"].as_u64().unwrap_or(0) as u32,
+        dfly: match cfg["dfly_num_hidden_layers"].as_u64() {
+            Some(n) => {
+                let list = |k: &str| -> Vec<usize> {
+                    cfg[k].as_array().map_or(vec![], |a| {
+                        a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect()
+                    })
+                };
+                Some(crate::config::Hy4DFly {
+                    layers: n as usize,
+                    mask: cfg["dfly_mask_token_id"].as_u64().context("dfly_mask_token_id")? as u32,
+                    kv_layers: list("dfly_target_kv_layers"),
+                    index_layers: list("dfly_target_index_layer"),
+                })
+            }
+            None => None,
+        },
     };
     let c = Config {
         hidden: u("hidden_size")?,
@@ -386,6 +402,9 @@ pub(crate) struct Engram {
     /// The odd multipliers `hash_ngrams` mixes the n-gram with, one per order: drawn by the checkpoint's seed
     /// (`engram_seed + 10007 * layer_id`, numpy PCG64) from the loaded map, so they are a property of the file.
     pub(crate) hash_mult: [i64; 3],
+    /// f32 on the device for `hy4_engram_gate`: `[value_bias | pre_gamma | per stream (key_bias, norm_query,
+    /// norm_key, scale)]`, each `hidden` wide.
+    pub(crate) gate_params: DeviceBuffer,
 }
 
 /// One Engram row table as the file stores it: `rows` rows of `k` 4-bit codes (bias 8) with an f16 scale each,
@@ -427,19 +446,30 @@ impl Table {
 
     /// Dequantized rows `ids` as `[ids, k]` f32: the 4-bit codes (bias 8) times the f16 scale of the row.
     pub(crate) fn rows(&self, ids: &[usize]) -> Result<Vec<f32>> {
+        use rayon::prelude::*;
         let rb = self.k / 2;
-        let mut buf = vec![0u8; rb];
-        let mut sb = [0u8; 2];
-        let mut out = Vec::with_capacity(ids.len() * self.k);
-        for &id in ids {
+        let mut out = vec![0f32; ids.len() * self.k];
+        // The rows are hashed, so a prompt reads them at random from a table mostly on NVMe: one read after the
+        // other waited ~80 us each, 2.2 s per Engram layer for a 2048-token prompt. In parallel the drive overlaps
+        // them; a decode step (16 rows) stays on one thread.
+        let read = |(id, dst): (&usize, &mut [f32])| -> Result<()> {
+            let id = *id;
             ensure!(id < self.rows, "engram row {id} out of range");
+            let mut buf = vec![0u8; rb];
+            let mut sb = [0u8; 2];
             self.file.read_at(id * rb, &mut buf)?;
             self.scales.read_at(id * 2, &mut sb)?;
             let s = half::f16::from_le_bytes(sb).to_f32();
-            for &b in &buf {
-                out.push(((b & 0xF) as f32 - 8.0) * s);
-                out.push(((b >> 4) as f32 - 8.0) * s);
+            for (i, &b) in buf.iter().enumerate() {
+                dst[2 * i] = ((b & 0xF) as f32 - 8.0) * s;
+                dst[2 * i + 1] = ((b >> 4) as f32 - 8.0) * s;
             }
+            Ok(())
+        };
+        if ids.len() > 64 {
+            ids.par_iter().zip(out.par_chunks_mut(self.k)).try_for_each(read)?;
+        } else {
+            ids.iter().zip(out.chunks_mut(self.k)).try_for_each(read)?;
         }
         Ok(out)
     }
@@ -470,6 +500,7 @@ pub(crate) struct Weights {
     pub(crate) engram_scales: Vec<DeviceBuffer>,
     pub(crate) norm: DeviceBuffer,
     pub(crate) head: Ihc,
+    pub(crate) dfly: Option<DFly>,
     pub(crate) bytes: usize,
 }
 
@@ -511,11 +542,13 @@ impl Weights {
             base: up.typed(src, "model.hc_head.hc_head_base", DType::F32, &[h.hc_mult])?,
             scale: up.typed(src, "model.hc_head.hc_head_scale", DType::F32, &[1])?,
         };
+        let dfly = DFly::load(src, c, up, seed)?;
         Ok(Weights {
             layers,
             engram_scales,
             norm,
             head,
+            dfly,
             bytes: up.bytes - before,
         })
     }
@@ -546,9 +579,6 @@ fn load_layer(
         MixerKind::Hy4Sliding => (h.swa_heads, h.swa_nope, h.swa_rope, h.swa_v),
         _ => (h.heads, h.nope, h.rope, h.v),
     };
-    let qd = heads * (nope + rope);
-    let kvd = heads * (nope + v);
-    let od = heads * v;
     let indexer = match c.kind[i] {
         MixerKind::Hy4Indexed => {
             let ix = |s: &str| p(&format!("self_attn.compressed_indexer.{s}"));
@@ -576,27 +606,7 @@ fn load_layer(
         }
         _ => None,
     };
-    let attn = Attn {
-        heads,
-        nope,
-        rope,
-        v,
-        q_a: up.linear(src, &p("self_attn.q_a_proj"), h.q_lora, c.hidden)?,
-        q_b: up.linear(src, &p("self_attn.q_b_proj"), qd, h.q_lora)?,
-        kv_a: up.linear(src, &p("self_attn.kv_a_proj_with_mqa"), h.kv_lora + rope, c.hidden)?,
-        kv_b: up.linear_bf16(src, &p("self_attn.kv_b_proj"), kvd, h.kv_lora, seed)?,
-        o: up.linear(src, &p("self_attn.o_proj"), c.hidden, od)?,
-        gate: up.linear(src, &p("self_attn.linear_gate"), od, c.hidden)?,
-        q_a_norm: up.norm(src, &p("self_attn.q_a_layernorm.weight"), h.q_lora, false)?,
-        // `mla_cache_write` multiplies by this weight directly and reads it as f32, so it goes up raw in f32.
-        kv_a_norm: up.norm_f32(src, &p("self_attn.kv_a_layernorm.weight"), h.kv_lora)?,
-        post_norm: up.norm(src, &p("self_attn.post_proj_norm.weight"), c.hidden, false)?,
-        sink: match h.sink {
-            true => Some(up.typed(src, &p("self_attn.learnable_sink_param"), DType::F32, &[heads])?),
-            false => None,
-        },
-        indexer,
-    };
+    let attn = load_attn(up, src, c, h, &p, (heads, nope, rope, v), indexer, seed)?;
     let ffn = if h.sparse[i] {
         let e = h_experts(src)?;
         let inter = moe_inter_width(src, &p("mlp"))?;
@@ -648,6 +658,132 @@ fn load_layer(
 }
 
 /// A bf16 tensor as a host vector (the Engram norms are applied on the host, where the memory is read).
+/// The gated MLA of a layer under `p` (a target layer or a drafter layer: the tensor names are the same).
+#[allow(clippy::too_many_arguments)]
+fn load_attn(
+    up: &mut Uploader,
+    src: &dyn TensorSource,
+    c: &Config,
+    h: &Hy4Config,
+    p: &dyn Fn(&str) -> String,
+    (heads, nope, rope, v): (usize, usize, usize, usize),
+    indexer: Option<Indexer>,
+    seed: u64,
+) -> Result<Attn> {
+    let qd = heads * (nope + rope);
+    let kvd = heads * (nope + v);
+    let od = heads * v;
+    Ok(Attn {
+        heads,
+        nope,
+        rope,
+        v,
+        q_a: up.linear(src, &p("self_attn.q_a_proj"), h.q_lora, c.hidden)?,
+        q_b: up.linear(src, &p("self_attn.q_b_proj"), qd, h.q_lora)?,
+        kv_a: up.linear(src, &p("self_attn.kv_a_proj_with_mqa"), h.kv_lora + rope, c.hidden)?,
+        kv_b: up.linear_bf16(src, &p("self_attn.kv_b_proj"), kvd, h.kv_lora, seed)?,
+        o: up.linear(src, &p("self_attn.o_proj"), c.hidden, od)?,
+        gate: up.linear(src, &p("self_attn.linear_gate"), od, c.hidden)?,
+        q_a_norm: up.norm(src, &p("self_attn.q_a_layernorm.weight"), h.q_lora, false)?,
+        // `mla_cache_write` multiplies by this weight directly and reads it as f32, so it goes up raw in f32.
+        kv_a_norm: up.norm_f32(src, &p("self_attn.kv_a_layernorm.weight"), h.kv_lora)?,
+        post_norm: up.norm(src, &p("self_attn.post_proj_norm.weight"), c.hidden, false)?,
+        sink: match h.sink {
+            // f32 in the target's layers, bf16 in the drafter's: the kernels read f32.
+            true => Some(match src.info(&p("self_attn.learnable_sink_param")).map(|i| i.dtype) {
+                Some(DType::BF16) => {
+                    DeviceBuffer::from_slice(&bf16_vec(src, &p("self_attn.learnable_sink_param"), heads)?)?
+                }
+                _ => up.typed(src, &p("self_attn.learnable_sink_param"), DType::F32, &[heads])?,
+            }),
+            false => None,
+        },
+        indexer,
+    })
+}
+
+/// One DFly2 block: pre-norm residual, the gated MLA of a target-geometry layer, a dense SwiGLU.
+#[allow(dead_code)]
+pub(crate) struct DLayer {
+    pub(crate) in_norm: DeviceBuffer,
+    pub(crate) post_norm: DeviceBuffer,
+    pub(crate) attn: Attn,
+    pub(crate) gate: Linear,
+    pub(crate) up: Linear,
+    pub(crate) down: Linear,
+}
+
+/// The DFly2 drafter (`model.dfly_layers.*`): the slot-0 fusion of the bonus token with the target's last hidden
+/// state, the blocks, the final norm and the hidden correction applied before the shared LM head.
+#[allow(dead_code)]
+pub(crate) struct DFly {
+    pub(crate) layers: Vec<DLayer>,
+    pub(crate) final_norm: DeviceBuffer,
+    pub(crate) eh_proj: Linear,
+    pub(crate) enorm: DeviceBuffer,
+    pub(crate) hnorm: DeviceBuffer,
+    /// f32 `[hidden]`: the per-channel gate of the slot-0 fusion.
+    pub(crate) fusion_gate: DeviceBuffer,
+    pub(crate) hc_gate: Linear,
+    pub(crate) hc_up: Linear,
+    pub(crate) hc_down: Linear,
+    pub(crate) hc_hidden_norm: DeviceBuffer,
+    pub(crate) hc_embed_norm: DeviceBuffer,
+}
+
+impl DFly {
+    pub(crate) fn load(src: &dyn TensorSource, c: &Config, up: &mut Uploader, seed: u64) -> Result<Option<Self>> {
+        let h = c.hy4.as_ref().context("no hy4 config")?;
+        let Some(d) = &h.dfly else { return Ok(None) };
+        if src.info("model.dfly_layers.final_norm.weight").is_none() {
+            return Ok(None);
+        }
+        ensure!(
+            d.kv_layers.len() == d.layers
+                && d.index_layers == d.kv_layers
+                && d.kv_layers
+                    .iter()
+                    .all(|&l| l < c.n_layers && c.kind[l] == MixerKind::Hy4Indexed),
+            "dfly: every draft layer reads an indexed target layer's cache and selection"
+        );
+        let hd = c.hidden;
+        let mut layers = Vec::with_capacity(d.layers);
+        for j in 0..d.layers {
+            let p = |s: &str| format!("model.dfly_layers.{j}.{s}");
+            let inter = src
+                .info(&p("mlp.gate_proj.weight"))
+                .context("dfly mlp")?
+                .shape
+                .iter()
+                .copied()
+                .find(|&x| x != hd)
+                .unwrap_or(hd);
+            layers.push(DLayer {
+                in_norm: up.norm(src, &p("input_layernorm.weight"), hd, false)?,
+                post_norm: up.norm(src, &p("post_attention_layernorm.weight"), hd, false)?,
+                attn: load_attn(up, src, c, h, &p, (h.heads, h.nope, h.rope, h.v), None, seed)?,
+                gate: up.linear(src, &p("mlp.gate_proj"), inter, hd)?,
+                up: up.linear(src, &p("mlp.up_proj"), inter, hd)?,
+                down: up.linear(src, &p("mlp.down_proj"), hd, inter)?,
+            });
+        }
+        let q = |s: &str| format!("model.dfly_layers.{s}");
+        Ok(Some(DFly {
+            layers,
+            final_norm: up.norm(src, &q("final_norm.weight"), hd, false)?,
+            eh_proj: up.linear(src, &q("mtp_fusion.eh_proj"), hd, 2 * hd)?,
+            enorm: up.norm(src, &q("mtp_fusion.enorm.weight"), hd, false)?,
+            hnorm: up.norm(src, &q("mtp_fusion.hnorm.weight"), hd, false)?,
+            fusion_gate: DeviceBuffer::from_slice(&bf16_vec(src, &q("mtp_fusion.gate"), hd)?)?,
+            hc_gate: up.linear(src, &q("hidden_correction.gate_proj"), hd, 2 * hd)?,
+            hc_up: up.linear(src, &q("hidden_correction.up_proj"), hd, 2 * hd)?,
+            hc_down: up.linear(src, &q("hidden_correction.down_proj"), hd, hd)?,
+            hc_hidden_norm: up.norm(src, &q("hidden_correction.hidden_norm.weight"), hd, false)?,
+            hc_embed_norm: up.norm(src, &q("hidden_correction.embed_norm.weight"), hd, false)?,
+        }))
+    }
+}
+
 fn bf16_vec(src: &dyn TensorSource, name: &str, n: usize) -> Result<Vec<f32>> {
     let raw = src.read_all(name).with_context(|| format!("missing tensor {name}"))?;
     let v: Vec<f32> = raw
@@ -788,16 +924,28 @@ fn load_engram(
         .typed(src, &p("lookup_table"), DType::I32, &[e.lookup])?
         .download(e.lookup)?;
     let head_vocab: Vec<usize> = sizes.iter().flatten().copied().collect();
+    let pre_gamma = bf16_vec(src, &p("unified_pre_gamma"), c.hidden)?;
+    let value_bias = bf16_vec(src, &p("value_proj.bias"), c.hidden)?;
+    let mut params = Vec::with_capacity((2 + 4 * key_bias.len()) * c.hidden);
+    params.extend_from_slice(&value_bias);
+    params.extend_from_slice(&pre_gamma);
+    for s in 0..key_bias.len() {
+        for v in [&key_bias[s], &norm_query[s], &norm_key[s], &scales[s]] {
+            ensure!(v.len() == c.hidden, "engram gate vector width");
+            params.extend_from_slice(v);
+        }
+    }
     Ok(Engram {
         key,
         value: up.linear(src, &p("value_proj"), c.hidden, width)?,
         norm_key,
         norm_query,
         head_norms,
-        pre_gamma: bf16_vec(src, &p("unified_pre_gamma"), c.hidden)?,
+        pre_gamma,
         scales,
-        value_bias: bf16_vec(src, &p("value_proj.bias"), c.hidden)?,
+        value_bias,
         key_bias,
+        gate_params: DeviceBuffer::from_slice(&params)?,
         head_vocab,
         heads: e.heads,
         dim: e.embed / e.heads,
@@ -809,12 +957,60 @@ fn load_engram(
     })
 }
 
+/// The most tokens one forward call takes: a longer call is split, so that a sliding layer's ring always holds the
+/// window behind every query of the call.
+/// `MALLEUS_HY4_RING_CHUNK` lowers it (a small ring is how the wrap-around is tested on a short prompt).
+pub(crate) fn hy4_max_chunk() -> usize {
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("MALLEUS_HY4_RING_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32768)
+            .max(64)
+    });
+    *V
+}
+
+/// Rows of a layer's KV cache when it is a ring: a sliding layer sees the last `window` positions, so it keeps
+/// `window + hy4_max_chunk()` of them (position p in row p % ring). 0 for a layer that keeps the whole context, or
+/// when the context is no longer than the ring. At 1M tokens this takes the 30 sliding layers from 35 GB of cache
+/// to 1.1 GB.
+pub(crate) fn ring_rows(c: &Config, li: usize, max_ctx: usize) -> usize {
+    let Some(h) = &c.hy4 else { return 0 };
+    if c.kind[li] != crate::config::MixerKind::Hy4Sliding || h.window == 0 {
+        return 0;
+    }
+    let ring = (h.window + hy4_max_chunk()).next_multiple_of(32);
+    if crate::weights::kv_ctx(max_ctx) <= ring {
+        0
+    } else {
+        ring
+    }
+}
+
+/// A snapshot at `len` restored on `s` needs the window behind `len` still in every ring: nothing written more than
+/// `ring - window` positions past it (64 more for the rejected drafts of a verify).
+pub(crate) fn can_restore(c: &Config, s: &crate::session::Session, len: usize) -> bool {
+    let Some(h) = &c.hy4 else { return true };
+    (0..c.n_layers).all(|li| match ring_rows(c, li, s.max_ctx) {
+        0 => true,
+        r => s.len + 64 <= len + r - h.window,
+    })
+}
+
 /// KV bytes of one session: the latent and the rotated dims per layer, fp16, plus the sliding window's own copy.
 pub(crate) fn session_bytes(c: &Config, ctx: usize) -> u64 {
     let Some(h) = &c.hy4 else { return 0 };
     let per_token = h.kv_lora as u64 + h.rope as u64;
     let n = crate::weights::kv_ctx(ctx) as u64;
-    let mut t = n * per_token * 2 * c.n_layers as u64;
+    let mut t: u64 = (0..c.n_layers)
+        .map(|li| match ring_rows(c, li, ctx) {
+            0 => n,
+            r => r as u64,
+        })
+        .sum::<u64>()
+        * per_token
+        * 2;
     // The compressed indexer of every indexed layer keeps its token keys, the groups that closed, and the 3-D
     // position of every slot (shared by the layers).
     let indexed = c
@@ -869,8 +1065,9 @@ fn rmsnorm_raw(
 /// instead of the host, which is one synchronization per layer — so the default is always grouped.
 const HY4_MOE_GROUPED_T: usize = 1;
 
-/// Up to this many tokens the routed experts run as per-pair GEMVs on the device router's choice (a decode step).
-const HY4_MOE_GEMV_T: usize = 4;
+/// Up to this many tokens the routed experts run as per-pair GEMVs on the device router's choice: a decode step,
+/// and a verify, whose rows then go through the same kernels as the serial step.
+const HY4_MOE_GEMV_T: usize = crate::weights::GEMV_MAX_T;
 
 /// The routed experts of a short step: one (token, slot) pair at a time, two GEMVs and the clamped SwiGLU over the
 /// pair's slice of the stacked matrices. Exact and launch-bound: it is what a 12-token prompt and a decode step take.
@@ -1231,27 +1428,79 @@ fn moe(
     }
     let routed = crate::session::f32s(t * latent)?;
     if t <= HY4_MOE_GEMV_T && std::env::var("MALLEUS_HY4_MOE_GEMV").map_or(true, |v| v != "0") {
-        // A decode step: one GEMV per (token, slot) on the expert the device router picked, the clamped SwiGLU
-        // rotated for the down projection, and the down projection weighted and summed over the slots. No sort, no
-        // gather and no padded tiles: three launches where the grouped path takes ten.
+        // A decode step or a verify: the (token, slot) pairs sorted by expert, each used expert's rows in one GEMV
+        // (its weights read once however many tokens picked it), the clamped SwiGLU rotated for the down
+        // projection, and the slots summed in order. Every row is computed the same way whatever t is.
         let ms = sc.moe.as_ref().context("hy4 MoE scratch")?;
         let p = t * top_k;
-        model.k.get("moe_gate_up").launch(
-            ((2 * inter).div_ceil(32) as u32, p as u32, 1),
-            (256, 1, 1),
+        model.k.get("moe_sort").launch(
+            (1, 1, 1),
+            (1024, 1, 1),
             0,
             st,
             &[
-                (&ms.gu).into(),
-                (&rout_in).into(),
-                (&m.gu.0).into(),
-                (&m.gu.1).into(),
+                (&ms.offs).into(),
+                (&ms.perm).into(),
+                (&ms.pos).into(),
+                (&ms.tiles).into(),
+                (&ms.ntiles).into(),
                 (&ms.ids).into(),
-                top_k.into(),
-                (2 * inter).into(),
-                latent.into(),
-                (&model.signs).into(),
+                p.into(),
+                (experts + 1).into(),
+                8i32.into(),
+                0i32.into(),
+                0i32.into(),
             ],
+        )?;
+        let grp = |name: &str,
+                   out: &DeviceBuffer,
+                   x: &DeviceBuffer,
+                   w: &(DeviceBuffer, DeviceBuffer),
+                   n: usize,
+                   k: usize,
+                   gu: bool|
+         -> Result<()> {
+            let mut a: Vec<malleus_hip::Arg> = vec![
+                out.into(),
+                x.into(),
+                (&w.0).into(),
+                (&w.1).into(),
+                (&ms.offs).into(),
+                (&ms.perm).into(),
+                (&ms.tiles).into(),
+                (&ms.ntiles).into(),
+            ];
+            if gu {
+                a.push(top_k.into());
+            }
+            a.push(n.into());
+            a.push(k.into());
+            if gu {
+                a.push(malleus_hip::Arg::U64(0));
+            }
+            model
+                .k
+                .get(name)
+                .launch((n.div_ceil(32) as u32, p as u32, 1), (256, 1, 1), 0, st, &a)?;
+            Ok(())
+        };
+        let one = if t == 1 { "1" } else { "" };
+        // The latent rows rotated once, not by every expert's block for every row it reads.
+        model.k.get("hadamard128").launch(
+            ((t * latent / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[(&sc.xr).into(), (&rout_in).into(), (&model.signs).into(), latent.into()],
+        )?;
+        grp(
+            &format!("moe_gate_up_grp{one}"),
+            &ms.gu,
+            &sc.xr,
+            &m.gu,
+            2 * inter,
+            latent,
+            true,
         )?;
         model.k.get("moe_act").launch(
             ((p * inter / 128) as u32, 1, 1),
@@ -1266,21 +1515,27 @@ fn moe(
                 h.swiglu_limit.into(),
             ],
         )?;
-        model.k.get("moe_down").launch(
-            (latent.div_ceil(32) as u32, t as u32, 1),
+        grp(
+            &format!("moe_down_grp{one}"),
+            &ms.y,
+            &ms.act,
+            &m.down,
+            latent,
+            inter,
+            false,
+        )?;
+        model.k.get("moe_combine").launch(
+            (t as u32, latent.div_ceil(1024) as u32, 1),
             (256, 1, 1),
             0,
             st,
             &[
                 (&routed).into(),
-                (&ms.act).into(),
-                (&m.down.0).into(),
-                (&m.down.1).into(),
-                (&ms.ids).into(),
+                (&ms.y).into(),
                 (&ms.w).into(),
+                (&ms.pos).into(),
                 top_k.into(),
                 latent.into(),
-                inter.into(),
                 0i32.into(),
             ],
         )?;
@@ -1583,80 +1838,28 @@ fn engram(
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &buf, Act::X(&emb), k, t, false)?;
         keys.push(buf);
     }
-    st.synchronize()?;
-    let mut main: Vec<f32> = main.download(t * hidden)?;
-    for ti in 0..t {
-        for i in 0..hidden {
-            main[ti * hidden + i] += e.value_bias[i];
-        }
+    // The gate per stream on the device: the value and the keys get their bias there, and the streams are updated
+    // in place. On the host this was a download and an upload of all the streams per Engram layer.
+    for (si, key) in keys.iter().enumerate() {
+        model.k.get("hy4_engram_gate").launch(
+            (t as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&*streams).into(),
+                (&main).into(),
+                key.into(),
+                (&e.gate_params).into(),
+                (&sc.ids).into(),
+                (h.image_token as i32).into(),
+                hc.into(),
+                si.into(),
+                hidden.into(),
+                BF16_EPS.into(),
+            ],
+        )?;
     }
-    let mut keys_host = Vec::with_capacity(hc);
-    for (s, k) in keys.iter().enumerate() {
-        let mut v: Vec<f32> = k.download(t * hidden)?;
-        for ti in 0..t {
-            for i in 0..hidden {
-                v[ti * hidden + i] += e.key_bias[s][i];
-            }
-        }
-        keys_host.push(v);
-    }
-    let trace_engram = std::env::var("MALLEUS_HY4_TRACE").is_ok();
-    if trace_engram && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR") {
-        let bytes: Vec<u8> = main.iter().flat_map(|x| x.to_le_bytes()).collect();
-        std::fs::write(std::path::Path::new(&dir).join("E_main.f32"), bytes)?;
-    }
-    let mut st_host: Vec<f32> = streams.download(t * hc * hidden)?;
-    let nh = hidden as f32;
-    let mut out = vec![0f32; t * hc * hidden];
-    for ti in 0..t {
-        let m = &main[ti * hidden..][..hidden];
-        let ms = m.iter().map(|v| v * v).sum::<f32>() / nh;
-        let inv = 1.0 / (ms + BF16_EPS).sqrt();
-        let mut gamma = vec![0f32; hidden];
-        for i in 0..hidden {
-            gamma[i] = e.pre_gamma[i] * m[i] * inv;
-        }
-        for s in 0..hc {
-            let q0 = &st_host[(ti * hc + s) * hidden..][..hidden];
-            let qs = q0.iter().map(|v| v * v).sum::<f32>() / nh;
-            let qinv = 1.0 / (qs + BF16_EPS).sqrt();
-            let k0 = &keys_host[s][ti * hidden..][..hidden];
-            let ks = k0.iter().map(|v| v * v).sum::<f32>() / nh;
-            let kinv = 1.0 / (ks + BF16_EPS).sqrt();
-            let mut dot = 0f32;
-            for i in 0..hidden {
-                let q = q0[i] * qinv * e.norm_query[s][i];
-                let k = k0[i] * kinv * e.norm_key[s][i];
-                dot += k * q;
-            }
-            let g = dot / nh.sqrt();
-            let g = 1.0 / (1.0 + (-(g.abs().max(1e-6).sqrt() * g.signum())).exp());
-            if tokens[ti] == h.image_token {
-                // A visual placeholder has no token to hash: the memory contributes nothing there.
-                continue;
-            }
-            for i in 0..hidden {
-                out[(ti * hc + s) * hidden + i] = gamma[i] * (g + e.scales[s][i]);
-            }
-        }
-    }
-    if trace_engram && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR") {
-        let bytes: Vec<u8> = out.iter().flat_map(|x| x.to_le_bytes()).collect();
-        std::fs::write(std::path::Path::new(&dir).join("E_out.f32"), bytes)?;
-    }
-    if trace_engram {
-        let r = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
-        eprintln!(
-            "engram out rms {:.5} gamma0 {:.4} out_row0 {:.5}",
-            r(&out),
-            r(&out[..hidden.min(out.len())]),
-            r(&out[..hidden.min(out.len())])
-        );
-    }
-    for (a, b) in st_host.iter_mut().zip(&out) {
-        *a += b;
-    }
-    streams.upload(&st_host)?;
     Ok(())
 }
 
@@ -2063,6 +2266,8 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
         idx_list: None,
         ple_snap: None,
         ngram_prev: Vec::new(),
+        hy4_spec: None,
+        hy4_draft: Default::default(),
         ix_tk: Vec::new(),
         ix_gk: Vec::new(),
         ix_pooled: Vec::new(),
@@ -2071,9 +2276,13 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
     let n = crate::weights::kv_ctx(max_ctx);
     let w = model.hy4.as_ref().context("no hy4 weights")?;
     for li in 0..c.n_layers {
+        let rows = match ring_rows(c, li, max_ctx) {
+            0 => n,
+            r => r,
+        };
         s.kv.push((
-            DeviceBuffer::zeroed(n * h.kv_lora * 2)?,
-            DeviceBuffer::zeroed(n * h.rope * 2)?,
+            DeviceBuffer::zeroed(rows * h.kv_lora * 2)?,
+            DeviceBuffer::zeroed(rows * h.rope * 2)?,
         ));
         // The compressed indexer caches the token keys of every indexed layer and the groups that closed; the
         // sliding layers have neither, so they hold `None` and the layer index stays the one of `s.kv`.
@@ -2288,26 +2497,47 @@ fn indexer_step(
             list.upload_at(ti0 * slots * 4, &flat)?;
             continue;
         }
-        model.k.get("hy4_ix_score").launch(
-            (ncg.div_ceil(256) as u32, nq as u32, 1),
-            (256, 1, 1),
-            ((nh * dim + nh) * 4) as u32,
-            st,
-            &[
-                (&keys).into(),
-                (&iq).into(),
-                gk.into(),
-                (&hw).into(),
-                len.into(),
-                ti0.into(),
-                ncg.into(),
-                nq.into(),
-                nh.into(),
-                dim.into(),
-                pool.into(),
-                scale.into(),
-            ],
-        )?;
+        if nh == 16 && dim == 128 && std::env::var("MALLEUS_HY4_IX_SCORE_WMMA").map_or(true, |v| v != "0") {
+            model.k.get("hy4_ix_score_wmma").launch(
+                (ncg.div_ceil(256) as u32, nq.div_ceil(8) as u32, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&keys).into(),
+                    (&iq).into(),
+                    gk.into(),
+                    (&hw).into(),
+                    len.into(),
+                    ti0.into(),
+                    ncg.into(),
+                    nq.into(),
+                    pool.into(),
+                    scale.into(),
+                ],
+            )?;
+        } else {
+            model.k.get("hy4_ix_score").launch(
+                (ncg.div_ceil(256) as u32, nq as u32, 1),
+                (256, 1, 1),
+                ((nh * dim + nh) * 4) as u32,
+                st,
+                &[
+                    (&keys).into(),
+                    (&iq).into(),
+                    gk.into(),
+                    (&hw).into(),
+                    len.into(),
+                    ti0.into(),
+                    ncg.into(),
+                    nq.into(),
+                    nh.into(),
+                    dim.into(),
+                    pool.into(),
+                    scale.into(),
+                ],
+            )?;
+        }
         // Debug: the order-preserving scores of this chunk, appended in query order, so the selection can be
         // compared against the reference's own logits (the transform is inverted in ref_indexer_replay.py).
         if std::env::var("MALLEUS_HY4_TRACE").is_ok()
@@ -2359,6 +2589,346 @@ fn indexer_step(
 
 /// Slices of the `c * hidden` input that `ihc_pre_part` spreads one token over.
 const IHC_SLICES: usize = 24;
+
+/// Where a layer's attention gets its sparse key list from: the target runs its own compressed indexer, the
+/// drafter brings the lists it derived from the target's.
+pub(crate) enum IxSource {
+    Target,
+    Given(Option<DeviceBuffer>),
+}
+
+/// The per-step buffers of the gated MLA, sized by the caller for the wider of the two head geometries.
+pub(crate) struct AttnBufs<'a> {
+    q: &'a DeviceBuffer,
+    qa: &'a DeviceBuffer,
+    kva: &'a DeviceBuffer,
+    gate: &'a DeviceBuffer,
+    attn_out: &'a DeviceBuffer,
+    o: &'a DeviceBuffer,
+    qt: &'a DeviceBuffer,
+    lat_merged: &'a DeviceBuffer,
+}
+
+/// One gated MLA with its learned sink on `t` rows: `hn2` is the normed input, the output (after `post_proj_norm`)
+/// goes to `hn`, and the keys are the KV cache of layer `li` (rope base `theta`, a sliding `window` or 0, a `ring`
+/// of rows or 0). Returns the sparse list the attention walked, if any.
+#[allow(clippy::too_many_arguments)]
+fn mla_attention(
+    model: &crate::engine::Model,
+    sess: &mut crate::session::Session,
+    sc: &crate::session::Scratch,
+    a: &Attn,
+    li: usize,
+    theta: f32,
+    window: usize,
+    ring: usize,
+    hn: &DeviceBuffer,
+    hn2: &DeviceBuffer,
+    b: &AttnBufs,
+    t: usize,
+    ix: IxSource,
+    dump: &dyn Fn(&str, usize, &DeviceBuffer, usize) -> Result<()>,
+) -> Result<Option<DeviceBuffer>> {
+    use crate::engine::Act;
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let st = &model.stream;
+    let eps = h.hc_eps;
+    let (q, qa, kva, gate, attn_out, o, qt, lat_merged) =
+        (b.q, b.qa, b.kva, b.gate, b.attn_out, b.o, b.qt, b.lat_merged);
+    let qd = a.heads * (a.nope + a.rope);
+    let vd = a.heads * a.v;
+    let hidden = c.hidden;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, qa, Act::X(hn2), &a.q_a, t, false)?;
+    model.rmsnorm(st, hn, qa, &a.q_a_norm, t, h.q_lora)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, q, Act::X(hn), &a.q_b, t, false)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, kva, Act::X(hn2), &a.kv_a, t, false)?;
+    dump("q", li, q, t * qd)?;
+    dump("ix_qresid", li, hn, t * h.q_lora)?;
+    // The compressed indexer of an indexed layer: `hn` is the q_a latent its query reads and `hn2` the block
+    // input its token keys and head weights read. `ix_list` is `Some` once the context outgrows `index_topk`.
+    let ix_list = match (ix, &a.indexer) {
+        (IxSource::Target, Some(i)) => indexer_step(model, i, sess, sc, li, hn, hn2, t, dump)?,
+        (IxSource::Target, None) => None,
+        (IxSource::Given(l), _) => l,
+    };
+    model.k.get("hy4_rope").launch(
+        // The layer's own geometry: a sliding layer has twice the heads of an indexed one, so the indexed
+        // shape would leave half of its query unrotated and the rest rotated at the wrong token's position.
+        ((t * (a.heads + 1) * (a.rope / 2)).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            q.into(),
+            kva.into(),
+            (&sc.pos).into(),
+            t.into(),
+            a.heads.into(),
+            a.nope.into(),
+            h.kv_lora.into(),
+            a.rope.into(),
+            h.mrope_section[1].into(),
+            h.mrope_section[2].into(),
+            theta.into(),
+        ],
+    )?;
+    let (ckv, ckrot) = &sess.kv[li];
+    model.k.get("hy4_cache_write").launch(
+        ((t * (h.kv_lora + h.rope)).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            ckv.into(),
+            ckrot.into(),
+            kva.into(),
+            (&a.kv_a_norm).into(),
+            eps.into(),
+            sess.len.into(),
+            t.into(),
+            h.kv_lora.into(),
+            h.rope.into(),
+            ring.into(),
+        ],
+    )?;
+    // Post-rope query and rotated key dims, for the score reconstruction against the reference replay.
+    dump("q_rot", li, q, t * qd)?;
+    if std::env::var("MALLEUS_HY4_DUMP_KROT").is_ok() {
+        model.ew(
+            st,
+            "hy4_cast_f32",
+            t * h.rope,
+            &[(&sc.big1).into(), ckrot.into(), (t * h.rope).into()],
+        )?;
+        dump("krot", li, &sc.big1, t * h.rope)?;
+    }
+    // Absorbed MLA: `kv_b`'s QK half is folded into the query once per token and head, the split walks the cached
+    // latents (the sliding layers only the last `window` of them), and the combine applies its V half and the gate.
+    let nsplit = 8usize;
+    if t > 8 {
+        // A chunk: one WMMA GEMM per head over all its tokens.
+        model.k.get("hy4_absorb_wmma").launch(
+            (h.kv_lora.div_ceil(64) as u32, t.div_ceil(64) as u32, a.heads as u32),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                qt.into(),
+                q.into(),
+                (&a.kv_b).into(),
+                t.into(),
+                h.kv_lora.into(),
+                a.nope.into(),
+                (a.heads * (a.nope + a.rope)).into(),
+                (a.nope + a.rope).into(),
+                (a.heads * h.kv_lora).into(),
+                ((a.nope + a.v) * h.kv_lora).into(),
+            ],
+        )?;
+    } else {
+        model.k.get("hy4_absorb").launch(
+            ((t * a.heads) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                qt.into(),
+                q.into(),
+                (&a.kv_b).into(),
+                t.into(),
+                a.heads.into(),
+                a.nope.into(),
+                h.kv_lora.into(),
+                a.rope.into(),
+                (a.nope + a.v).into(),
+            ],
+        )?;
+    }
+    dump("qt", li, qt, t * a.heads * h.kv_lora)?;
+    if let Ok(dir) = std::env::var("MALLEUS_HY4_DUMP_W") {
+        st.synchronize()?;
+        let v: Vec<f32> = a.kv_b.download(a.kv_b.len() / 4)?;
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(std::path::Path::new(&dir).join(format!("W{li}_kvb.f32")), bytes)?;
+        // The gate weight, dequantized like linear_f32 does (MLS4 -> f32), to check the row order.
+        if let crate::weights::Weights::Mls4 { q, sc } = &a.gate.w {
+            use malleus_gguf::quant::{self, BLOCK};
+            let (n, k) = (a.gate.n, a.gate.k);
+            let g = k / BLOCK;
+            let signs = quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED);
+            let qw = q.download::<u8>(n * k / 2)?;
+            let sw = sc.download::<u8>(n * g * 2)?;
+            let mut out = vec![0f32; n * k];
+            for r in 0..n {
+                for j in 0..g {
+                    let at = (r * g + j) * 2;
+                    let s = half::f16::from_le_bytes([sw[at], sw[at + 1]]).to_f32();
+                    let mut blk = [0f32; BLOCK];
+                    quant::dequant_int4(&qw[r * k / 2 + j * BLOCK / 2..][..BLOCK / 2], s, &mut blk);
+                    quant::unrotate_block(&mut blk, &signs);
+                    out[r * k + j * BLOCK..][..BLOCK].copy_from_slice(&blk);
+                }
+            }
+            let bytes: Vec<u8> = out.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join(format!("W{li}_gate.f32")), bytes)?;
+        }
+    }
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, gate, Act::X(hn2), &a.gate, t, false)?;
+    dump("gate", li, gate, t * vd)?;
+    let sink = a.sink.as_ref().context("hy4 gated MLA needs the learned sink")?;
+    // A chunk on the dense path: one WMMA kernel per 32 heads of a token, which writes the weighted latent itself.
+    let wmma_attn = t > 8
+        && (ix_list.is_none() || h.index_pool == 4)
+        && a.heads.is_multiple_of(32)
+        && std::env::var("MALLEUS_HY4_ATTN_WMMA").map_or(true, |v| v != "0");
+    if wmma_attn {
+        model.k.get("hy4_mla_attn_wmma").launch(
+            ((t * a.heads / 32) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                lat_merged.into(),
+                qt.into(),
+                q.into(),
+                ckv.into(),
+                ckrot.into(),
+                sink.into(),
+                sess.len.into(),
+                a.heads.into(),
+                a.nope.into(),
+                h.kv_lora.into(),
+                a.rope.into(),
+                (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                window.into(),
+                ix_list.as_ref().map_or(Arg::U64(0), |l| l.into()),
+                ix_list.as_ref().map_or(0, |l| l.len() / (t * 4)).into(),
+                h.index_pool.into(),
+                ring.into(),
+            ],
+        )?;
+    } else {
+        let part = crate::session::f32s(t * a.heads * nsplit * (h.kv_lora + 2))?;
+        if let Some(list) = &ix_list {
+            // The groups this query recalled (`index_topk / pool - 1` plus its own), or every closed one under
+            // `MALLEUS_HY4_IX_ALL`; the same split and merge as the dense path, one kernel over the list.
+            let slots = list.len() / (t * 4);
+            model.k.get("hy4_mla_split_ix").launch(
+                ((t * a.heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&part).into(),
+                    qt.into(),
+                    q.into(),
+                    ckv.into(),
+                    ckrot.into(),
+                    list.into(),
+                    sink.into(),
+                    sess.len.into(),
+                    t.into(),
+                    a.heads.into(),
+                    a.nope.into(),
+                    h.kv_lora.into(),
+                    a.rope.into(),
+                    (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                    nsplit.into(),
+                    h.index_pool.into(),
+                    slots.into(),
+                ],
+            )?;
+        } else {
+            model.k.get("hy4_mla_split").launch(
+                ((t * a.heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&part).into(),
+                    qt.into(),
+                    q.into(),
+                    ckv.into(),
+                    ckrot.into(),
+                    sink.into(),
+                    sess.len.into(),
+                    t.into(),
+                    a.heads.into(),
+                    a.nope.into(),
+                    h.kv_lora.into(),
+                    a.rope.into(),
+                    (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                    nsplit.into(),
+                    window.into(),
+                    ring.into(),
+                ],
+            )?;
+        }
+        // The merge into a global buffer, then the V half of kv_b_proj and the gate: two kernels so that the
+        // latent the V projection reads is the one written, not a block of shared memory.
+        model.k.get("hy4_mla_merge").launch(
+            ((t * a.heads) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[lat_merged.into(), (&part).into(), h.kv_lora.into(), nsplit.into()],
+        )?;
+        if std::env::var("MALLEUS_HY4_DUMP_PART").is_ok() && li == 0 {
+            st.synchronize()?;
+            let dir = std::env::var("MALLEUS_DUMP_DIR")?;
+            let n_lat = crate::weights::kv_ctx(sess.max_ctx) * h.kv_lora;
+            let cache: Vec<u16> = ckv.download(n_lat)?;
+            let bytes: Vec<u8> = cache.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("T0_ckv.f16"), bytes)?;
+            let v: Vec<f32> = part.download(t * a.heads * nsplit * (h.kv_lora + 2))?;
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("T0_part.f32"), bytes)?;
+            let lm: Vec<f32> = lat_merged.download(t * a.heads * h.kv_lora)?;
+            let bytes: Vec<u8> = lm.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("T0_latmerged.f32"), bytes)?;
+            let gl: Vec<f32> = gate.download(t * vd)?;
+            let bytes: Vec<u8> = gl.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("T0_gate2.f32"), bytes)?;
+        }
+    }
+    // The V half of `kv_b_proj`: one bf16 WMMA GEMM per head over the whole chunk (a batch on `blockIdx.z`), then
+    // the per-(head, dim) gate. As a per-(token, head) GEMV this read the 256 rows of a head one per thread — 32
+    // cache lines per instruction — and was 90 % of the prefill.
+    let args = [
+        attn_out.into(),
+        lat_merged.into(),
+        (&a.kv_b).into(),
+        t.into(),
+        a.v.into(),
+        h.kv_lora.into(),
+        (a.heads * h.kv_lora).into(),
+        (a.heads * a.v).into(),
+        ((a.nope + a.v) * h.kv_lora).into(),
+        (a.nope * h.kv_lora).into(),
+    ];
+    // A few rows (decode, a short verify) read each bf16 row once in a GEMV; a chunk goes through the WMMA tiles.
+    let (name, grid) = if t <= 8 {
+        ("hy4_vhalf_gemv", (a.v.div_ceil(8) as u32, a.heads as u32, 1))
+    } else {
+        (
+            "gemm_bf16_wmma",
+            (a.v.div_ceil(64) as u32, t.div_ceil(64) as u32, a.heads as u32),
+        )
+    };
+    model.k.get(name).launch(grid, (256, 1, 1), 0, st, &args)?;
+    model.ew(
+        st,
+        "hy4_gate_mul",
+        t * vd,
+        &[attn_out.into(), gate.into(), (t * vd).into()],
+    )?;
+    dump("attn_raw2", li, attn_out, t * vd)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, o, Act::X(attn_out), &a.o, t, false)?;
+    model.rmsnorm(st, hn, o, &a.post_norm, t, hidden)?;
+    dump("attn", li, hn, t * hidden)?;
+    Ok(ix_list)
+}
 
 /// The iHC pre-mix of one sublayer: `out` the block input, `post` the residual gates.
 fn ihc_pre(
@@ -2455,6 +3025,25 @@ pub(crate) fn forward(
     }
     let t = tokens.len();
     ensure!(t > 0 && n_logits >= 1 && n_logits <= t, "bad hy4 step");
+    // A ring holds the window behind every query only up to `hy4_max_chunk()` tokens a call: a longer text prompt is
+    // split (an image prompt carries its own positions and features for the whole call, and is never that long).
+    if t > hy4_max_chunk() && positions.is_none() && std::env::var_os("MALLEUS_HY4_IMAGE_PNG").is_none() {
+        let (head, tail) = tokens.split_at(t - t % hy4_max_chunk());
+        let (head, tail) = if tail.len() >= n_logits {
+            (head, tail)
+        } else {
+            tokens.split_at(t - hy4_max_chunk())
+        };
+        for part in head.chunks(hy4_max_chunk()) {
+            forward(model, sess, part, None, 1)?;
+        }
+        return forward(model, sess, tail, None, n_logits);
+    }
+    ensure!(
+        t <= hy4_max_chunk() || (0..c.n_layers).all(|li| ring_rows(c, li, sess.max_ctx) == 0),
+        "a hy4 call of {t} tokens with positions is longer than the sliding ring allows ({})",
+        hy4_max_chunk()
+    );
     ensure!(
         sess.len + t <= sess.max_ctx,
         "context full ({} + {} > {})",
@@ -2628,8 +3217,16 @@ pub(crate) fn forward(
     let gate = crate::session::f32s(t * vd)?;
     let attn_out = crate::session::f32s(t * vd)?;
     let o = crate::session::f32s(t * hidden)?;
+    // The absorbed query and the weighted latent of every layer, sized for the wider (sliding) head count: above the
+    // buffer pool's size limit, a per-layer allocation was a hipMalloc (~60 ms per layer at 2048 tokens).
+    let qt = crate::session::f32s(t * nh_max * h.kv_lora)?;
+    let lat_merged = crate::session::f32s(t * nh_max * h.kv_lora)?;
     let _ = (sess.len + t, kvd);
     // The tokens before this call that the Engram n-grams reach (`engram_max_ngram_size - 1` of them).
+    // DFly2 drafts from the indexer lists of its target layers and the final hidden state of this call.
+    let spec_on = has_draft(model);
+    let dfly_layers: Vec<usize> = h.dfly.as_ref().map_or(vec![], |d| d.kv_layers.clone());
+    let mut spec_lists: Vec<(usize, Option<DeviceBuffer>)> = Vec::new();
     let hist: Vec<u32> = if sess.len == 0 {
         Vec::new()
     } else {
@@ -2665,247 +3262,44 @@ pub(crate) fn forward(
         dump("ihc_out", li, &hn, t * hidden)?;
         model.rmsnorm(st, &hn2, &hn, &layer.in_norm, t, hidden)?;
         dump("in_norm", li, &hn2, t * hidden)?;
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &qa, Act::X(&hn2), &a.q_a, t, false)?;
-        model.rmsnorm(st, &hn, &qa, &a.q_a_norm, t, h.q_lora)?;
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &q, Act::X(&hn), &a.q_b, t, false)?;
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &kva, Act::X(&hn2), &a.kv_a, t, false)?;
-        dump("q", li, &q, t * qd)?;
-        dump("ix_qresid", li, &hn, t * h.q_lora)?;
-        // The compressed indexer of an indexed layer: `hn` is the q_a latent its query reads and `hn2` the block
-        // input its token keys and head weights read. `ix_list` is `Some` once the context outgrows `index_topk`.
-        let ix_list = match &a.indexer {
-            Some(ix) => indexer_step(model, ix, sess, &sc, li, &hn, &hn2, t, &dump)?,
-            None => None,
+        let theta = match c.kind[li] {
+            crate::config::MixerKind::Hy4Sliding => h.theta_sliding,
+            _ => h.theta_indexed,
         };
-        model.k.get("hy4_rope").launch(
-            // The layer's own geometry: a sliding layer has twice the heads of an indexed one, so the indexed
-            // shape would leave half of its query unrotated and the rest rotated at the wrong token's position.
-            ((t * (a.heads + 1) * (a.rope / 2)).div_ceil(256) as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[
-                (&q).into(),
-                (&kva).into(),
-                (&sc.pos).into(),
-                t.into(),
-                a.heads.into(),
-                a.nope.into(),
-                h.kv_lora.into(),
-                a.rope.into(),
-                h.mrope_section[1].into(),
-                h.mrope_section[2].into(),
-                // The sliding layers rotate with the short base, the global ones with the long one.
-                match c.kind[li] {
-                    crate::config::MixerKind::Hy4Sliding => h.theta_sliding,
-                    _ => h.theta_indexed,
-                }
-                .into(),
-            ],
-        )?;
-        let (ckv, ckrot) = &sess.kv[li];
-        model.k.get("mla_cache_write").launch(
-            ((t * (h.kv_lora + h.rope)).div_ceil(256) as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[
-                ckv.into(),
-                ckrot.into(),
-                (&kva).into(),
-                (&a.kv_a_norm).into(),
-                eps.into(),
-                sess.len.into(),
-                t.into(),
-                h.kv_lora.into(),
-                h.rope.into(),
-            ],
-        )?;
-        // Post-rope query and rotated key dims, for the score reconstruction against the reference replay.
-        dump("q_rot", li, &q, t * qd)?;
-        if std::env::var("MALLEUS_HY4_DUMP_KROT").is_ok() {
-            model.ew(
-                st,
-                "hy4_cast_f32",
-                t * h.rope,
-                &[(&sc.big1).into(), ckrot.into(), (t * h.rope).into()],
-            )?;
-            dump("krot", li, &sc.big1, t * h.rope)?;
-        }
-        // Absorbed MLA: `kv_b`'s QK half is folded into the query once per token and head, the split walks the cached
-        // latents (the sliding layers only the last `window` of them), and the combine applies its V half and the gate.
-        let nsplit = 8usize;
-        let qt = crate::session::f32s(t * a.heads * h.kv_lora)?;
-        model.k.get("hy4_absorb").launch(
-            ((t * a.heads) as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[
-                (&qt).into(),
-                (&q).into(),
-                (&a.kv_b).into(),
-                t.into(),
-                a.heads.into(),
-                a.nope.into(),
-                h.kv_lora.into(),
-                a.rope.into(),
-                (a.nope + a.v).into(),
-            ],
-        )?;
-        dump("qt", li, &qt, t * a.heads * h.kv_lora)?;
-        if let Ok(dir) = std::env::var("MALLEUS_HY4_DUMP_W") {
-            st.synchronize()?;
-            let v: Vec<f32> = a.kv_b.download(a.kv_b.len() / 4)?;
-            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join(format!("W{li}_kvb.f32")), bytes)?;
-            // The gate weight, dequantized like linear_f32 does (MLS4 -> f32), to check the row order.
-            if let crate::weights::Weights::Mls4 { q, sc } = &a.gate.w {
-                use malleus_gguf::quant::{self, BLOCK};
-                let (n, k) = (a.gate.n, a.gate.k);
-                let g = k / BLOCK;
-                let signs = quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED);
-                let qw = q.download::<u8>(n * k / 2)?;
-                let sw = sc.download::<u8>(n * g * 2)?;
-                let mut out = vec![0f32; n * k];
-                for r in 0..n {
-                    for j in 0..g {
-                        let at = (r * g + j) * 2;
-                        let s = half::f16::from_le_bytes([sw[at], sw[at + 1]]).to_f32();
-                        let mut blk = [0f32; BLOCK];
-                        quant::dequant_int4(&qw[r * k / 2 + j * BLOCK / 2..][..BLOCK / 2], s, &mut blk);
-                        quant::unrotate_block(&mut blk, &signs);
-                        out[r * k + j * BLOCK..][..BLOCK].copy_from_slice(&blk);
-                    }
-                }
-                let bytes: Vec<u8> = out.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(std::path::Path::new(&dir).join(format!("W{li}_gate.f32")), bytes)?;
-            }
-        }
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &gate, Act::X(&hn2), &a.gate, t, false)?;
-        dump("gate", li, &gate, t * vd)?;
-        let part = crate::session::f32s(t * a.heads * nsplit * (h.kv_lora + 2))?;
-        let sink = a.sink.as_ref().context("hy4 gated MLA needs the learned sink")?;
         let window = match c.kind[li] {
             crate::config::MixerKind::Hy4Sliding => h.window,
             _ => 0,
         };
-        if let Some(list) = &ix_list {
-            // The groups this query recalled (`index_topk / pool - 1` plus its own), or every closed one under
-            // `MALLEUS_HY4_IX_ALL`; the same split and merge as the dense path, one kernel over the list.
-            let slots = list.len() / (t * 4);
-            model.k.get("hy4_mla_split_ix").launch(
-                ((t * a.heads) as u32, 1, 1),
-                (256, 1, 1),
-                0,
-                st,
-                &[
-                    (&part).into(),
-                    (&qt).into(),
-                    (&q).into(),
-                    ckv.into(),
-                    ckrot.into(),
-                    list.into(),
-                    sink.into(),
-                    sess.len.into(),
-                    t.into(),
-                    a.heads.into(),
-                    a.nope.into(),
-                    h.kv_lora.into(),
-                    a.rope.into(),
-                    (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
-                    nsplit.into(),
-                    h.index_pool.into(),
-                    slots.into(),
-                ],
-            )?;
-        } else {
-            model.k.get("hy4_mla_split").launch(
-                ((t * a.heads) as u32, 1, 1),
-                (256, 1, 1),
-                0,
-                st,
-                &[
-                    (&part).into(),
-                    (&qt).into(),
-                    (&q).into(),
-                    ckv.into(),
-                    ckrot.into(),
-                    sink.into(),
-                    sess.len.into(),
-                    t.into(),
-                    a.heads.into(),
-                    a.nope.into(),
-                    h.kv_lora.into(),
-                    a.rope.into(),
-                    (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
-                    nsplit.into(),
-                    window.into(),
-                ],
-            )?;
-        }
-        // The merge into a global buffer, then the V half of kv_b_proj and the gate: two kernels so that the
-        // latent the V projection reads is the one written, not a block of shared memory.
-        let lat_merged = crate::session::f32s(t * a.heads * h.kv_lora)?;
-        model.k.get("hy4_mla_merge").launch(
-            ((t * a.heads) as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[(&lat_merged).into(), (&part).into(), h.kv_lora.into(), nsplit.into()],
-        )?;
-        if std::env::var("MALLEUS_HY4_DUMP_PART").is_ok() && li == 0 {
-            st.synchronize()?;
-            let dir = std::env::var("MALLEUS_DUMP_DIR")?;
-            let n_lat = crate::weights::kv_ctx(sess.max_ctx) * h.kv_lora;
-            let cache: Vec<u16> = ckv.download(n_lat)?;
-            let bytes: Vec<u8> = cache.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("T0_ckv.f16"), bytes)?;
-            let v: Vec<f32> = part.download(t * a.heads * nsplit * (h.kv_lora + 2))?;
-            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("T0_part.f32"), bytes)?;
-            let lm: Vec<f32> = lat_merged.download(t * a.heads * h.kv_lora)?;
-            let bytes: Vec<u8> = lm.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("T0_latmerged.f32"), bytes)?;
-            let gl: Vec<f32> = gate.download(t * vd)?;
-            let bytes: Vec<u8> = gl.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("T0_gate2.f32"), bytes)?;
-        }
-        // The V half of `kv_b_proj`: one bf16 WMMA GEMM per head over the whole chunk (a batch on `blockIdx.z`), then
-        // the per-(head, dim) gate. As a per-(token, head) GEMV this read the 256 rows of a head one per thread — 32
-        // cache lines per instruction — and was 90 % of the prefill.
-        let args = [
-            (&attn_out).into(),
-            (&lat_merged).into(),
-            (&a.kv_b).into(),
-            t.into(),
-            a.v.into(),
-            h.kv_lora.into(),
-            (a.heads * h.kv_lora).into(),
-            (a.heads * a.v).into(),
-            ((a.nope + a.v) * h.kv_lora).into(),
-            (a.nope * h.kv_lora).into(),
-        ];
-        // A few rows (decode, a short verify) read each bf16 row once in a GEMV; a chunk goes through the WMMA tiles.
-        let (name, grid) = if t <= 8 {
-            ("hy4_vhalf_gemv", (a.v.div_ceil(8) as u32, a.heads as u32, 1))
-        } else {
-            (
-                "gemm_bf16_wmma",
-                (a.v.div_ceil(64) as u32, t.div_ceil(64) as u32, a.heads as u32),
-            )
+        let ring = ring_rows(c, li, sess.max_ctx);
+        let bufs = AttnBufs {
+            q: &q,
+            qa: &qa,
+            kva: &kva,
+            gate: &gate,
+            attn_out: &attn_out,
+            o: &o,
+            qt: &qt,
+            lat_merged: &lat_merged,
         };
-        model.k.get(name).launch(grid, (256, 1, 1), 0, st, &args)?;
-        model.ew(
-            st,
-            "hy4_gate_mul",
-            t * vd,
-            &[(&attn_out).into(), (&gate).into(), (t * vd).into()],
+        let ix_list = mla_attention(
+            model,
+            sess,
+            &sc,
+            a,
+            li,
+            theta,
+            window,
+            ring,
+            &hn,
+            &hn2,
+            &bufs,
+            t,
+            IxSource::Target,
+            &dump,
         )?;
-        dump("attn_raw2", li, &attn_out, t * vd)?;
-        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&attn_out), &a.o, t, false)?;
-        model.rmsnorm(st, &hn, &o, &a.post_norm, t, hidden)?;
-        dump("attn", li, &hn, t * hidden)?;
+        if spec_on && dfly_layers.contains(&li) {
+            spec_lists.push((li, ix_list));
+        }
         model.k.get("ihc_res").launch(
             ((t * sd).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
@@ -2992,7 +3386,8 @@ pub(crate) fn forward(
     }
     sess.len += t;
     sess.next_pos = max_pos + 1;
-    let keep = h.engram.as_ref().map_or(0, |e| e.max_ngram.saturating_sub(1));
+    // The n-gram reach plus a verify's worth, so that a rollback still leaves the n-grams of the kept tokens.
+    let keep = h.engram.as_ref().map_or(0, |e| e.max_ngram.saturating_sub(1)) + SPEC_ROWS;
     let all: Vec<u32> = hist.iter().chain(tokens).copied().collect();
     sess.ngram_ctx = all[all.len().saturating_sub(keep)..].to_vec();
     // The head: the streams mixed down, the final norm and the logits.
@@ -3015,6 +3410,10 @@ pub(crate) fn forward(
         ],
     )?;
     model.rmsnorm(st, &hn, &normed, &w.norm, t, hidden)?;
+    if spec_on {
+        spec_lists.sort_by_key(|(li, _)| dfly_layers.iter().position(|l| l == li));
+        keep_spec(model, sess, &hn, &spec_lists, t)?;
+    }
     let first = t - n_logits;
     let mut last = crate::session::f32s(n_logits * hidden)?;
     last.copy_from(0, &hn, first * hidden * 4, n_logits * hidden * 4, st)?;
@@ -3033,6 +3432,341 @@ pub(crate) fn forward(
     st.synchronize()?;
     *model.scratch_cache.lock().unwrap() = Some(sc);
     Ok(logits.download(n_logits * c.vocab)?)
+}
+
+/// What the next DFly2 block needs from the target's last call: the final-norm hidden state and, for each draft
+/// layer, the indexer list of the last `rows` rows; `src` is the row of the last token kept (moved back by a
+/// rollback).
+pub(crate) struct SpecState {
+    hidden: DeviceBuffer,
+    lists: Vec<Option<(Vec<i32>, usize)>>,
+    src: usize,
+}
+
+/// How a session's drafts have fared: a moving average of the drafts accepted per round sets the next block's
+/// length, and a session whose drafts keep failing stops drafting (one probe every `PROBE` rounds) so that it never
+/// decodes slower than without them.
+#[derive(Clone, Copy)]
+pub(crate) struct DraftStats {
+    accepted: f32,
+    last: usize,
+    rounds: usize,
+}
+
+impl Default for DraftStats {
+    fn default() -> Self {
+        DraftStats {
+            accepted: 2.0,
+            last: 0,
+            rounds: 0,
+        }
+    }
+}
+
+const PROBE: usize = 16;
+
+/// The drafts the next block proposes, at most `max`: none while the average says a verify would not pay.
+pub(crate) fn draft_len(sess: &mut crate::session::Session, max: usize) -> usize {
+    let s = &mut sess.hy4_draft;
+    s.rounds += 1;
+    if s.accepted < 0.6 {
+        return if s.rounds.is_multiple_of(PROBE) { 2.min(max) } else { 0 };
+    }
+    ((s.accepted + 1.0).ceil() as usize).clamp(1, max)
+}
+
+/// Rows of the last call the speculative state keeps: a verify is at most this wide.
+const SPEC_ROWS: usize = crate::weights::GEMV_MAX_T;
+
+/// Drops the last `n` tokens of the preceding call: the caches are positional (rows past `len` are rewritten), so
+/// what moves back is the length, the Engram history, the indexer's count of closed groups and the draft's source.
+pub(crate) fn rollback(model: &crate::engine::Model, sess: &mut crate::session::Session, n: usize) -> Result<()> {
+    let h = model.cfg.hy4.as_ref().context("no hy4 config")?;
+    ensure!(n < sess.len && n <= sess.ngram_ctx.len(), "hy4 rollback of {n} tokens");
+    sess.len -= n;
+    sess.next_pos -= n as i64;
+    let keep = sess.ngram_ctx.len() - n;
+    sess.ngram_ctx.truncate(keep);
+    let closed = sess.len / h.index_pool;
+    for p in sess.ix_pooled.iter_mut() {
+        *p = (*p).min(closed);
+    }
+    if let Some(sp) = sess.hy4_spec.as_mut() {
+        ensure!(n <= sp.src, "hy4 rollback past the verify");
+        sp.src -= n;
+    }
+    let d = &mut sess.hy4_draft;
+    if d.last > 0 {
+        let acc = d.last.saturating_sub(n) as f32;
+        d.accepted = 0.7 * d.accepted + 0.3 * acc;
+        d.last = 0;
+    }
+    Ok(())
+}
+
+/// After a restore to `len`: nothing of the indexer past it counts, and the draft state is the target's to rebuild.
+pub(crate) fn restored(model: &crate::engine::Model, sess: &mut crate::session::Session) {
+    if let Some(h) = model.cfg.hy4.as_ref() {
+        let closed = sess.len / h.index_pool;
+        for p in sess.ix_pooled.iter_mut() {
+            *p = (*p).min(closed);
+        }
+    }
+    sess.hy4_spec = None;
+}
+
+/// Whether the model carries a DFly2 drafter that drafting may use (`MALLEUS_HY4_DFLY=0` turns it off).
+pub(crate) fn has_draft(model: &crate::engine::Model) -> bool {
+    model.hy4.as_ref().is_some_and(|w| w.dfly.is_some()) && std::env::var("MALLEUS_HY4_DFLY").map_or(true, |v| v != "0")
+}
+
+/// Keeps what the next DFly2 block reads from this call: the last rows of the final-norm hidden state and of the
+/// draft layers' indexer lists.
+fn keep_spec(
+    model: &crate::engine::Model,
+    sess: &mut crate::session::Session,
+    normed: &DeviceBuffer,
+    lists: &[(usize, Option<DeviceBuffer>)],
+    t: usize,
+) -> Result<()> {
+    let c = &model.cfg;
+    let st = &model.stream;
+    let rows = t.min(SPEC_ROWS);
+    let first = t - rows;
+    let mut hidden = crate::session::f32s(SPEC_ROWS * c.hidden)?;
+    if let Some(old) = sess.hy4_spec.take() {
+        hidden = old.hidden;
+    }
+    hidden.copy_from(0, normed, first * c.hidden * 4, rows * c.hidden * 4, st)?;
+    let mut out = Vec::with_capacity(lists.len());
+    for (_, l) in lists {
+        out.push(match l {
+            Some(buf) => {
+                let slots = buf.len() / (t * 4);
+                st.synchronize()?;
+                let all: Vec<i32> = buf.download(t * slots)?;
+                Some((all[first * slots..].to_vec(), slots))
+            }
+            None => None,
+        });
+    }
+    sess.hy4_spec = Some(Box::new(SpecState {
+        hidden,
+        lists: out,
+        src: rows - 1,
+    }));
+    Ok(())
+}
+
+/// One DFly2 block after the target's last call: slot 0 is `bonus` (the token the target just produced) fused with
+/// the target's hidden state at the last kept row, slots 1..=n the mask token, at the positions that follow. The
+/// blocks run once over the whole block on the KV cache of their target layers (the block writes its own keys in
+/// the rows the verify then overwrites); then each slot's hidden state gets the correction from the token drafted
+/// before it and goes through the shared LM head, greedily.
+pub(crate) fn draft(
+    model: &crate::engine::Model,
+    sess: &mut crate::session::Session,
+    bonus: u32,
+    n: usize,
+) -> Result<Vec<u32>> {
+    use crate::engine::Act;
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let w = model.hy4.as_ref().context("no hy4 weights")?;
+    let d = w.dfly.as_ref().context("no DFly2 drafter")?;
+    let dc = h.dfly.as_ref().context("no DFly2 config")?;
+    let st = &model.stream;
+    let hd = c.hidden;
+    let n = draft_len(sess, n);
+    if n == 0 {
+        return Ok(vec![]);
+    }
+    sess.hy4_draft.last = n;
+    let wdt = n + 1;
+    ensure!(wdt <= SPEC_ROWS + 2, "dfly block of {n} drafts");
+    ensure!(sess.len + wdt <= sess.max_ctx, "context full for a draft block");
+    let sp = sess.hy4_spec.take().context("dfly: no target state to draft from")?;
+    let mut sc = model.take_scratch(wdt.max(2))?;
+    let anchor = sess.len;
+    let ids: Vec<i32> = std::iter::once(bonus as i32)
+        .chain(std::iter::repeat_n(dc.mask as i32, n))
+        .collect();
+    let pos: Vec<i32> = (0..wdt).flat_map(|k| [(sess.next_pos + k as i64) as i32; 3]).collect();
+    sc.upload_step(anchor as i32, &ids, &pos)?;
+    let x = crate::session::f32s(wdt * hd)?;
+    model.k.get("embed_bf16").launch(
+        (wdt as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&x).into(), (&model.embed).into(), (&sc.ids).into(), hd.into()],
+    )?;
+    // Slot 0: x0 += gate * eh_proj([enorm(e0) | hnorm(h_src)]).
+    let mut cat = crate::session::f32s(2 * hd)?;
+    let mut tmp = crate::session::f32s(2 * hd)?;
+    model.rmsnorm(st, &cat, &x, &d.enorm, 1, hd)?;
+    tmp.copy_from(0, &sp.hidden, sp.src * hd * 4, hd * 4, st)?;
+    model.rmsnorm(st, &tmp, &tmp, &d.hnorm, 1, hd)?;
+    cat.copy_from(hd * 4, &tmp, 0, hd * 4, st)?;
+    let fused = crate::session::f32s(hd)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &fused, Act::X(&cat), &d.eh_proj, 1, false)?;
+    model.k.get("hy4_fma_vec").launch(
+        (hd.div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&x).into(), (&d.fusion_gate).into(), (&fused).into(), hd.into()],
+    )?;
+    // The blocks.
+    let nh = h.heads;
+    let qd = nh * (h.nope + h.rope);
+    let vd = nh * h.v;
+    let (q, qa, kva) = (
+        crate::session::f32s(wdt * qd)?,
+        crate::session::f32s(wdt * h.q_lora)?,
+        crate::session::f32s(wdt * (h.kv_lora + h.rope))?,
+    );
+    let (gate, attn_out, o) = (
+        crate::session::f32s(wdt * vd)?,
+        crate::session::f32s(wdt * vd)?,
+        crate::session::f32s(wdt * hd)?,
+    );
+    let (qt, lat_merged) = (
+        crate::session::f32s(wdt * nh * h.kv_lora)?,
+        crate::session::f32s(wdt * nh * h.kv_lora)?,
+    );
+    let bufs = AttnBufs {
+        q: &q,
+        qa: &qa,
+        kva: &kva,
+        gate: &gate,
+        attn_out: &attn_out,
+        o: &o,
+        qt: &qt,
+        lat_merged: &lat_merged,
+    };
+    let hn = crate::session::f32s(wdt * hd)?;
+    let hn2 = crate::session::f32s(wdt * hd)?;
+    let no_dump = |_: &str, _: usize, _: &DeviceBuffer, _: usize| -> Result<()> { Ok(()) };
+    for (j, l) in d.layers.iter().enumerate() {
+        let li = dc.kv_layers[j];
+        // The target's selection of the source row, plus the groups the block itself spans: every row of the block
+        // walks the same list, and the causal bound of the attention keeps a row to the keys before it.
+        let list = match &sp.lists[j] {
+            Some((rows, slots)) => {
+                let base = &rows[sp.src * slots..][..*slots];
+                let mut row: Vec<i32> = base.iter().copied().filter(|&g| g >= 0).collect();
+                let pool = h.index_pool;
+                for g in anchor / pool..=(anchor + n) / pool {
+                    if !row.contains(&(g as i32)) {
+                        row.push(g as i32);
+                    }
+                }
+                let width = slots + 4;
+                ensure!(row.len() <= width, "dfly list wider than its slots");
+                row.resize(width, -1);
+                let all: Vec<i32> = (0..wdt).flat_map(|_| row.iter().copied()).collect();
+                Some(DeviceBuffer::from_slice(&all)?)
+            }
+            None => None,
+        };
+        model.rmsnorm(st, &hn2, &x, &l.in_norm, wdt, hd)?;
+        mla_attention(
+            model,
+            sess,
+            &sc,
+            &l.attn,
+            li,
+            h.theta_indexed,
+            0,
+            0,
+            &hn,
+            &hn2,
+            &bufs,
+            wdt,
+            IxSource::Given(list),
+            &no_dump,
+        )?;
+        model.k.get("hy4_add").launch(
+            ((wdt * hd).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&x).into(), (&hn).into(), (wdt * hd).into()],
+        )?;
+        model.rmsnorm(st, &hn2, &x, &l.post_norm, wdt, hd)?;
+        let g = crate::session::f32s(wdt * l.gate.n)?;
+        let u = crate::session::f32s(wdt * l.up.n)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &g, Act::X(&hn2), &l.gate, wdt, false)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &u, Act::Same(&hn2), &l.up, wdt, false)?;
+        model.ew(
+            st,
+            "silu_mul",
+            wdt * l.gate.n,
+            &[(&g).into(), (&g).into(), (&u).into(), (wdt * l.gate.n).into()],
+        )?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &x, Act::X(&g), &l.down, wdt, true)?;
+    }
+    let fin = crate::session::f32s(wdt * hd)?;
+    model.rmsnorm(st, &fin, &x, &d.final_norm, wdt, hd)?;
+    // The chained head: slot k corrected with the token drafted at slot k - 1 (the bonus for slot 1).
+    let mut out = Vec::with_capacity(n);
+    let mut prev = bonus;
+    let mut pid = DeviceBuffer::alloc(4)?;
+    let emb = crate::session::f32s(hd)?;
+    let mut row = crate::session::f32s(hd)?;
+    let hg = crate::session::f32s(d.hc_gate.n)?;
+    let hu = crate::session::f32s(d.hc_up.n)?;
+    let logits = crate::session::f32s(c.vocab)?;
+    let best = DeviceBuffer::alloc(4)?;
+    for k in 1..=n {
+        pid.upload(&[prev as i32])?;
+        model.k.get("embed_bf16").launch(
+            (1, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&emb).into(), (&model.embed).into(), (&pid).into(), hd.into()],
+        )?;
+        row.copy_from(0, &fin, k * hd * 4, hd * 4, st)?;
+        model.rmsnorm(st, &cat, &row, &d.hc_hidden_norm, 1, hd)?;
+        model.rmsnorm(st, &tmp, &emb, &d.hc_embed_norm, 1, hd)?;
+        cat.copy_from(hd * 4, &tmp, 0, hd * 4, st)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &hg, Act::X(&cat), &d.hc_gate, 1, false)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &hu, Act::Same(&cat), &d.hc_up, 1, false)?;
+        model.ew(
+            st,
+            "silu_mul",
+            d.hc_gate.n,
+            &[(&hg).into(), (&hg).into(), (&hu).into(), d.hc_gate.n.into()],
+        )?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &row, Act::X(&hg), &d.hc_down, 1, true)?;
+        model.gemm(
+            st,
+            &sc.xr,
+            &sc.xh,
+            &sc.xsc,
+            &logits,
+            Act::X(&row),
+            &model.lm_head,
+            1,
+            false,
+        )?;
+        model.k.get("logits_argmax").launch(
+            (1, 1, 1),
+            (1024, 1, 1),
+            0,
+            st,
+            &[(&best).into(), (&logits).into(), c.vocab.into()],
+        )?;
+        st.synchronize()?;
+        let id: Vec<i32> = best.download(1)?;
+        prev = id[0] as u32;
+        out.push(prev);
+    }
+    *model.scratch_cache.lock().unwrap() = Some(sc);
+    sess.hy4_spec = Some(sp);
+    Ok(out)
 }
 
 #[cfg(test)]

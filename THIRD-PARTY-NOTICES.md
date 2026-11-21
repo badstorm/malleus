@@ -54,6 +54,15 @@ the checkpoint geometry and from that documented behaviour; it is cited because 
 MIT/Apache sources consulted as references. Copyright © the SGLang authors (Apache License 2.0) and the DFlash
 authors (MIT).
 
+### AngelSpec — Apache-2.0, vLLM — Apache-2.0
+
+Hy4-flash's DFly2 draft (`model.dfly_layers.*`) is not in `transformers`. Its forward (slot-0 fusion, the blocks on
+the target's KV cache and indexer selection, the hidden correction before the LM head) follows the training code of
+`Tencent/AngelSpec` (`angelspec/models/draft/dflash.py`, `hy4_mla.py`, commit `9ee5a9de`) and the drafting loop
+of vLLM's Hy4 speculator (`vllm/models/hy_v4/nvidia/dfly_speculator.py`, `dfly_inputs.py`). The draft in
+`src/crates/malleus-model/src/hy4.rs` was written here from those descriptions. Copyright © Tencent (Apache
+License 2.0) and the vLLM authors (Apache License 2.0).
+
 ## Programs used for measurement, not distributed
 
 `llama.cpp` (MIT) is the baseline in `MODELS.md`: it is run as an external program from its own container image

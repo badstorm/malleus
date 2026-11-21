@@ -425,6 +425,9 @@ pub fn draft_tokens(
     pmin: f32,
     hist: Option<(&[u32], &[Vec<u32>])>,
 ) -> Result<Vec<u32>> {
+    if model.has_block_draft() {
+        return model.block_draft(sess, *pend.last().context("no pending token")?, max);
+    }
     let (d, mut p) = model.mtp_draft(sess, pend)?;
     if let Some((h, sources)) = hist {
         let lk = lookup_drafts(h, sources, env_or("MALLEUS_LOOKUP_NGRAM", LOOKUP_NGRAM), max);
@@ -873,6 +876,7 @@ impl Worker {
                     .enumerate()
                     .filter(|(_, (toks, snap))| {
                         snap.len == toks.len()
+                            && model.can_restore(sess, snap)
                             && toks.len() <= lcp
                             && toks.len() < req.prompt.len()
                             && req.prompt.starts_with(toks)
@@ -1103,7 +1107,9 @@ impl Worker {
         if !act.emit(tok, top) {
             return Ok(Progress::Done);
         }
-        let spec = drafts > 0 && sess.len + 2 <= act.ctx && model.mtp_pending(sess) == act.pend.len();
+        let spec = drafts > 0
+            && sess.len + 2 <= act.ctx
+            && (model.has_block_draft() || model.mtp_pending(sess) == act.pend.len());
         if !spec {
             let logits = model.forward(sess, &[tok], None, 1)?;
             cached.push(tok);
