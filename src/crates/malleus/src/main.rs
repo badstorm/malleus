@@ -2191,6 +2191,71 @@ fn kernel_test() -> Result<()> {
             wa[p * ii..(p + 1) * ii].copy_from_slice(&row);
         }
         println!("inkling2_moe_act   rel err {:.2e}", rel_err(&wa, &ga));
+        // Loop controller: hidden 512, rank 8, two tokens.
+        let (hc, rk, tc) = (512usize, 8usize, 2usize);
+        let cur: Vec<f32> = (0..tc * hc).map(|_| rnd()).collect();
+        let msg: Vec<f32> = (0..tc * hc).map(|_| rnd()).collect();
+        let dn: Vec<u16> = (0..rk * 2 * hc)
+            .map(|_| half::bf16::from_f32(rnd() * 0.05).to_bits())
+            .collect();
+        let gw: Vec<u16> = (0..hc * rk)
+            .map(|_| half::bf16::from_f32(rnd() * 0.05).to_bits())
+            .collect();
+        let fw: Vec<u16> = (0..hc * rk)
+            .map(|_| half::bf16::from_f32(rnd() * 0.05).to_bits())
+            .collect();
+        let (curd, msgd) = (DeviceBuffer::from_slice(&cur)?, DeviceBuffer::from_slice(&msg)?);
+        let (dnd, gwd, fwd) = (
+            DeviceBuffer::from_slice(&dn)?,
+            DeviceBuffer::from_slice(&gw)?,
+            DeviceBuffer::from_slice(&fw)?,
+        );
+        let outc = DeviceBuffer::zeroed(tc * hc * 4)?;
+        k.get("inkling2_control").launch(
+            (tc as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &s,
+            &[
+                (&outc).into(),
+                (&curd).into(),
+                (&msgd).into(),
+                (&dnd).into(),
+                (&gwd).into(),
+                (&fwd).into(),
+                hc.into(),
+                rk.into(),
+                1e-6f32.into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let got = outc.download::<f32>(tc * hc)?;
+        let mut want = vec![0f32; tc * hc];
+        for tt in 0..tc {
+            let c = &cur[tt * hc..(tt + 1) * hc];
+            let m = &msg[tt * hc..(tt + 1) * hc];
+            let fc = 1.0 / ((c.iter().map(|v| v * v).sum::<f32>() / hc as f32) + 1e-6).sqrt();
+            let fm = 1.0 / ((m.iter().map(|v| v * v).sum::<f32>() / hc as f32) + 1e-6).sqrt();
+            let mut gate = vec![0f32; rk];
+            for j in 0..rk {
+                let mut acc = 0f32;
+                for i in 0..hc {
+                    acc += half::bf16::from_bits(dn[j * 2 * hc + i]).to_f32() * c[i] * fc;
+                    acc += half::bf16::from_bits(dn[j * 2 * hc + hc + i]).to_f32() * m[i] * fm;
+                }
+                gate[j] = acc;
+            }
+            for i in 0..hc {
+                let mut g = 0f32;
+                let mut f = 0f32;
+                for j in 0..rk {
+                    g += half::bf16::from_bits(gw[i * rk + j]).to_f32() * gate[j];
+                    f += half::bf16::from_bits(fw[i * rk + j]).to_f32() * gate[j];
+                }
+                want[tt * hc + i] = c[i] * (1.0 - f.tanh()) + g.tanh() * m[i];
+            }
+        }
+        println!("inkling2_control   rel err {:.2e}", rel_err(&want, &got));
     }
     Ok(())
 }

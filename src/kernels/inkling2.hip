@@ -268,3 +268,59 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_moe_act(float* out, c
     }
     out[(size_t)p * I + b * 128 + i] = s[i] * 0.08838834764831845f;
 }
+
+// The loop's cross-pass controller (issue #62): the message of the previous pass is mixed into this pass's input.
+//   gate   = down . concat(rms(cur), rms(message))      [rank]
+//   gain   = tanh(gain_w . gate)                        [hidden]
+//   forget = tanh(forget_w . gate)                      [hidden]
+//   out    = cur - forget * cur + gain * message
+// One block per token; the weights are bf16 like the checkpoint's, the arithmetic is fp32.
+extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, const float* cur, const float* msg,
+                                                                  const ik_bf16* down, const ik_bf16* gain_w,
+                                                                  const ik_bf16* forget_w, int hidden, int rank,
+                                                                  float eps) {
+    __shared__ float red[256];
+    __shared__ float gate[128];
+    __shared__ float nc[4096];
+    __shared__ float nm[4096];
+    const int t = blockIdx.x, r = threadIdx.x;
+    const float* cp = cur + (size_t)t * hidden;
+    const float* mp = msg + (size_t)t * hidden;
+    // rms of both inputs, then the concatenated normed pair.
+    float sc = 0.f, sm = 0.f;
+    for (int i = r; i < hidden; i += 256) sc += cp[i] * cp[i], sm += mp[i] * mp[i];
+    red[r] = sc;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if (r < o) red[r] += red[r + o];
+        __syncthreads();
+    }
+    const float fc = rsqrtf(red[0] / (float)hidden + eps);
+    __syncthreads();
+    red[r] = sm;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if (r < o) red[r] += red[r + o];
+        __syncthreads();
+    }
+    const float fm = rsqrtf(red[0] / (float)hidden + eps);
+    for (int i = r; i < hidden; i += 256) nc[i] = cp[i] * fc, nm[i] = mp[i] * fm;
+    __syncthreads();
+    // gate = down . [nc | nm], one output per thread up to rank.
+    for (int j = r; j < rank; j += 256) {
+        const ik_bf16* w = down + (size_t)j * 2 * hidden;
+        float acc = 0.f;
+        for (int i = 0; i < hidden; ++i) acc += ik_bf2f(w[i]) * nc[i] + ik_bf2f(w[hidden + i]) * nm[i];
+        gate[j] = acc;
+    }
+    __syncthreads();
+    // out = cur - tanh(forget) * cur + tanh(gain) * message.
+    for (int i = r; i < hidden; i += 256) {
+        float g = 0.f, f = 0.f;
+        for (int j = 0; j < rank; ++j) {
+            g += ik_bf2f(gain_w[(size_t)i * rank + j]) * gate[j];
+            f += ik_bf2f(forget_w[(size_t)i * rank + j]) * gate[j];
+        }
+        out[(size_t)t * hidden + i] = cp[i] * (1.f - tanhf(f)) + tanhf(g) * mp[i];
+    }
+}
