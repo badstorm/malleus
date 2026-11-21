@@ -230,6 +230,7 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "hy4_absorb_wmma",
             "hy4_mla_attn_wmma",
             "hy4_cache_write",
+            "hy4_ix_score_wmma",
             "hy4_vhalf_gemv",
             "hy4_gemv_long",
             "hy4_engram_gate",

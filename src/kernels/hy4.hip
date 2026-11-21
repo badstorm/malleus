@@ -707,7 +707,8 @@ extern "C" __global__ void __launch_bounds__(256) hy4_ix_score(unsigned* keys, c
     const int i = blockIdx.y, tid = threadIdx.x;
     const int ti = ti0 + i;
     for (int e = tid; e < nh * dim; e += blockDim.x) qs[e] = q[(size_t)ti * nh * dim + e];
-    for (int e = tid; e < nh; e += blockDim.x) hws[e] = hw[e] * scale;
+    // The head weights of this query's token: reading hw[0 .. nh) gave every query the first token's weights.
+    for (int e = tid; e < nh; e += blockDim.x) hws[e] = hw[(size_t)ti * nh + e] * scale;
     __syncthreads();
     const int own = (len + ti) / pool;
     const int g = blockIdx.x * 256 + tid;
@@ -1183,5 +1184,63 @@ extern "C" __global__ void __launch_bounds__(256) hy4_cache_write(__half* ckv, _
         ckv[at * kv + d] = __float2half(row[d] * inv * norm_w[d]);
     } else {
         krot[at * rd + (d - kv)] = __float2half(row[d]);
+    }
+}
+
+// `hy4_ix_score` on fp16 WMMA for the shape Hy4 has (16 index heads of 128 dims): the 16 heads of a query are the 16
+// rows of a fragment, so S = Q K^T over (16 heads x 16 groups) and the score of a group is a column reduction,
+// sum_h w[h] * relu(S[h, g]). Grid (ceil(ncg / 256), ceil(nq / 8)): the block stages the queries of 8 tokens in LDS,
+// each wave keeps the keys of its 32 groups in registers and walks the 8 tokens. Per query that reads ~48 bytes per
+// group where the scalar kernel read the whole 256-byte group key, in f32.
+extern "C" __global__ void __launch_bounds__(256) hy4_ix_score_wmma(unsigned* keys, const float* q, const __half* gk,
+                                                                   const float* hw, int len, int ti0, int ncg, int nq,
+                                                                   int pool, float scale) {
+    constexpr int NH = 16, DIM = 128, QT = 8, QS = DIM + 8;
+    __shared__ __attribute__((aligned(16))) _Float16 qs[QT][NH][QS];
+    __shared__ float hws[QT][NH];
+    const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+    const int i0 = blockIdx.y * QT;
+    for (int e = tid; e < QT * NH * DIM; e += 256) {
+        const int tk = e / (NH * DIM), r = e % (NH * DIM), hh = r / DIM, d = r % DIM;
+        const int i = min(i0 + tk, nq - 1);
+        qs[tk][hh][d] = (_Float16)q[(size_t)(ti0 + i) * NH * DIM + r];
+    }
+    if (tid < QT * NH) {
+        const int i = min(i0 + tid / NH, nq - 1);
+        hws[tid / NH][tid % NH] = hw[(size_t)(ti0 + i) * NH + tid % NH] * scale;
+    }
+    __syncthreads();
+    const int g0 = blockIdx.x * 256 + wave * 32;
+    hy4_h16 b[2][8];
+#pragma unroll
+    for (int f = 0; f < 2; ++f)
+#pragma unroll
+        for (int kf = 0; kf < 8; ++kf) {
+            const int g = min(g0 + f * 16 + lane % 16, ncg - 1);
+            b[f][kf] = *(const hy4_h16*)(gk + (size_t)g * DIM + kf * 16);
+        }
+    for (int tk = 0; tk < QT; ++tk) {
+        const int i = i0 + tk;
+        if (i >= nq) break;
+        const int own = (len + ti0 + i) / pool;
+#pragma unroll
+        for (int f = 0; f < 2; ++f) {
+            hy4_f32x8 acc = (hy4_f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int kf = 0; kf < 8; ++kf) {
+                const hy4_h16 a = *(const hy4_h16*)&qs[tk][lane % 16][kf * 16];
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b[f][kf], acc);
+            }
+            float part = 0.f;
+#pragma unroll
+            for (int r = 0; r < 8; ++r) part += hws[tk][2 * r + lane / 16] * fmaxf(acc[r], 0.f);
+            part += __shfl_xor(part, 16, 32);
+            const int g = g0 + f * 16 + lane % 16;
+            if (lane < 16 && g < ncg) {
+                unsigned u = __float_as_uint(part);
+                u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+                keys[(size_t)i * ncg + g] = g < own ? u : 0u;
+            }
+        }
     }
 }

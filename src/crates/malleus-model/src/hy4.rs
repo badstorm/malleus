@@ -2314,26 +2314,47 @@ fn indexer_step(
             list.upload_at(ti0 * slots * 4, &flat)?;
             continue;
         }
-        model.k.get("hy4_ix_score").launch(
-            (ncg.div_ceil(256) as u32, nq as u32, 1),
-            (256, 1, 1),
-            ((nh * dim + nh) * 4) as u32,
-            st,
-            &[
-                (&keys).into(),
-                (&iq).into(),
-                gk.into(),
-                (&hw).into(),
-                len.into(),
-                ti0.into(),
-                ncg.into(),
-                nq.into(),
-                nh.into(),
-                dim.into(),
-                pool.into(),
-                scale.into(),
-            ],
-        )?;
+        if nh == 16 && dim == 128 && std::env::var("MALLEUS_HY4_IX_SCORE_WMMA").map_or(true, |v| v != "0") {
+            model.k.get("hy4_ix_score_wmma").launch(
+                (ncg.div_ceil(256) as u32, nq.div_ceil(8) as u32, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&keys).into(),
+                    (&iq).into(),
+                    gk.into(),
+                    (&hw).into(),
+                    len.into(),
+                    ti0.into(),
+                    ncg.into(),
+                    nq.into(),
+                    pool.into(),
+                    scale.into(),
+                ],
+            )?;
+        } else {
+            model.k.get("hy4_ix_score").launch(
+                (ncg.div_ceil(256) as u32, nq as u32, 1),
+                (256, 1, 1),
+                ((nh * dim + nh) * 4) as u32,
+                st,
+                &[
+                    (&keys).into(),
+                    (&iq).into(),
+                    gk.into(),
+                    (&hw).into(),
+                    len.into(),
+                    ti0.into(),
+                    ncg.into(),
+                    nq.into(),
+                    nh.into(),
+                    dim.into(),
+                    pool.into(),
+                    scale.into(),
+                ],
+            )?;
+        }
         // Debug: the order-preserving scores of this chunk, appended in query order, so the selection can be
         // compared against the reference's own logits (the transform is inverted in ref_indexer_replay.py).
         if std::env::var("MALLEUS_HY4_TRACE").is_ok()
