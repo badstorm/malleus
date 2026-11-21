@@ -128,15 +128,23 @@ pub struct Inkling2Vision {
 }
 
 /// The MTP head (`mtp_config`): 3 layers that propose a block of tokens, with a Markov correction on the logits.
+/// Its attention is the full/sliding pair of the text stack at its own head geometry (24 query heads here).
 #[derive(Clone, Debug)]
 pub struct Inkling2Mtp {
     pub layers: usize,
     pub inter: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_theta: f32,
+    pub window: usize,
+    /// Layers of the head that slide; the rest are full attention.
+    pub local: Vec<usize>,
     /// Tokens per proposed block (`block_size`).
     pub block: usize,
     /// Width of the Markov embedding mixed into the logits (`markov_rank`).
     pub markov_rank: usize,
-    /// Target layers whose hidden states the head reads.
+    /// Layer applications whose hidden states the head reads.
     pub target_layers: Vec<usize>,
 }
 

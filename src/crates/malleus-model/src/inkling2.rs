@@ -85,6 +85,17 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
             Some(Inkling2Mtp {
                 layers: mu("num_hidden_layers")?,
                 inter: mu("intermediate_size")?,
+                heads: mu("num_attention_heads")?,
+                kv_heads: mu("num_key_value_heads")?,
+                head_dim: mu("head_dim")?,
+                rope_theta: v["rope_theta"].as_f64().unwrap_or(1e6) as f32,
+                window: mu("sliding_window_size")?,
+                local: v["local_layer_ids"]
+                    .as_array()
+                    .context("config: mtp_config.local_layer_ids")?
+                    .iter()
+                    .map(|x| x.as_u64().map(|x| x as usize).context("local_layer_ids"))
+                    .collect::<Result<_>>()?,
                 block: mu("block_size")?,
                 markov_rank: mu("markov_rank")?,
                 target_layers: v["target_layer_ids"]
@@ -342,10 +353,18 @@ pub fn text_map(c: &Config) -> Result<Vec<Expected>> {
     Ok(v)
 }
 
+/// The whole file: the text graph, the vision tower and the MTP head. The order is the order the loader reads.
+pub fn map(c: &Config) -> Result<Vec<Expected>> {
+    let mut v = text_map(c)?;
+    v.extend(vision_map(c)?);
+    v.extend(mtp_map(c)?);
+    Ok(v)
+}
+
 /// Checks the file against the map: every tensor the forward reads is there, with the shape and the dtype it
 /// expects, and nothing in the file is left unclaimed.
 pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
-    let expected = text_map(c)?;
+    let expected = map(c)?;
     let mut lines = Vec::new();
     let mut claimed: Vec<&str> = Vec::with_capacity(expected.len());
     for e in &expected {
@@ -370,21 +389,33 @@ pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
         .collect();
     unclaimed.sort_unstable();
     lines.push(format!(
-        "{} of {} tensors mapped ({} text tensors expected)",
+        "{} of {} tensors mapped ({} text, {} vision, {} mtp)",
         claimed.len(),
         claimed.len() + unclaimed.len(),
-        expected.len()
+        text_map(c)?.len(),
+        vision_map(c)?.len(),
+        mtp_map(c)?.len()
     ));
     if !unclaimed.is_empty() {
-        let vision = unclaimed.iter().filter(|n| n.starts_with("model.visual.")).count();
         lines.push(format!(
-            "{} unclaimed: {vision} vision, {} elsewhere (the MTP head and the vision tower are the next map)",
+            "{} unclaimed, first: {:?}",
             unclaimed.len(),
-            unclaimed.len() - vision
+            &unclaimed[..unclaimed.len().min(8)]
         ));
-        let rest: Vec<&&str> = unclaimed.iter().filter(|n| !n.starts_with("model.visual.")).collect();
-        lines.push(format!("  first unclaimed: {:?}", &rest[..rest.len().min(8)]));
     }
+    // What the device will hold: the stored bytes of each part, which is what the plan has to fit.
+    let bytes = |v: &[Expected]| -> f64 {
+        v.iter()
+            .map(|e| e.dtype.size_of_elems(e.shape.iter().product::<usize>()) as f64)
+            .sum::<f64>()
+            / 1e9
+    };
+    lines.push(format!(
+        "footprint: {:.2} GB text, {:.2} GB vision, {:.2} GB mtp",
+        bytes(&text_map(c)?),
+        bytes(&vision_map(c)?),
+        bytes(&mtp_map(c)?)
+    ));
     lines.push(format!(
         "loop {}..{} x{}, attention-residual blocks of {}, window {}, {} experts of {} active",
         c.inkling2.as_ref().unwrap().loop_start,
@@ -401,17 +432,115 @@ pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
             m.layers, m.block, m.markov_rank
         ));
     }
-    let _ = bail_if_vision_missing(c);
     Ok(lines)
 }
 
-/// The vision tower is a map of its own, and the forward needs it before the first image prompt.
-fn bail_if_vision_missing(c: &Config) -> Result<()> {
-    if c.inkling2.as_ref().is_some_and(|i| i.vision.is_some()) {
-        // The tower's tensors are in the file but not in the map yet: say so instead of pretending.
-        return Ok(());
+/// The vision tower: 23 pre-norm ViT blocks at 1024 wide, 16 heads, 4x MLP, native patches of 20x20 at two frames,
+/// merged 2x2 by the adapter, then a 4096-wide projection in and out. Stored at 16 bits, like the checkpoint.
+pub fn vision_map(c: &Config) -> Result<Vec<Expected>> {
+    let i = c.inkling2.as_ref().context("no inkling2 config")?;
+    let v = match &i.vision {
+        Some(v) => v,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    let mut push = |name: String, shape: Vec<usize>| {
+        out.push(Expected {
+            name,
+            dtype: DType::BF16,
+            shape,
+        })
+    };
+    let h = v.hidden;
+    push("model.visual.proj_in.weight".into(), vec![v.proj_hidden, v.proj_hidden]);
+    push("model.visual.proj_out.weight".into(), vec![c.hidden, v.proj_hidden]);
+    for n in ["weight", "bias"] {
+        push(format!("model.visual.backbone.ln_pre.{n}"), vec![h]);
     }
-    Ok(())
+    let e = "model.visual.backbone.embeddings";
+    push(format!("{e}.class_embedding"), vec![h]);
+    push(format!("{e}.cls_position_embedding"), vec![h]);
+    push(format!("{e}.patch_embedding.weight"), vec![h, 3 * v.patch * v.patch]);
+    push(format!("{e}.position_embedding"), vec![h, v.grid * v.grid]);
+    for l in 0..v.layers {
+        let p = |s: &str| format!("model.visual.backbone.layers.{l}.{s}");
+        for n in ["ln_1", "ln_2"] {
+            for t in ["weight", "bias"] {
+                push(p(&format!("{n}.{t}")), vec![h]);
+            }
+        }
+        for n in ["ls_1", "ls_2"] {
+            push(p(&format!("{n}.gamma")), vec![h]);
+        }
+        push(p("mlp.c_fc.weight"), vec![v.inter, h]);
+        push(p("mlp.c_fc.bias"), vec![v.inter]);
+        push(p("mlp.c_proj.weight"), vec![h, v.inter]);
+        push(p("mlp.c_proj.bias"), vec![h]);
+        for n in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+            push(p(&format!("self_attn.{n}.weight")), vec![h, h]);
+            push(p(&format!("self_attn.{n}.bias")), vec![h]);
+        }
+    }
+    Ok(out)
+}
+
+/// The MTP head: 3 layers at the text width, one sliding and two full, plus the Markov correction of the logits.
+pub fn mtp_map(c: &Config) -> Result<Vec<Expected>> {
+    let i = c.inkling2.as_ref().context("no inkling2 config")?;
+    let m = match &i.mtp {
+        Some(m) => m,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    let mut push = |name: String, dtype: DType, shape: Vec<usize>| out.push(Expected { name, dtype, shape });
+    let h = c.hidden;
+    let qd = m.heads * m.head_dim;
+    let kvd = m.kv_heads * m.head_dim;
+    push("fuse_weight".into(), DType::BF16, vec![4, 4]);
+    push("mask_embed".into(), DType::BF16, vec![h]);
+    push("norm.weight".into(), DType::BF16, vec![h]);
+    for l in 0..m.layers {
+        let p = |s: &str| format!("layers.{l}.{s}");
+        for n in ["dflare_norm", "input_layernorm", "post_attention_layernorm"] {
+            push(p(&format!("{n}.weight")), DType::BF16, vec![h]);
+        }
+        for (n, shape) in [
+            ("mlp.gate_proj.weight", vec![m.inter, h]),
+            ("mlp.up_proj.weight", vec![m.inter, h]),
+            ("mlp.down_proj.weight", vec![h, m.inter]),
+            ("self_attn.q_proj.weight", vec![qd, h]),
+            ("self_attn.k_proj.weight", vec![kvd, h]),
+            ("self_attn.v_proj.weight", vec![kvd, h]),
+            ("self_attn.o_proj.weight", vec![h, qd]),
+        ] {
+            let k = *shape.last().unwrap();
+            let scales = vec![shape[0], k / 128];
+            push(p(n), DType::Mls4, shape);
+            push(p(&format!("{n}.scales")), DType::F16, scales);
+        }
+        for n in ["k_proj_ctx", "v_proj_ctx"] {
+            push(p(&format!("self_attn.{n}.weight")), DType::BF16, vec![kvd, h]);
+        }
+        for n in ["q_norm", "k_norm", "k_norm_ctx"] {
+            push(p(&format!("self_attn.{n}.weight")), DType::BF16, vec![m.head_dim]);
+        }
+    }
+    let mk = "markov_head";
+    push(format!("{mk}.dflare_norm.weight"), DType::BF16, vec![h]);
+    push(format!("{mk}.hidden_out.weight"), DType::BF16, vec![h, m.markov_rank]);
+    push(format!("{mk}.hidden_out.bias"), DType::BF16, vec![h]);
+    push(
+        format!("{mk}.markov_w1.weight"),
+        DType::BF16,
+        vec![c.vocab, m.markov_rank],
+    );
+    push(
+        format!("{mk}.rnn_proj.weight"),
+        DType::BF16,
+        vec![3 * m.markov_rank, 5120],
+    );
+    push(format!("{mk}.rnn_proj.bias"), DType::BF16, vec![3 * m.markov_rank]);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -432,6 +561,7 @@ mod tests {
         for l in &lines {
             println!("{l}");
         }
-        assert!(lines[0].contains("tensors mapped"), "{}", lines[0]);
+        assert!(lines[0].starts_with("1384 of 1384"), "{}", lines[0]);
+        assert_eq!(lines.len(), 4, "{lines:?}");
     }
 }
