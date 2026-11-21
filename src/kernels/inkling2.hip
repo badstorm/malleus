@@ -252,11 +252,16 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_route(int* ids, f
 
 // The expert activation: softcap(gate) * sigmoid(gate) * softcap(up), with softcap(x) = tanh(x / c) * c, then the
 // randomized Hadamard of every 128-block like moe_act (the down weights are in the rotated basis).
+//
+// The checkpoint stores `w13` interleaved (`g0, u0, g1, u1, ...`): the reference deinterleaves it with
+// `Interleave(dim=1)` before splitting the gate and the up. The MLS4 file keeps the checkpoint's row order, so the
+// gate of element `j` is row `2j` and the up is row `2j+1`.
 extern "C" __global__ void __launch_bounds__(128) inkling2_moe_act(float* out, const float* gu, const int8_t* signs,
                                                                   int I, float gate_cap, float up_cap) {
     __shared__ float s[128];
     const int nb = I / 128, p = blockIdx.x / nb, b = blockIdx.x % nb, i = threadIdx.x;
-    const float g = gu[(size_t)p * 2 * I + b * 128 + i], u = gu[(size_t)p * 2 * I + I + b * 128 + i];
+    const int pos = b * 128 + i;
+    const float g = gu[(size_t)p * 2 * I + 2 * pos], u = gu[(size_t)p * 2 * I + 2 * pos + 1];
     const float gc = tanhf(g / gate_cap) * gate_cap;
     const float uc = tanhf(u / up_cap) * up_cap;
     s[i] = gc / (1.f + expf(-g)) * uc * (float)signs[i];

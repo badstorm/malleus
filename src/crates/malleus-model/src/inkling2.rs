@@ -138,7 +138,12 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         unpadded_vocab: u("unpadded_vocab_size")?,
         loop_start: lu("core_start")?,
         loop_end: lu("core_end")?,
-        loop_passes: lu("num_passes")?,
+        // Debug: `MALLEUS_INKLING2_PASSES=1` runs the base graph (prelude, one core pass, tail) for the
+        // layer-by-layer comparison against a reference loaded with `loop_num_passes=1`.
+        loop_passes: std::env::var("MALLEUS_INKLING2_PASSES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(lu("num_passes")?),
         loop_rank: lu("gate_rank")?,
         vision,
         mtp,
@@ -223,7 +228,7 @@ pub(crate) fn validate(c: &Config) -> Result<()> {
         i.loop_start > 0 && i.loop_start < i.loop_end && i.loop_end <= c.n_layers,
         "the loop range must be a non-empty part of the stack"
     );
-    ensure!(i.loop_passes >= 2, "a fixed loop runs at least twice");
+    ensure!(i.loop_passes >= 1, "a loop needs at least one pass");
     ensure!(
         c.hidden.is_multiple_of(128) && i.moe_inter.is_multiple_of(128),
         "the 4-bit rotation needs widths in 128s"
@@ -1570,8 +1575,8 @@ impl Graph {
     }
 }
 
-/// Runs `tokens` through the whole graph and returns the argmax of the last position's logits.
-fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
+/// Runs `tokens` through the whole graph and returns the logits of every position, `[t, vocab]` row-major.
+fn step_logits(model: &Model, tokens: &[u32]) -> Result<Vec<f32>> {
     let c = &model.cfg;
     let i = c.inkling2.as_ref().context("no inkling2 config")?;
     let w = model.inkling2.as_ref().context("no inkling2 weights")?;
@@ -1648,10 +1653,8 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
         c.eps,
     )?;
     rms(model, st, &g.normed, &g.mix_out, &w.norm, t, h, c.eps)?;
-    // The last row only.
-    let last = f32s(h)?;
-    last.copy_from_shared(0, &g.normed, (t - 1) * h * 4, h * 4, st)?;
-    let logits_out = f32s(c.vocab)?;
+    // The whole sequence's logits: the golden and eval gates compare every position's argmax.
+    let logits_out = f32s(t * c.vocab)?;
     lin(
         model,
         st,
@@ -1659,13 +1662,21 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
         &mut g.xh,
         &mut g.xsc,
         &logits_out,
-        &last,
+        &g.normed,
         &w.unembed,
-        1,
+        t,
     )?;
-    softcap(model, st, &logits_out, c.vocab, i.logit_softcap)?;
-    let raw: Vec<f32> = logits_out.download(c.vocab)?;
-    Ok(argmax(&raw, i.unpadded_vocab))
+    softcap(model, st, &logits_out, t * c.vocab, i.logit_softcap)?;
+    Ok(logits_out.download(t * c.vocab)?)
+}
+
+/// Runs `tokens` through the whole graph and returns the argmax of the last position's logits.
+fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
+    let c = &model.cfg;
+    let i = c.inkling2.as_ref().context("no inkling2 config")?;
+    let all = step_logits(model, tokens)?;
+    let t = tokens.len();
+    Ok(argmax(&all[(t - 1) * c.vocab..], i.unpadded_vocab))
 }
 
 fn rms(
@@ -2036,6 +2047,10 @@ fn softcap(model: &Model, st: &Stream, y: &DeviceBuffer, n: usize, cap: f32) -> 
 }
 
 /// The graph has no KV cache: every new token re-runs the whole sequence.
+pub fn logits(model: &Model, tokens: &[u32]) -> Result<Vec<f32>> {
+    step_logits(model, tokens)
+}
+
 pub fn generate(model: &Model, tokens: &[u32], n: usize) -> Result<Vec<u32>> {
     let c = &model.cfg;
     let mut ids = tokens.to_vec();

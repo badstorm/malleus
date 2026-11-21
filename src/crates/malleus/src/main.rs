@@ -2203,8 +2203,9 @@ fn kernel_test() -> Result<()> {
             for b in 0..ii / 128 {
                 let mut blk = [0f32; 128];
                 for i in 0..128 {
-                    let g = gu[p * 2 * ii + b * 128 + i];
-                    let u = gu[p * 2 * ii + ii + b * 128 + i];
+                    let pos = b * 128 + i;
+                    let g = gu[p * 2 * ii + 2 * pos];
+                    let u = gu[p * 2 * ii + 2 * pos + 1];
                     blk[i] = (g / 4.0).tanh() * 4.0 / (1.0 + (-g).exp()) * (u / 25.0).tanh() * 25.0 * sgn[i] as f32;
                 }
                 for h in [1usize, 2, 4, 8, 16, 32, 64] {

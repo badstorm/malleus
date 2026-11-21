@@ -212,6 +212,8 @@ def main():
     ap.add_argument("--skip-greedy", action="store_true")
     ap.add_argument("--reasoning-effort", default=None,
                     help="template reasoning effort for models that use it (inkling2: none|low|...)")
+    ap.add_argument("--loop-passes", type=int, default=None,
+                    help="inkling2: override loop_num_passes (1 = the base graph, for debugging)")
     args = ap.parse_args()
 
     from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -223,6 +225,9 @@ def main():
     proc = AutoProcessor.from_pretrained(args.model)
     t0 = time.time()
     model = load_on_gpu(args.model)
+    if args.loop_passes is not None and hasattr(model.config, "text_config"):
+        model.config.text_config.loop_num_passes = args.loop_passes
+        model.model.language_model.config.loop_num_passes = args.loop_passes
     print(f"loaded in {time.time() - t0:.0f}s", flush=True)
 
     meta = {"transformers": transformers.__version__, "torch": torch.__version__, "dtype": "bfloat16", "text": [], "images": []}

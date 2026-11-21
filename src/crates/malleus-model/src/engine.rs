@@ -1482,6 +1482,14 @@ impl Model {
         positions: Option<&[[i32; 3]]>,
         n_logits: usize,
     ) -> Result<Vec<f32>> {
+        // Inkling-2's release graph is the looped forward in `crate::inkling2`, not the generic stack: the
+        // generic path's layer/state bookkeeping does not describe its 48 KV slots.
+        if self.inkling2.is_some() {
+            let all = crate::inkling2::logits(self, tokens)?;
+            let vocab = self.cfg.vocab;
+            let start = all.len().saturating_sub(n_logits * vocab);
+            return Ok(all[start..].to_vec());
+        }
         self.forward_mm(sess, tokens, positions, n_logits, &[])
     }
 
@@ -1500,6 +1508,9 @@ impl Model {
     /// One-token greedy step: the argmax is computed on the device and only the token id comes back. The
     /// logits never cross the bus; `forward` keeps the full row for sampling and verification.
     pub fn forward_argmax(&self, sess: &mut Session, tokens: &[u32]) -> Result<u32> {
+        if self.inkling2.is_some() {
+            return crate::inkling2::generate(self, tokens, 1).map(|v| v[0]);
+        }
         let v = self.forward_impl(sess, tokens, None, 1, &[], false, true)?;
         Ok(v[0] as u32)
     }
