@@ -892,20 +892,26 @@ __device__ __forceinline__ uint16_t f2bf(float f) {
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
+// `ldx`/`ldo` are the row strides of the input and the output (K and N for a plain GEMM) and `blockIdx.z` walks a
+// batch, each member `K` columns into x, `N` into out and `wld` rows into W plus `woff` rows: one launch for the 32
+// heads of Hy4's `kv_b_proj` V half, whose rows are a contiguous block per head.
 extern "C" __global__ void __launch_bounds__(256) gemm_bf16_wmma(float* out, const float* x, const bf16_t* W, int T,
-                                                                int N, int K) {
+                                                                int N, int K, int ldx, int ldo, int wld, int woff) {
     __shared__ __attribute__((aligned(16))) uint16_t xs[64][40];
     __shared__ __attribute__((aligned(16))) uint16_t ws[64][40];
     const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
     const int t0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    const float* xb = x + (size_t)blockIdx.z * K;
+    float* ob = out + (size_t)blockIdx.z * N;
+    const bf16_t* Wb = W + (size_t)blockIdx.z * wld + woff;
     const int wt = (wave / 2) * 16, wn = (wave % 2) * 32;
     f32x8 acc[2] = {(f32x8){0, 0, 0, 0, 0, 0, 0, 0}, (f32x8){0, 0, 0, 0, 0, 0, 0, 0}};
     for (int k0 = 0; k0 < K; k0 += 32) {
         __syncthreads();
         for (int e = tid; e < 64 * 32; e += 256) {
             const int r = e / 32, c = e % 32;
-            xs[r][c] = f2bf(x[(size_t)min(t0 + r, T - 1) * K + k0 + c]);
-            ws[r][c] = W[(size_t)min(n0 + r, N - 1) * K + k0 + c];
+            xs[r][c] = f2bf(xb[(size_t)min(t0 + r, T - 1) * ldx + k0 + c]);
+            ws[r][c] = Wb[(size_t)min(n0 + r, N - 1) * K + k0 + c];
         }
         __syncthreads();
 #pragma unroll
@@ -923,7 +929,7 @@ extern "C" __global__ void __launch_bounds__(256) gemm_bf16_wmma(float* out, con
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int t = t0 + wt + 2 * i + lane / 16, n = n0 + wn + f * 16 + lane % 16;
-            if (t < T && n < N) out[(size_t)t * N + n] = acc[f][i];
+            if (t < T && n < N) ob[(size_t)t * ldo + n] = acc[f][i];
         }
 }
 

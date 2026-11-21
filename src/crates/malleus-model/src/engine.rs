@@ -97,7 +97,7 @@ impl Default for LoadOptions {
 /// Rows per tile of the grouped MoE GEMMs (moe_i8*).
 pub(crate) const MOE_BM: usize = 64;
 
-static MOE_BM128_ROWS_ENV: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+pub(crate) static MOE_BM128_ROWS_ENV: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::env::var("MALLEUS_MOE_BM128")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -809,8 +809,33 @@ impl Model {
                     DeviceBuffer::alloc(blocks * 4)?,
                 ]
             },
-            moe: match &c.moe {
-                Some(m) => {
+            // The grouped MoE of the other families hinges on `c.moe`; Hy4's latent MoE has its own geometry
+            // (`hy4.rs`: the experts run in the latent width, the shared expert on the full one), so it gets the
+            // same scratch sized from `hy4` instead.
+            moe: match (&c.moe, &c.hy4) {
+                (None, Some(h)) if h.sparse.iter().any(|s| *s) => {
+                    let (p, e1) = (cap * h.top_k, h.experts + 1);
+                    let (latent, inter) = (h.latent, h.moe_inter);
+                    Some(MoeScratch {
+                        logits: f32s(cap * e1)?,
+                        ids: DeviceBuffer::alloc(p * 4)?,
+                        slot_ids: std::sync::Mutex::new(DeviceBuffer::alloc(4)?),
+                        w: f32s(p)?,
+                        gu: f32s(p * 2 * inter)?,
+                        act: f32s(p * inter)?,
+                        offs: DeviceBuffer::alloc((e1 + 1) * 4)?,
+                        perm: DeviceBuffer::alloc(p * 4)?,
+                        pos: DeviceBuffer::alloc(p * 4)?,
+                        tiles: DeviceBuffer::alloc((p.div_ceil(MOE_BM) + 3 * e1 + 1) * 8)?,
+                        ntiles: DeviceBuffer::alloc(8)?,
+                        xg: DeviceBuffer::alloc(p * latent)?,
+                        xgs: f32s(p * latent.div_ceil(128))?,
+                        aq: DeviceBuffer::alloc(p * inter)?,
+                        aqs: f32s(p * inter.div_ceil(128))?,
+                        y: DeviceBuffer::alloc(p * latent * 4)?,
+                    })
+                }
+                (Some(m), _) => {
                     let (p, e1) = (cap * m.slots(), m.experts + 1);
                     Some(MoeScratch {
                         logits: f32s(cap * e1)?,
@@ -835,7 +860,7 @@ impl Model {
                         y: DeviceBuffer::alloc(p * c.hidden * if self.moe_y_half { 2 } else { 4 })?,
                     })
                 }
-                None => None,
+                _ => None,
             },
             idx: match &c.indexer {
                 Some(ic) => Some([
@@ -2100,6 +2125,10 @@ impl Model {
                     t.into(),
                     e1.into(),
                     h.into(),
+                    h.into(),
+                    e1.into(),
+                    0i32.into(),
+                    0i32.into(),
                 ],
             )?;
         } else {
@@ -2139,6 +2168,8 @@ impl Model {
                     mc.n_group.into(),
                     mc.topk_group.into(),
                     mc.scaling.into(),
+                    (mc.experts + 1).into(),
+                    1i32.into(),
                 ],
             )?;
         } else {

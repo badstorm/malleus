@@ -203,13 +203,26 @@ extern "C" __global__ void __launch_bounds__(256) ihc_head(float* out, const flo
     }
 }
 
-// The routed expert's SwiGLU: y[i] = silu(gu[i]).clamp(max = L) * gu[inter + i].clamp(-L, L).
+// The routed expert's SwiGLU, as the reference writes it: `silu(clamp(gate, max = L)) * clamp(up, -L, L)`. The gate is
+// clamped before the silu, not after.
+__device__ __forceinline__ float hy4_swiglu(float g, float u, float limit) {
+    const float gc = fminf(g, limit);
+    return gc / (1.f + expf(-gc)) * fmaxf(-limit, fminf(u, limit));
+}
+
 extern "C" __global__ void __launch_bounds__(256) hy4_glu(float* y, const float* gu, int inter, float limit) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= inter) return;
-    const float g = gu[i], u = gu[inter + i];
-    const float gs = g / (1.f + expf(-g));
-    y[i] = fminf(gs, limit) * fmaxf(-limit, fminf(u, limit));
+    y[i] = hy4_swiglu(gu[i], gu[inter + i], limit);
+}
+
+// The same over every row of the grouped gate|up GEMM's output (`ms.gu` of the prefill: [rows, 2 * inter]) and without
+// the rotation, which the int8 quantizer of the down GEMM applies.
+extern "C" __global__ void __launch_bounds__(256) hy4_glu_rows(float* y, const float* gu, int inter, float limit) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (i >= inter) return;
+    const float* g = gu + (size_t)r * 2 * inter;
+    y[(size_t)r * inter + i] = hy4_swiglu(g[i], g[inter + i], limit);
 }
 
 // out[i] += w * y[i]: one (token, slot) pair added into its token's latent row.
@@ -370,23 +383,23 @@ extern "C" __global__ void __launch_bounds__(256) hy4_merge_pack(float* out, con
 // Absorbed MLA. The cache holds the latent (512) and the rotated dims (64); `kv_b_proj` is read once into the query
 // instead of expanding K and V for every token, so a step costs 1.1 KiB per cached token and not `heads * (nope + v)`.
 // The per-head stride of `kv_b` is `nope + v` (Hy4's V is wider than its nope), which is where Ling's kernels differ.
-extern "C" __global__ void __launch_bounds__(256) hy4_absorb(float* qt, const float* q, const float* wkb, int t,
-                                                            int nh, int nope, int kv, int rd, int vo) {
+extern "C" __global__ void __launch_bounds__(256) hy4_absorb(float* qt, const float* q, const unsigned short* wkb,
+                                                            int t, int nh, int nope, int kv, int rd, int vo) {
     const int wl = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int w = blockIdx.x * 8 + wl;
     if (w >= t * nh) return;
     const int ti = w / nh, h = w % nh;
     const int d0 = lane * 16;
     const float* qh = q + (size_t)ti * nh * (nope + rd) + (size_t)h * (nope + rd);
-    const float* wk = wkb + (size_t)h * vo * kv;
+    const unsigned short* wk = wkb + (size_t)h * vo * kv;
     float acc[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) acc[i] = 0.f;
     for (int n = 0; n < nope; ++n) {
         const float qn = qh[n];
-        const float* row = wk + (size_t)n * kv + d0;
+        const unsigned short* row = wk + (size_t)n * kv + d0;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) acc[i] += qn * row[i];
+        for (int i = 0; i < 16; ++i) acc[i] += qn * hy4_bf(row[i]);
     }
     float* dst = qt + (size_t)w * kv + d0;
 #pragma unroll
@@ -475,19 +488,11 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_merge(float* lat_out, 
     if (d + 256 < kv) lat_out[(size_t)th * kv + d + 256] = L > 0.f ? b / L : 0.f;
 }
 
-// The V half of `kv_b_proj` for one (token, head) of the merged latent, times the per-(head, dim) output gate.
-extern "C" __global__ void __launch_bounds__(256) hy4_mla_v(float* out, const float* lat_out, const float* wkb,
-                                                           const float* gate, int nh, int nope, int v, int kv) {
-    const int th = blockIdx.x;
-    const int h = th % nh;
-    const int d = threadIdx.x;
-    if (d >= v) return;
-    const float* row = wkb + (size_t)h * (nope + v) * kv + (size_t)(nope + d) * kv;
-    const float* lat = lat_out + (size_t)th * kv;
-    float sum = 0.f;
-    for (int c = 0; c < kv; ++c) sum += row[c] * lat[c];
-    const size_t o = (size_t)th * v + d;
-    out[o] = sum * (1.f / (1.f + expf(-gate[o])));
+// The output gate of the gated MLA: out[o] *= sigmoid(gate[o]). It follows the V half of `kv_b_proj`, which is a
+// GEMM now (the per-(token, head) GEMV read the 256 rows of a head one per thread, 32 cache lines per instruction).
+extern "C" __global__ void __launch_bounds__(256) hy4_gate_mul(float* out, const float* gate, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] *= 1.f / (1.f + expf(-gate[i]));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
