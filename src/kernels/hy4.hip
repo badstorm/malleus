@@ -12,42 +12,64 @@
 //   pre  = sigmoid((fn[0:c] @ flat) * scale[0] + base[0:c]) + eps
 //   post = magnitude * sigmoid((fn[c:2c] @ flat) * scale[1] + base[c:2c]) + eps
 //   out  = sum_c pre[c] * streams[:, c, :]
-extern "C" __global__ void __launch_bounds__(256) ihc_pre(float* out, float* post, const float* streams,
-                                                          const float* fn, const float* base, const float* scale,
-                                                          int t, int c, int h, float magnitude, float eps) {
-    extern __shared__ float sh[];
-    float* m = sh;          // [2 * c]
-    float* red = sh + 2 * c; // [256]
-    const int ti = blockIdx.x;
-    const int tid = threadIdx.x;
-    const float* flat = streams + (size_t)ti * c * h;
-    const int k = c * h;
-    float ss = 0.f;
-    for (int i = tid; i < k; i += blockDim.x) ss += flat[i] * flat[i];
-    red[tid] = ss;
+// Stage 1 of the pre-mix: the partial sum of squares and the 2c dot products over one slice of `flat`, for grid
+// (t, P). A single block per token was latency bound on the 2c x c*h f32 matrix: ~135 us for one decode token.
+//   part [t, P, 17]: the 2c partial mixes in [0, 2c), the partial sum of squares at 16.
+extern "C" __global__ void __launch_bounds__(256) ihc_pre_part(float* part, const float* streams, const float* fn,
+                                                               int t, int c, int h) {
+    __shared__ float red[8][17];
+    const int ti = blockIdx.x, p = blockIdx.y, np = gridDim.y;
+    const int tid = threadIdx.x, lane = tid % 32, wl = tid / 32;
+    const int k = c * h, nm = 2 * c;
+    const int per = (k + np - 1) / np;
+    const int i0 = p * per, i1 = min(k, i0 + per);
+    const float* flat = streams + (size_t)ti * k;
+    float acc[17];
+#pragma unroll
+    for (int o = 0; o < 17; ++o) acc[o] = 0.f;
+    for (int i = i0 + tid; i < i1; i += blockDim.x) {
+        const float x = flat[i];
+        acc[16] += x * x;
+#pragma unroll
+        for (int o = 0; o < 16; ++o)
+            if (o < nm) acc[o] += fn[(size_t)o * k + i] * x;
+    }
+#pragma unroll
+    for (int o = 0; o < 17; ++o) {
+        float v = acc[o];
+        for (int d = 16; d > 0; d >>= 1) v += __shfl_xor(v, d);
+        if (lane == 0) red[wl][o] = v;
+    }
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) red[tid] += red[tid + s];
-        __syncthreads();
+    if (tid < 17) {
+        float v = 0.f;
+        for (int w = 0; w < (int)blockDim.x / 32; ++w) v += red[w][tid];
+        part[((size_t)ti * np + p) * 17 + tid] = v;
     }
-    const float norm = rsqrtf(red[0] / (float)k + eps);
-    // The 2c mixes: one block-wide dot product each.
-    for (int o = 0; o < 2 * c; ++o) {
-        const float* row = fn + (size_t)o * k;
-        float acc = 0.f;
-        for (int i = tid; i < k; i += blockDim.x) acc += row[i] * flat[i];
-        red[tid] = acc;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            __syncthreads();
-        }
-        m[o] = red[0] * norm;
-        __syncthreads();
+}
+
+// Stage 2: the partials of one token summed in a fixed order, then the gates and the mix.
+//   pre  = sigmoid(mix[0:c] * norm * scale[0] + base[0:c]) + eps
+//   post = magnitude * sigmoid(mix[c:2c] * norm * scale[1] + base[c:2c]) + eps
+//   out  = sum_c pre[c] * streams[:, c, :]
+extern "C" __global__ void __launch_bounds__(256) ihc_pre(float* out, float* post, const float* streams,
+                                                          const float* part, const float* base, const float* scale,
+                                                          int t, int c, int h, int np, float magnitude, float eps) {
+    __shared__ float m[17];
+    const int ti = blockIdx.x, tid = threadIdx.x;
+    const float* flat = streams + (size_t)ti * c * h;
+    if (tid < 17) {
+        float v = 0.f;
+        for (int p = 0; p < np; ++p) v += part[((size_t)ti * np + p) * 17 + tid];
+        m[tid] = v;
     }
+    __syncthreads();
+    const float norm = rsqrtf(m[16] / (float)(c * h) + eps);
+    __syncthreads();
     if (tid < c) {
-        post[ti * c + tid] = magnitude * (1.f / (1.f + expf(-(m[c + tid] * scale[1] + base[c + tid])))) + eps;
-        m[tid] = 1.f / (1.f + expf(-(m[tid] * scale[0] + base[tid]))) + eps;
+        post[ti * c + tid] =
+            magnitude * (1.f / (1.f + expf(-(m[c + tid] * norm * scale[1] + base[c + tid])))) + eps;
+        m[tid] = 1.f / (1.f + expf(-(m[tid] * norm * scale[0] + base[tid]))) + eps;
     }
     __syncthreads();
     for (int d = tid; d < h; d += blockDim.x) {
@@ -385,9 +407,12 @@ extern "C" __global__ void __launch_bounds__(256) hy4_merge_pack(float* out, con
 // The per-head stride of `kv_b` is `nope + v` (Hy4's V is wider than its nope), which is where Ling's kernels differ.
 extern "C" __global__ void __launch_bounds__(256) hy4_absorb(float* qt, const float* q, const unsigned short* wkb,
                                                             int t, int nh, int nope, int kv, int rd, int vo) {
+    // One block per (token, head); its eight warps split the nope rows and add their partial latents in a fixed
+    // order, so the result does not depend on the launch. One warp per (token, head) left a decode token with eight
+    // blocks on the whole GPU.
+    __shared__ float part[8][512];
     const int wl = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int w = blockIdx.x * 8 + wl;
-    if (w >= t * nh) return;
+    const int w = blockIdx.x;
     const int ti = w / nh, h = w % nh;
     const int d0 = lane * 16;
     const float* qh = q + (size_t)ti * nh * (nope + rd) + (size_t)h * (nope + rd);
@@ -395,15 +420,68 @@ extern "C" __global__ void __launch_bounds__(256) hy4_absorb(float* qt, const fl
     float acc[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) acc[i] = 0.f;
-    for (int n = 0; n < nope; ++n) {
+    for (int n = wl; n < nope; n += 8) {
         const float qn = qh[n];
-        const unsigned short* row = wk + (size_t)n * kv + d0;
+        const uint4* row = (const uint4*)(wk + (size_t)n * kv + d0);
+        const uint4 a = row[0], b = row[1];
+        const unsigned u[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
 #pragma unroll
-        for (int i = 0; i < 16; ++i) acc[i] += qn * hy4_bf(row[i]);
+        for (int i = 0; i < 8; ++i) {
+            acc[2 * i] += qn * __uint_as_float(u[i] << 16);
+            acc[2 * i + 1] += qn * __uint_as_float(u[i] & 0xffff0000u);
+        }
     }
-    float* dst = qt + (size_t)w * kv + d0;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) dst[i] = acc[i];
+    for (int i = 0; i < 16; ++i) part[wl][d0 + i] = acc[i];
+    __syncthreads();
+    float* dst = qt + (size_t)w * kv;
+    for (int d = threadIdx.x; d < kv; d += 256) {
+        float v = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v += part[j][d];
+        dst[d] = v;
+    }
+}
+
+// The V half of `kv_b` for a few rows (decode, short verify): out[t, h, n] = sum_k x[t, h, k] * W[h, woff + n, k],
+// one warp per output row and all `T <= 8` tokens at once, so each bf16 row of W is read once per step. The 64-row
+// WMMA tile it replaces for small T read 64 bytes per row per k-step and ran at a quarter of the bandwidth.
+extern "C" __global__ void __launch_bounds__(256) hy4_vhalf_gemv(float* out, const float* x, const unsigned short* W,
+                                                                int T, int N, int K, int ldx, int ldo, int wld,
+                                                                int woff) {
+    const int wl = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int n = blockIdx.x * 8 + wl, h = blockIdx.y;
+    if (n >= N) return;
+    const unsigned short* row = W + (size_t)h * wld + woff + (size_t)n * K;
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+    for (int k0 = lane * 8; k0 < K; k0 += 256) {
+        const uint4 a = *(const uint4*)(row + k0);
+        const unsigned u[4] = {a.x, a.y, a.z, a.w};
+        float wv[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            wv[2 * i] = __uint_as_float(u[i] << 16);
+            wv[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int ti = 0; ti < 8; ++ti) {
+            if (ti < T) {
+                const float* xr = x + (size_t)ti * ldx + (size_t)h * K + k0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[ti] += wv[i] * xr[i];
+            }
+        }
+    }
+#pragma unroll
+    for (int ti = 0; ti < 8; ++ti) {
+        if (ti < T) {
+            float v = acc[ti];
+            for (int d = 16; d > 0; d >>= 1) v += __shfl_xor(v, d);
+            if (lane == 0) out[(size_t)ti * ldo + (size_t)h * N + n] = v;
+        }
+    }
 }
 
 // One split of one (token, head): the block's eight warps split the token's keys, each with an online softmax and the
@@ -774,4 +852,68 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_split_ix(float* part, 
     }
 #pragma unroll
     for (int i = 0; i < 16; ++i) dst[2 + d0 + i] = acc[i];
+}
+
+// MLS4 GEMV for a long K on few rows (Hy4's o_proj: K = 8192 / 16384, N = 3072), T <= 4 tokens. `xr` is already in
+// the rotated basis (f32, one `hadamard128` per step), so nothing is staged: each lane reads 32 weights (16 bytes) of
+// two rows and the 32 inputs they meet straight from the cache, two chunks per iteration, with no barrier. The staged
+// GEMV redid the Hadamard of the whole input in each of its blocks and waited on a barrier per 1024 weights (8.4 ms a
+// token on this shape against 7.7 here). Every token sums in the same order whatever T is, so a row of a verify
+// equals the same token decoded alone. LDS staging and a split over K were both measured slower: what is left is
+// how the 8 KB rows are read, not the number of loads in flight.
+extern "C" __global__ void __launch_bounds__(256) hy4_gemv_long(float* out, const float* xr, const unsigned char* q,
+                                                               const __half* sc, int T, int N, int K, int accumulate) {
+    constexpr int R = 2;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int n0 = (blockIdx.x * 8 + warp) * R;
+    if (n0 >= N) return;
+    const int G = K / 128;
+    float acc[4][R];
+#pragma unroll
+    for (int a = 0; a < 4; ++a)
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[a][r] = 0.f;
+#pragma unroll 2
+    for (int k = lane * 32; k < K; k += 1024) {
+        uint4 v[R];
+        float s[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int n = min(n0 + r, N - 1);
+            v[r] = *(const uint4*)(q + (size_t)n * (K / 2) + k / 2);
+            s[r] = __half2float(sc[(size_t)n * G + k / 128]);
+        }
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+            if (a >= T) break;
+            const float4* xp = (const float4*)(xr + (size_t)a * K + k);
+            float part[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) part[r] = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 x0 = xp[2 * i], x1 = xp[2 * i + 1];
+                const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const unsigned w = i == 0 ? v[r].x : i == 1 ? v[r].y : i == 2 ? v[r].z : v[r].w;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) part[r] += xv[j] * (float)(((int)(w << (28 - 4 * j))) >> 28);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[a][r] += part[r] * s[r];
+        }
+    }
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        if (a >= T) break;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = acc[a][r];
+            for (int d = 16; d > 0; d >>= 1) v += __shfl_xor(v, d);
+            const int n = n0 + r;
+            if (lane == 0 && n < N) out[(size_t)a * N + n] = accumulate ? out[(size_t)a * N + n] + v : v;
+        }
+    }
 }

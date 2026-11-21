@@ -226,7 +226,10 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
 pub(crate) fn validate(c: &Config) -> Result<()> {
     let h = c.hy4.as_ref().context("config: hy4 geometry")?;
     ensure!(c.family == Family::Hy4 && c.n_layers == c.kind.len(), "bad hy4 layers");
-    ensure!(h.hc_mult >= 2, "hy4 needs at least two streams");
+    ensure!(
+        (2..=8).contains(&h.hc_mult),
+        "hy4 needs 2..=8 streams (ihc_pre keeps 2c mixes in registers)"
+    );
     ensure!(h.rope == 64 && h.swa_rope == h.rope, "hy4 rotates 64 dims per head");
     ensure!(
         h.mrope_section.iter().sum::<usize>() * 2 == h.rope,
@@ -865,6 +868,9 @@ fn rmsnorm_raw(
 /// instead of the host, which is one synchronization per layer — so the default is always grouped.
 const HY4_MOE_GROUPED_T: usize = 1;
 
+/// Up to this many tokens the routed experts run as per-pair GEMVs on the device router's choice (a decode step).
+const HY4_MOE_GEMV_T: usize = 4;
+
 /// The routed experts of a short step: one (token, slot) pair at a time, two GEMVs and the clamped SwiGLU over the
 /// pair's slice of the stacked matrices. Exact and launch-bound: it is what a 12-token prompt and a decode step take.
 fn pair_experts(
@@ -1223,11 +1229,67 @@ fn moe(
         );
     }
     let routed = crate::session::f32s(t * latent)?;
-    routed.memset(0, st)?;
-    if grouped {
-        grouped_experts(model, m, &rout_in, &ids, &ws, t, &routed, sc)?;
+    if t <= HY4_MOE_GEMV_T && std::env::var("MALLEUS_HY4_MOE_GEMV").map_or(true, |v| v != "0") {
+        // A decode step: one GEMV per (token, slot) on the expert the device router picked, the clamped SwiGLU
+        // rotated for the down projection, and the down projection weighted and summed over the slots. No sort, no
+        // gather and no padded tiles: three launches where the grouped path takes ten.
+        let ms = sc.moe.as_ref().context("hy4 MoE scratch")?;
+        let p = t * top_k;
+        model.k.get("moe_gate_up").launch(
+            ((2 * inter).div_ceil(32) as u32, p as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&ms.gu).into(),
+                (&rout_in).into(),
+                (&m.gu.0).into(),
+                (&m.gu.1).into(),
+                (&ms.ids).into(),
+                top_k.into(),
+                (2 * inter).into(),
+                latent.into(),
+                (&model.signs).into(),
+            ],
+        )?;
+        model.k.get("moe_act").launch(
+            ((p * inter / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[
+                (&ms.act).into(),
+                (&ms.gu).into(),
+                (&model.signs).into(),
+                inter.into(),
+                h.swiglu_limit.into(),
+            ],
+        )?;
+        model.k.get("moe_down").launch(
+            (latent.div_ceil(32) as u32, t as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&routed).into(),
+                (&ms.act).into(),
+                (&m.down.0).into(),
+                (&m.down.1).into(),
+                (&ms.ids).into(),
+                (&ms.w).into(),
+                top_k.into(),
+                latent.into(),
+                inter.into(),
+                0i32.into(),
+            ],
+        )?;
     } else {
-        pair_experts(model, m, &rout_in, &ids, &ws, t, &routed)?;
+        routed.memset(0, st)?;
+        if grouped {
+            grouped_experts(model, m, &rout_in, &ids, &ws, t, &routed, sc)?;
+        } else {
+            pair_experts(model, m, &rout_in, &ids, &ws, t, &routed)?;
+        }
     }
 
     // Back to the hidden width, then the shared expert on the full-width input added in: plain GEMMs, since the
@@ -2294,6 +2356,60 @@ fn indexer_step(
     Ok(Some(list))
 }
 
+/// Slices of the `c * hidden` input that `ihc_pre_part` spreads one token over.
+const IHC_SLICES: usize = 24;
+
+/// The iHC pre-mix of one sublayer: `out` the block input, `post` the residual gates.
+fn ihc_pre(
+    model: &crate::engine::Model,
+    w: &Ihc,
+    out: &DeviceBuffer,
+    post: &DeviceBuffer,
+    streams: &DeviceBuffer,
+    part: &DeviceBuffer,
+    t: usize,
+) -> Result<()> {
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let st = &model.stream;
+    let (hc, hidden) = (h.hc_mult, c.hidden);
+    model.k.get("ihc_pre_part").launch(
+        (t as u32, IHC_SLICES as u32, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            part.into(),
+            streams.into(),
+            (&w.f).into(),
+            t.into(),
+            hc.into(),
+            hidden.into(),
+        ],
+    )?;
+    model.k.get("ihc_pre").launch(
+        (t as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            out.into(),
+            post.into(),
+            streams.into(),
+            part.into(),
+            (&w.base).into(),
+            (&w.scale).into(),
+            t.into(),
+            hc.into(),
+            hidden.into(),
+            IHC_SLICES.into(),
+            h.hc_magnitude.into(),
+            h.hc_eps.into(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// One forward of the text graph: iHC, the Engram memories, the gated MLA with its sink (dense below `index_topk`,
 /// over the recalled groups above it), the compressed indexer of the indexed layers, the latent MoE and the head.
 pub(crate) fn forward(
@@ -2346,11 +2462,9 @@ pub(crate) fn forward(
         sess.max_ctx
     );
     let st = &model.stream;
-    // The kv_b expansion GEMM runs over the whole cache (`nk = len + t`), so the GEMM scratch is sized for the
-    // larger of the step and the cache: with no history the two coincide, which is why this only showed up once
-    // the bench decoded into a prompt.
-    let sc_cap = (sess.len + t).max(t);
-    let mut sc = model.take_scratch(sc_cap)?;
+    // Every GEMM of the step runs over the step's own rows (the absorbed MLA never expands the cache), so the scratch
+    // is sized on `t`: sized on `len + t` it grew by one row per decode token and was reallocated at every step.
+    let mut sc = model.take_scratch(t)?;
     let ids: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
     // An image prompt: the merged features replace the placeholder rows and the positions are the 3-D M-RoPE
     // ones (an image block is a rectangle of patches with a newline column, not a run of positions).
@@ -2479,7 +2593,7 @@ pub(crate) fn forward(
         ],
     )?;
     let (hidden, hc, eps) = (c.hidden, h.hc_mult, c.hy4.as_ref().unwrap().hc_eps);
-    let hc_shared = (2 * hc * 4 + 256 * 4) as u32;
+    let ihc_part = crate::session::f32s(t * IHC_SLICES * 17)?;
     let layers = std::env::var("MALLEUS_HY4_LAYERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -2544,25 +2658,7 @@ pub(crate) fn forward(
             dump("engram_out", li, &streams, t * sd)?;
         }
         // iHC pre-mix of the mixer, its norm, and the MLA projections.
-        model.k.get("ihc_pre").launch(
-            (t as u32, 1, 1),
-            (256, 1, 1),
-            hc_shared,
-            st,
-            &[
-                (&hn).into(),
-                (&post).into(),
-                (&streams).into(),
-                (&layer.attn_hc.f).into(),
-                (&layer.attn_hc.base).into(),
-                (&layer.attn_hc.scale).into(),
-                t.into(),
-                hc.into(),
-                hidden.into(),
-                h.hc_magnitude.into(),
-                eps.into(),
-            ],
-        )?;
+        ihc_pre(model, &layer.attn_hc, &hn, &post, &streams, &ihc_part, t)?;
         dump("ihc_pre", li, &hn, t * hidden)?;
         dump("ihc_post", li, &post, t * hc)?;
         dump("ihc_out", li, &hn, t * hidden)?;
@@ -2640,7 +2736,7 @@ pub(crate) fn forward(
         let nsplit = 8usize;
         let qt = crate::session::f32s(t * a.heads * h.kv_lora)?;
         model.k.get("hy4_absorb").launch(
-            ((t * a.heads).div_ceil(8) as u32, 1, 1),
+            ((t * a.heads) as u32, 1, 1),
             (256, 1, 1),
             0,
             st,
@@ -2777,24 +2873,28 @@ pub(crate) fn forward(
         // The V half of `kv_b_proj`: one bf16 WMMA GEMM per head over the whole chunk (a batch on `blockIdx.z`), then
         // the per-(head, dim) gate. As a per-(token, head) GEMV this read the 256 rows of a head one per thread — 32
         // cache lines per instruction — and was 90 % of the prefill.
-        model.k.get("gemm_bf16_wmma").launch(
-            (a.v.div_ceil(64) as u32, t.div_ceil(64) as u32, a.heads as u32),
-            (256, 1, 1),
-            0,
-            st,
-            &[
-                (&attn_out).into(),
-                (&lat_merged).into(),
-                (&a.kv_b).into(),
-                t.into(),
-                a.v.into(),
-                h.kv_lora.into(),
-                (a.heads * h.kv_lora).into(),
-                (a.heads * a.v).into(),
-                ((a.nope + a.v) * h.kv_lora).into(),
-                (a.nope * h.kv_lora).into(),
-            ],
-        )?;
+        let args = [
+            (&attn_out).into(),
+            (&lat_merged).into(),
+            (&a.kv_b).into(),
+            t.into(),
+            a.v.into(),
+            h.kv_lora.into(),
+            (a.heads * h.kv_lora).into(),
+            (a.heads * a.v).into(),
+            ((a.nope + a.v) * h.kv_lora).into(),
+            (a.nope * h.kv_lora).into(),
+        ];
+        // A few rows (decode, a short verify) read each bf16 row once in a GEMV; a chunk goes through the WMMA tiles.
+        let (name, grid) = if t <= 8 {
+            ("hy4_vhalf_gemv", (a.v.div_ceil(8) as u32, a.heads as u32, 1))
+        } else {
+            (
+                "gemm_bf16_wmma",
+                (a.v.div_ceil(64) as u32, t.div_ceil(64) as u32, a.heads as u32),
+            )
+        };
+        model.k.get(name).launch(grid, (256, 1, 1), 0, st, &args)?;
         model.ew(
             st,
             "hy4_gate_mul",
@@ -2822,25 +2922,7 @@ pub(crate) fn forward(
         )?;
         dump("streams_attn", li, &streams, t * sd)?;
         // FFN: iHC pre-mix, pre-norm, the dense SwiGLU and its sandwich norm, then the residual.
-        model.k.get("ihc_pre").launch(
-            (t as u32, 1, 1),
-            (256, 1, 1),
-            hc_shared,
-            st,
-            &[
-                (&hn).into(),
-                (&post).into(),
-                (&streams).into(),
-                (&layer.ffn_hc.f).into(),
-                (&layer.ffn_hc.base).into(),
-                (&layer.ffn_hc.scale).into(),
-                t.into(),
-                hc.into(),
-                hidden.into(),
-                h.hc_magnitude.into(),
-                eps.into(),
-            ],
-        )?;
+        ihc_pre(model, &layer.ffn_hc, &hn, &post, &streams, &ihc_part, t)?;
         dump("ffn_pre", li, &hn, t * hidden)?;
         dump("ffn_post", li, &post, t * hc)?;
         model.rmsnorm(st, &hn2, &hn, &layer.post_norm, t, hidden)?;

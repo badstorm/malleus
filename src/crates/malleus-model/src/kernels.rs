@@ -195,6 +195,7 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
         "hy4",
         &[
             "ihc_pre",
+            "ihc_pre_part",
             "ihc_res",
             "ihc_head",
             "hy4_rope",
@@ -210,6 +211,8 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "hy4_vit_attn",
             "hy4_merge_pack",
             "hy4_absorb",
+            "hy4_vhalf_gemv",
+            "hy4_gemv_long",
             "hy4_mla_split",
             "hy4_mla_merge",
             "hy4_ix_keys",

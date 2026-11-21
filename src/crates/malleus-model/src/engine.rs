@@ -1273,6 +1273,28 @@ impl Model {
         } else {
             (w.n.div_ceil(16) as u32, t.div_ceil(8) as u32, 1)
         };
+        if name == "gemv_mls4_l1" && w.n <= 4096 && w.k >= 8192 && self.hy4.is_some() {
+            // Hy4's o_proj (K = 8192 / 16384 on 3072 rows): the fused rotation redoes the Hadamard of the whole input
+            // in every one of the 384 blocks, which costs as much as decoding the weights. Rotate it once instead.
+            let rot = [xr.into(), x.into(), (&self.signs).into(), w.k.into()];
+            self.k
+                .get("hadamard128")
+                .launch((chunks, 1, 1), (128, 1, 1), 0, s, &rot)?;
+            let args = [
+                out.into(),
+                xr.into(),
+                q.into(),
+                sc.into(),
+                t.into(),
+                w.n.into(),
+                w.k.into(),
+                (acc as i32).into(),
+            ];
+            self.k
+                .get("hy4_gemv_long")
+                .launch((w.n.div_ceil(16) as u32, 1, 1), (256, 1, 1), 0, s, &args)?;
+            return Ok(());
+        }
         if name == "gemv_mls4_l1" && w.n <= 4096 {
             // Few rows (o_proj, out_proj): one row per warp gives the GPU 4x the blocks.
             let g = (w.n.div_ceil(8) as u32, 1, 1);
