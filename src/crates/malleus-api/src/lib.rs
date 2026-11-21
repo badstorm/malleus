@@ -291,14 +291,19 @@ impl RouterStatus {
     }
 }
 
+/// The image placeholder the tokenizer knows: Qwen and the models carried so far spell it `<|image_pad|>`, Hy4
+/// spells it `<｜hy_image▁pad:opensource｜>` (the token its own chat template writes).
+fn image_pad_id(chat: &Chat) -> Option<u32> {
+    ["<|image_pad|>", "<\u{ff5c}hy_image\u{2581}pad:opensource\u{ff5c}>"]
+        .iter()
+        .find_map(|t| chat.token_id(t))
+}
+
 /// One catalog entry in the router shape. It carries the OpenAI fields too, so a client can read either catalog the
 /// same way; `meta.n_ctx` is the context this server serves the model with, which is also the only training window
 /// this engine knows (it does not read the checkpoint's own `max_position_embeddings`).
 fn router_entry(st: &AppState, spec: &ModelSpec, status: &RouterStatus) -> Value {
-    let vision = st
-        .chats
-        .get(&spec.id)
-        .is_some_and(|c| c.token_id("<|image_pad|>").is_some());
+    let vision = st.chats.get(&spec.id).is_some_and(|c| image_pad_id(c).is_some());
     json!({
         "id": spec.id.as_ref(),
         "object": "model",
@@ -849,10 +854,7 @@ fn prepare(
     let image_token = if images.is_empty() {
         None
     } else {
-        Some(
-            chat.token_id("<|image_pad|>")
-                .ok_or_else(|| bad("tokenizer has no <|image_pad|> token"))?,
-        )
+        Some(image_pad_id(chat).ok_or_else(|| bad("tokenizer has no image placeholder token"))?)
     };
     let left = ctx - ids.len();
     let max_tokens = (max_tokens.unwrap_or(st.cfg.max_tokens_default as u64) as usize).clamp(1, left);
