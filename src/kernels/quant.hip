@@ -436,11 +436,13 @@ extern "C" __global__ void __launch_bounds__(32) moe_route_w(int* ids, float* w,
 // The shared expert of Ling has no gate at all: it is added with weight 1 (docs/model-ling3-flash.md, § MoE).
 extern "C" __global__ void __launch_bounds__(256) moe_route_g(int* ids, float* w, const float* logits,
                                                               const float* bias, int E, int topk, int ng, int tg,
-                                                              float scaling) {
+                                                              float scaling, int ld, int shared) {
     __shared__ float sr[512], sv[512], gs[8];
     __shared__ int gsel[8], chosen[32];
     const int t = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const float* l = logits + (size_t)t * (E + 1);
+    // `ld` is the row stride of the logits (E + 1 where the router has a shared-expert gate next to them, E where it
+    // has none) and `shared` writes that extra slot (weight 1, id E) after the routed ones.
+    const float* l = logits + (size_t)t * ld;
     for (int e = threadIdx.x; e < E; e += 256) {
         const float s = 1.f / (1.f + expf(-l[e]));
         sv[e] = s;
@@ -524,12 +526,15 @@ extern "C" __global__ void __launch_bounds__(256) moe_route_g(int* ids, float* w
         // Weights from the scores without the bias, renormalized over what was chosen, then scaled.
         float sum = 0.f;
         for (int j = 0; j < topk; ++j) sum += sv[chosen[j]];
+        const int stride = shared ? topk + 1 : topk;
         for (int j = 0; j < topk; ++j) {
-            ids[t * (topk + 1) + j] = chosen[j];
-            w[t * (topk + 1) + j] = sv[chosen[j]] / (sum + 1e-20f) * scaling;
+            ids[t * stride + j] = chosen[j];
+            w[t * stride + j] = sv[chosen[j]] / (sum + 1e-20f) * scaling;
         }
-        ids[t * (topk + 1) + topk] = E;
-        w[t * (topk + 1) + topk] = 1.f;
+        if (shared) {
+            ids[t * stride + topk] = E;
+            w[t * stride + topk] = 1.f;
+        }
     }
 }
 

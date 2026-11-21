@@ -161,6 +161,15 @@ pub fn working_set_bytes(c: &Config, chunk: usize, moe_y_half: bool) -> u64 {
         b += p * c.hidden + p * c.hidden.div_ceil(128) * f32 + p * m.inter + p * m.inter.div_ceil(128) * f32;
         b += p * c.hidden * if moe_y_half { 2 } else { 4 };
     }
+    if let Some(h) = &c.hy4 {
+        // The grouped MoE of the indexed layers, sized from the latent geometry (`engine::scratch`).
+        let (p, e1) = (cap * h.top_k, h.experts + 1);
+        let (latent, inter) = (h.latent, h.moe_inter);
+        b += cap * e1 * f32 + 3 * p * 4 + p * 2 * inter * f32 + p * inter * f32;
+        b += (e1 + 1) * 4 + (p.div_ceil(MOE_BM) + 3 * e1 + 1) * 8 + 8;
+        b += p * latent + p * latent.div_ceil(128) * f32 + p * inter + p * inter.div_ceil(128) * f32;
+        b += p * latent * f32;
+    }
     if let Some(ic) = &c.indexer {
         b += cap * ((ic.heads + 1) * ic.dim + ic.heads * ic.dim + ic.dim) * f32;
     }

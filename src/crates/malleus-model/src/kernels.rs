@@ -212,7 +212,6 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "hy4_absorb",
             "hy4_mla_split",
             "hy4_mla_merge",
-            "hy4_mla_v",
             "hy4_ix_keys",
             "hy4_ix_pool",
             "hy4_ix_qrope",
@@ -220,6 +219,8 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "hy4_ix_score",
             "hy4_ix_select",
             "hy4_mla_split_ix",
+            "hy4_glu_rows",
+            "hy4_gate_mul",
         ],
     ),
     (

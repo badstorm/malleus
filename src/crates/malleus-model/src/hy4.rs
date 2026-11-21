@@ -251,6 +251,12 @@ pub(crate) fn validate(c: &Config) -> Result<()> {
         "hy4 compressed indexer: a 128-wide key and at most 8 slots per group"
     );
     ensure!(h.sparse.len() == c.n_layers, "hy4 mlp_layer_types length");
+    // `moe_route_g` (the device router of the latent MoE) keeps the expert scores in 512 shared floats and the chosen
+    // ids in 32.
+    ensure!(
+        h.experts <= 512 && h.top_k <= 32,
+        "hy4 MoE routing: at most 512 experts, 32 per token"
+    );
     ensure!(
         c.kind.contains(&MixerKind::Hy4Indexed) && c.kind.contains(&MixerKind::Hy4Sliding),
         "hy4 needs both indexed and sliding layers"
@@ -304,7 +310,8 @@ pub(crate) struct Attn {
     pub(crate) q_a: Linear,
     pub(crate) q_b: Linear,
     pub(crate) kv_a: Linear,
-    /// fp32 `[heads * (nope + v), kv_lora]`, dequantized at load: the absorbed kernels read it as a matrix.
+    /// bf16 `[heads * (nope + v), kv_lora]`, dequantized at load: the absorbed kernels read it as a matrix (the
+    /// reference keeps it in bf16, and the V half goes through the WMMA GEMM on bf16 anyway).
     pub(crate) kv_b: DeviceBuffer,
     pub(crate) o: Linear,
     pub(crate) gate: Linear,
@@ -573,7 +580,7 @@ fn load_layer(
         q_a: up.linear(src, &p("self_attn.q_a_proj"), h.q_lora, c.hidden)?,
         q_b: up.linear(src, &p("self_attn.q_b_proj"), qd, h.q_lora)?,
         kv_a: up.linear(src, &p("self_attn.kv_a_proj_with_mqa"), h.kv_lora + rope, c.hidden)?,
-        kv_b: up.linear_f32(src, &p("self_attn.kv_b_proj"), kvd, h.kv_lora, seed)?,
+        kv_b: up.linear_bf16(src, &p("self_attn.kv_b_proj"), kvd, h.kv_lora, seed)?,
         o: up.linear(src, &p("self_attn.o_proj"), c.hidden, od)?,
         gate: up.linear(src, &p("self_attn.linear_gate"), od, c.hidden)?,
         q_a_norm: up.norm(src, &p("self_attn.q_a_layernorm.weight"), h.q_lora, false)?,
@@ -849,79 +856,36 @@ fn rmsnorm_raw(
 /// The latent MoE: route on the full width, run the chosen experts in the latent space, add the shared expert and
 /// close with `combine_output_norm`.
 ///
-/// The routing and the per-expert GEMVs are exact but not fast: the top-k is host work and every (token, slot) pair
-/// is two GEMV launches over its slice of the stacked matrix. The grouped GEMM path (the one the carried models use
-/// for a prompt) is the next step; this one proves the math.
-fn moe(
+/// A chunk of `HY4_MOE_GROUPED_T` tokens or more sorts its (token, slot) pairs per expert and runs two grouped GEMMs
+/// over the stacked MLS4 expert matrices (int8 activations); shorter steps walk the pair list with GEMVs, where the
+/// grouped tiles would be all padding. The router stays on the host in both: 512 experts per token is a rounding
+/// noise next to one expert read.
+/// Tokens per step below which the routed experts take the per-pair GEMVs (`MALLEUS_HY4_MOE_GROUPED=0` forces them
+/// at any size, for the A/B). The grouped path is faster even at one token — it reads the routing from the scratch
+/// instead of the host, which is one synchronization per layer — so the default is always grouped.
+const HY4_MOE_GROUPED_T: usize = 1;
+
+/// The routed experts of a short step: one (token, slot) pair at a time, two GEMVs and the clamped SwiGLU over the
+/// pair's slice of the stacked matrices. Exact and launch-bound: it is what a 12-token prompt and a decode step take.
+fn pair_experts(
     model: &crate::engine::Model,
     m: &Moe,
-    hn2: &DeviceBuffer,
+    rout_in: &DeviceBuffer,
+    ids: &[i32],
+    ws: &[f32],
     t: usize,
-    sc: &mut crate::session::Scratch,
-) -> Result<DeviceBuffer> {
-    use crate::engine::Act;
+    routed: &DeviceBuffer,
+) -> Result<()> {
     let c = &model.cfg;
     let h = c.hy4.as_ref().context("no hy4 config")?;
     let st = &model.stream;
-    let (hidden, latent, inter) = (c.hidden, h.latent, h.moe_inter);
-    let (experts, top_k) = (h.experts, h.top_k);
-    // The router sees the full-width input; the experts run on its projection into the latent space.
-    let logits = crate::session::f32s(t * experts)?;
-    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &logits, Act::X(hn2), &m.router, t, false)?;
-    let rout_in = crate::session::f32s(t * latent)?;
-    // `Act::X`, not `Same`: the router GEMM is bf16 and does not quantize its input, so there is nothing to reuse.
-    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &rout_in, Act::X(hn2), &m.pre, t, false)?;
-    st.synchronize()?;
-    let scores: Vec<f32> = logits.download(t * experts)?;
-    let bias: Vec<f32> = m.bias.download(experts)?;
-    let mut ids = vec![0i32; t * top_k];
-    let mut ws = vec![0f32; t * top_k];
-    for ti in 0..t {
-        let row = &scores[ti * experts..][..experts];
-        let sig: Vec<f32> = row.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
-        // Selection carries the bias, the weight does not; the top-k weights are renormalized and scaled.
-        let mut order: Vec<usize> = (0..experts)
-            .map(|e| (e, sig[e] + bias[e]))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|(e, _)| e)
-            .collect();
-        order.sort_by(|&a, &b| (sig[b] + bias[b]).total_cmp(&(sig[a] + bias[a])));
-        let sel = &order[..top_k];
-        let sum: f32 = sel.iter().map(|&e| sig[e]).sum::<f32>().max(1e-20);
-        for (slot, &e) in sel.iter().enumerate() {
-            ids[ti * top_k + slot] = e as i32;
-            ws[ti * top_k + slot] = sig[e] / sum * h.routed_scaling;
-        }
-    }
-    let slots = top_k;
-    let trace = std::env::var("MALLEUS_HY4_TRACE").is_ok();
-    let dump = |name: &str, buf: &DeviceBuffer, n: usize| -> Result<()> {
-        if !trace {
-            return Ok(());
-        }
-        st.synchronize()?;
-        let v: Vec<f32> = buf.download(n)?;
-        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let dir = std::env::var("MALLEUS_DUMP_DIR")?;
-        std::fs::write(std::path::Path::new(&dir).join(format!("M_{name}.f32")), bytes)?;
-        Ok(())
-    };
-    dump("rout_in", &rout_in, t * latent)?;
-    if trace {
-        eprintln!(
-            "routing ids {:?} w {:?}",
-            &ids[..ids.len().min(4)],
-            &ws[..ws.len().min(4)]
-        );
-    }
+    let (latent, inter) = (h.latent, h.moe_inter);
+    let slots = h.top_k;
+    let (gq, gs_) = &m.gu;
+    let (dq, ds) = &m.down;
     let gu = crate::session::f32s(t * slots * 2 * inter)?;
     let act = crate::session::f32s(t * slots * inter)?;
     let y = crate::session::f32s(t * slots * latent)?;
-    let routed = crate::session::f32s(t * latent)?;
-    routed.memset(0, st)?;
-    let (gq, gs_) = &m.gu;
-    let (dq, ds) = &m.down;
     let (gu_row, gu_grp) = (2 * inter, 2 * inter * (latent / 128) * 2);
     let (dn_row, dn_grp) = (latent, latent * (inter / 128) * 2);
     let nexp = if std::env::var("MALLEUS_HY4_MOE_NOEXPERTS").is_ok() {
@@ -1014,67 +978,270 @@ fn moe(
             )?;
         }
     }
-    // Back to the hidden width, then the shared expert on the full-width input added in. Every projection is read
-    // row by row through the GEMV the experts use: no GEMM state to carry across the pair loop.
-    dump("routed", &routed, t * latent)?;
-    let out = crate::session::f32s(t * hidden)?;
-    let sg = crate::session::f32s(t * inter)?;
-    let su = crate::session::f32s(t * inter)?;
-    let xr = crate::session::f32s(inter.max(hidden).max(latent))?;
-    let row = |w: &crate::weights::Linear, dst: &DeviceBuffer, x: &DeviceBuffer, xi: usize, acc: i32| -> Result<()> {
-        let crate::weights::Weights::Mls4 { q, sc } = &w.w else {
-            bail!("hy4 MoE projection is not MLS4")
+    Ok(())
+}
+
+/// The routed experts of a chunk: the (token, slot) pairs sorted by expert, the latent inputs rotated and quantized
+/// to int8, one grouped gate|up GEMM over the stacked MLS4 experts, the clamped SwiGLU, one grouped down GEMM, and the
+/// weighted sum back into each token's latent row. The weights of an expert are read once per tile either way; what
+/// this removes is the launch per pair (5 * slots * t per layer on the pair path).
+fn grouped_experts(
+    model: &crate::engine::Model,
+    m: &Moe,
+    rout_in: &DeviceBuffer,
+    ids: &[i32],
+    ws: &[f32],
+    t: usize,
+    routed: &DeviceBuffer,
+    sc: &mut crate::session::Scratch,
+) -> Result<()> {
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let st = &model.stream;
+    let (latent, inter, experts, slots) = (h.latent, h.moe_inter, h.experts, h.top_k);
+    let ms = sc.moe.as_mut().context("hy4 grouped MoE scratch")?;
+    let (p, e1) = (t * slots, experts + 1);
+    ms.ids.upload(ids)?;
+    ms.w.upload(ws)?;
+    // Row tiles: 64 rows, and each expert's remainder (< 64) on 32-row tiles, because a prefill chunk has only a few
+    // rows per expert and a 64-row tile of padding is what the grouped GEMM is paid for.
+    let bm = if p / experts >= *crate::engine::MOE_BM128_ROWS_ENV {
+        128
+    } else {
+        crate::engine::MOE_BM
+    };
+    let off2 = p.div_ceil(bm) + 1;
+    model.k.get("moe_sort").launch(
+        (1, 1, 1),
+        (1024, 1, 1),
+        0,
+        st,
+        &[
+            (&ms.offs).into(),
+            (&ms.perm).into(),
+            (&ms.pos).into(),
+            (&ms.tiles).into(),
+            (&ms.ntiles).into(),
+            (&ms.ids).into(),
+            p.into(),
+            e1.into(),
+            bm.into(),
+            (bm / 2).into(),
+            off2.into(),
+        ],
+    )?;
+    // The latent rows in the rotated basis the experts are stored in, int8 with one scale per 128-group, then
+    // gathered into expert order.
+    model.k.get("rot_quant_i8_w").launch(
+        ((t * latent / 128) as u32, 1, 1),
+        (32, 1, 1),
+        0,
+        st,
+        &[
+            (&sc.xh).into(),
+            (&sc.xsc).into(),
+            rout_in.into(),
+            (&model.signs).into(),
+            latent.into(),
+        ],
+    )?;
+    model.k.get("moe_gather_g").launch(
+        (p as u32, 1, 1),
+        (128, 1, 1),
+        0,
+        st,
+        &[
+            (&ms.xg).into(),
+            (&ms.xgs).into(),
+            (&sc.xh).into(),
+            (&sc.xsc).into(),
+            (&ms.perm).into(),
+            slots.into(),
+            latent.into(),
+        ],
+    )?;
+    // Both lists of tiles: the full BM-row tiles, then the remainder of each expert on BM / 2 rows.
+    let grouped = |name: &str,
+                   out: &DeviceBuffer,
+                   x: &DeviceBuffer,
+                   xs: &DeviceBuffer,
+                   w: (&DeviceBuffer, &DeviceBuffer),
+                   n: usize,
+                   k: usize,
+                   second: bool|
+     -> Result<()> {
+        let (tiles, cnt, nt) = if second {
+            (ms.tiles.addr() + 8 * off2 as u64, ms.ntiles.addr() + 4, 2 * e1)
+        } else {
+            (ms.tiles.addr(), ms.ntiles.addr(), p / bm)
         };
-        model.k.get("hadamard128").launch(
-            ((w.k / 128) as u32, 1, 1),
-            (128, 1, 1),
-            0,
-            st,
-            &[
-                (&xr).into(),
-                Arg::U64(x.addr() + (xi * w.k * 4) as u64),
-                (&model.signs).into(),
-                w.k.into(),
-            ],
-        )?;
-        model.k.get("hy4_expert_gemv").launch(
-            (w.n as u32, 1, 1),
+        model.k.get(name).launch(
+            ((nt * n.div_ceil(128)).max(1) as u32, 1, 1),
             (256, 1, 1),
             0,
             st,
             &[
-                Arg::U64(dst.addr() + (xi * w.n * 4) as u64),
-                (&xr).into(),
-                q.into(),
-                sc.into(),
-                w.n.into(),
-                w.k.into(),
-                acc.into(),
+                out.into(),
+                x.into(),
+                xs.into(),
+                w.0.into(),
+                w.1.into(),
+                (&ms.offs).into(),
+                Arg::U64(tiles),
+                Arg::U64(cnt),
+                n.into(),
+                k.into(),
             ],
         )?;
         Ok(())
     };
-    let shared = std::env::var("MALLEUS_HY4_MOE_NOSHARED").is_err();
-    for ti in 0..t {
-        row(&m.up, &out, &routed, ti, 0)?;
-        if !shared {
-            continue;
+    let gu = (&m.gu.0, &m.gu.1);
+    grouped("moe_w4a8", &ms.gu, &ms.xg, &ms.xgs, gu, 2 * inter, latent, false)?;
+    grouped("moe_w4a8_m32", &ms.gu, &ms.xg, &ms.xgs, gu, 2 * inter, latent, true)?;
+    model.k.get("hy4_glu_rows").launch(
+        (inter.div_ceil(256) as u32, p as u32, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&ms.act).into(), (&ms.gu).into(), inter.into(), h.swiglu_limit.into()],
+    )?;
+    model.k.get("rot_quant_i8_w").launch(
+        ((p * inter / 128) as u32, 1, 1),
+        (32, 1, 1),
+        0,
+        st,
+        &[
+            (&ms.aq).into(),
+            (&ms.aqs).into(),
+            (&ms.act).into(),
+            (&model.signs).into(),
+            inter.into(),
+        ],
+    )?;
+    let dn = (&m.down.0, &m.down.1);
+    grouped("moe_w4a8", &ms.y, &ms.aq, &ms.aqs, dn, latent, inter, false)?;
+    grouped("moe_w4a8_m32", &ms.y, &ms.aq, &ms.aqs, dn, latent, inter, true)?;
+    model.k.get("moe_combine").launch(
+        (t as u32, latent.div_ceil(1024) as u32, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            routed.into(),
+            (&ms.y).into(),
+            (&ms.w).into(),
+            (&ms.pos).into(),
+            slots.into(),
+            latent.into(),
+            0i32.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn moe(
+    model: &crate::engine::Model,
+    m: &Moe,
+    hn2: &DeviceBuffer,
+    t: usize,
+    sc: &mut crate::session::Scratch,
+) -> Result<DeviceBuffer> {
+    use crate::engine::Act;
+    let c = &model.cfg;
+    let h = c.hy4.as_ref().context("no hy4 config")?;
+    let st = &model.stream;
+    let (hidden, latent, inter) = (c.hidden, h.latent, h.moe_inter);
+    let (experts, top_k) = (h.experts, h.top_k);
+    // The router sees the full-width input; the experts run on its projection into the latent space.
+    let logits = crate::session::f32s(t * experts)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &logits, Act::X(hn2), &m.router, t, false)?;
+    let rout_in = crate::session::f32s(t * latent)?;
+    // `Act::X`, not `Same`: the router GEMM is bf16 and does not quantize its input, so there is nothing to reuse.
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &rout_in, Act::X(hn2), &m.pre, t, false)?;
+    // The router runs on the device (`moe_route_g`: one group, sigmoid + `e_score_correction_bias` for the choice,
+    // plain sigmoid renormalized and scaled for the weight) — the host top-k used to cost a synchronization and a
+    // 512-way sort per layer, which at a 256-token chunk was most of the prefill.
+    let ms = sc.moe.as_mut().context("hy4 MoE scratch")?;
+    model.k.get("moe_route_g").launch(
+        (t as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            (&ms.ids).into(),
+            (&ms.w).into(),
+            (&logits).into(),
+            (&m.bias).into(),
+            experts.into(),
+            top_k.into(),
+            1i32.into(),
+            1i32.into(),
+            h.routed_scaling.into(),
+            experts.into(),
+            0i32.into(),
+        ],
+    )?;
+    // The pair path reads the choice in its launch arguments, so it needs it on the host (a short step: a few
+    // hundred ints). The grouped path reads it from the scratch and never synchronizes.
+    let grouped = match std::env::var("MALLEUS_HY4_MOE_GROUPED") {
+        Ok(v) => v != "0",
+        Err(_) => t >= HY4_MOE_GROUPED_T,
+    };
+    let (ids, ws) = if grouped {
+        (Vec::new(), Vec::new())
+    } else {
+        st.synchronize()?;
+        (ms.ids.download(t * top_k)?, ms.w.download(t * top_k)?)
+    };
+    let trace = std::env::var("MALLEUS_HY4_TRACE").is_ok();
+    let dump = |name: &str, buf: &DeviceBuffer, n: usize| -> Result<()> {
+        if !trace {
+            return Ok(());
         }
-        row(&m.shared.0, &sg, hn2, ti, 0)?;
-        row(&m.shared.1, &su, hn2, ti, 0)?;
-        let off = (ti * inter * 4) as u64;
+        st.synchronize()?;
+        let v: Vec<f32> = buf.download(n)?;
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let dir = std::env::var("MALLEUS_DUMP_DIR")?;
+        std::fs::write(std::path::Path::new(&dir).join(format!("M_{name}.f32")), bytes)?;
+        Ok(())
+    };
+    dump("rout_in", &rout_in, t * latent)?;
+    if trace {
+        st.synchronize()?;
+        let i4: Vec<i32> = ms.ids.download(t * top_k)?;
+        let w4: Vec<f32> = ms.w.download(t * top_k)?;
+        eprintln!(
+            "routing ids {:?} w {:?}",
+            &i4[..i4.len().min(4)],
+            &w4[..w4.len().min(4)]
+        );
+    }
+    let routed = crate::session::f32s(t * latent)?;
+    routed.memset(0, st)?;
+    if grouped {
+        grouped_experts(model, m, &rout_in, &ids, &ws, t, &routed, sc)?;
+    } else {
+        pair_experts(model, m, &rout_in, &ids, &ws, t, &routed)?;
+    }
+
+    // Back to the hidden width, then the shared expert on the full-width input added in: plain GEMMs, since the
+    // whole chunk shares one input (the pair loop could not, which is why this used to be a GEMV per token).
+    dump("routed", &routed, t * latent)?;
+    let out = crate::session::f32s(t * hidden)?;
+    model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &out, Act::X(&routed), &m.up, t, false)?;
+    let sg = crate::session::f32s(t * inter)?;
+    let su = crate::session::f32s(t * inter)?;
+    let shared = std::env::var("MALLEUS_HY4_MOE_NOSHARED").is_err();
+    if shared {
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &sg, Act::X(hn2), &m.shared.0, t, false)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &su, Act::Same(hn2), &m.shared.1, t, false)?;
         model.ew(
             st,
             "silu_mul",
-            inter,
-            &[
-                Arg::U64(sg.addr() + off),
-                Arg::U64(sg.addr() + off),
-                Arg::U64(su.addr() + off),
-                inter.into(),
-            ],
+            t * inter,
+            &[(&sg).into(), (&sg).into(), (&su).into(), (t * inter).into()],
         )?;
-        row(&m.shared.2, &out, &sg, ti, 1)?;
+        model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &out, Act::X(&sg), &m.shared.2, t, true)?;
     }
     dump("out", &out, t * hidden)?;
     let normed = crate::session::f32s(t * hidden)?;
@@ -2587,8 +2754,11 @@ pub(crate) fn forward(
             let bytes: Vec<u8> = gl.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("T0_gate2.f32"), bytes)?;
         }
-        model.k.get("hy4_mla_v").launch(
-            ((t * a.heads) as u32, 1, 1),
+        // The V half of `kv_b_proj`: one bf16 WMMA GEMM per head over the whole chunk (a batch on `blockIdx.z`), then
+        // the per-(head, dim) gate. As a per-(token, head) GEMV this read the 256 rows of a head one per thread — 32
+        // cache lines per instruction — and was 90 % of the prefill.
+        model.k.get("gemm_bf16_wmma").launch(
+            (a.v.div_ceil(64) as u32, t.div_ceil(64) as u32, a.heads as u32),
             (256, 1, 1),
             0,
             st,
@@ -2596,12 +2766,20 @@ pub(crate) fn forward(
                 (&attn_out).into(),
                 (&lat_merged).into(),
                 (&a.kv_b).into(),
-                (&gate).into(),
-                a.heads.into(),
-                a.nope.into(),
+                t.into(),
                 a.v.into(),
                 h.kv_lora.into(),
+                (a.heads * h.kv_lora).into(),
+                (a.heads * a.v).into(),
+                ((a.nope + a.v) * h.kv_lora).into(),
+                (a.nope * h.kv_lora).into(),
             ],
+        )?;
+        model.ew(
+            st,
+            "hy4_gate_mul",
+            t * vd,
+            &[(&attn_out).into(), (&gate).into(), (t * vd).into()],
         )?;
         dump("attn_raw2", li, &attn_out, t * vd)?;
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &o, Act::X(&attn_out), &a.o, t, false)?;

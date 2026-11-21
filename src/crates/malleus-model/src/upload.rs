@@ -202,6 +202,41 @@ impl Uploader {
         Ok(DeviceBuffer::from_slice(&out)?)
     }
 
+    /// The same dequantization as `linear_f32`, kept in bf16: half the bytes for a matrix a GEMM reads as tiles, and
+    /// the reference keeps these weights in bf16 anyway (Hy4's `kv_b_proj`, which the absorbed MLA reads directly).
+    pub(crate) fn linear_bf16(
+        &mut self,
+        src: &dyn TensorSource,
+        name: &str,
+        n: usize,
+        k: usize,
+        seed: u64,
+    ) -> Result<DeviceBuffer> {
+        use malleus_gguf::quant::{self, BLOCK};
+        let wn = format!("{name}.weight");
+        let info = src.info(&wn).with_context(|| format!("missing tensor {wn}"))?;
+        ensure!(info.dtype == DType::Mls4, "{wn}: expected MLS4, got {:?}", info.dtype);
+        let q = src.read_all(&wn)?;
+        let sc = src.read_all(&format!("{wn}.scales"))?;
+        let g = k / BLOCK;
+        let signs = quant::hadamard_signs(seed);
+        let mut out = vec![0u16; n * k];
+        for r in 0..n {
+            for j in 0..g {
+                let at = (r * g + j) * 2;
+                let s = half::f16::from_le_bytes([sc[at], sc[at + 1]]).to_f32();
+                let mut blk = [0f32; BLOCK];
+                quant::dequant_int4(&q[r * k / 2 + j * BLOCK / 2..][..BLOCK / 2], s, &mut blk);
+                quant::unrotate_block(&mut blk, &signs);
+                for (i, v) in blk.iter().enumerate() {
+                    out[r * k + j * BLOCK + i] = half::bf16::from_f32(*v).to_bits();
+                }
+            }
+        }
+        self.bytes += n * k * 2;
+        Ok(DeviceBuffer::from_slice(&out)?)
+    }
+
     /// A norm weight, as the kernels that read it want it.
     ///
     /// Qwen's RMSNorm is `(1 + w) * x / rms(x)` and the kernels add the one, so the tensor goes up as it is
