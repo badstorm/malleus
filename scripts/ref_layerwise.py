@@ -54,9 +54,22 @@ class Shards:
             return f.get_slice(name).get_shape()
 
     def rows(self, name: str, idx: list[int]) -> torch.Tensor:
+        if not idx:
+            return None
         with self._open(name) as f:
             s = f.get_slice(name)
-            return torch.cat([s[i : i + 1].clone() for i in idx]) if idx else None
+            # The ids of an embedding lookup arrive sorted and mostly consecutive; one slice per run keeps the
+            # number of tensor reads (and their overhead) proportional to the runs, not to the tokens.
+            runs = []
+            i = 0
+            while i < len(idx):
+                j = i + 1
+                while j < len(idx) and idx[j] == idx[j - 1] + 1:
+                    j += 1
+                # The end of the slice is one past the run's last row: `idx[j]` is the next run (or out of range).
+                runs.append(s[idx[i] : idx[j - 1] + 1].clone())
+                i = j
+            return torch.cat(runs)
 
 
 class ShardedRows(nn.Module):
@@ -494,6 +507,7 @@ def hy4(args, cfg, tok, shards, seqs, out, blob, dump, dev):
     import transformers
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
     from transformers.models.hy_v4.modeling_hy_v4 import HYV4HyperHead
+    from transformers.models.hy_v4_flash import modeling_hy_v4_flash as H
     from transformers.models.hy_v4_vl import modeling_hy_v4_vl as V
 
     pre = "model."
