@@ -1824,6 +1824,223 @@ fn kernel_test() -> Result<()> {
             assert_eq!((diff, sdiff), (0, 0), "{new} must match {old} byte for byte");
         }
     }
+    // ---- Inkling-2 (issue #62): the short convolution, the per-head transforms, the relative bias and the
+    // attention, each against a replica of the reference arithmetic on the host.
+    {
+        let (t, c, heads, dim) = (6usize, 256usize, 2usize, 128usize);
+        let x: Vec<f32> = (0..t * c).map(|_| rnd()).collect();
+        let w: Vec<u16> = (0..c * 4)
+            .map(|_| half::bf16::from_f32(rnd() * 0.1).to_bits())
+            .collect();
+        let past: Vec<f32> = (0..3 * c).map(|_| rnd()).collect();
+        let xd = DeviceBuffer::from_slice(&x)?;
+        let wd = DeviceBuffer::from_slice(&w)?;
+        let pd = DeviceBuffer::from_slice(&past)?;
+        let yd = DeviceBuffer::zeroed(t * c * 4)?;
+        k.get("inkling2_sconv").launch(
+            ((t * c).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &s,
+            &[
+                (&yd).into(),
+                (&xd).into(),
+                (&wd).into(),
+                Arg::U64(0),
+                (&pd).into(),
+                t.into(),
+                c.into(),
+                heads.into(),
+                (5.0f32.sqrt()).into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let got = yd.download::<f32>(t * c)?;
+        let mut want = vec![0f32; t * c];
+        for tt in 0..t {
+            for cc in 0..c {
+                let mut acc = 0f32;
+                for j in 0..4 {
+                    let pp = tt as isize - 3 + j as isize;
+                    let vv = if pp >= 0 {
+                        x[pp as usize * c + cc]
+                    } else {
+                        past[(pp + 3) as usize * c + cc]
+                    };
+                    acc += half::bf16::from_bits(w[cc * 4 + j]).to_f32() * vv;
+                }
+                want[tt * c + cc] = (x[tt * c + cc] + acc) / 5.0f32.sqrt();
+            }
+        }
+        println!("inkling2_sconv     rel err {:.2e}", rel_err(&want, &got));
+        for (name, scaled, tau) in [("inkling2_l2_clip", true, true), ("inkling2_l2_clip", true, false)] {
+            let rows = t * heads;
+            let xa: Vec<f32> = (0..rows * dim).map(|_| rnd() * 4.0).collect();
+            let sc: Vec<f32> = (0..heads * dim).map(|_| 1.0 + 0.2 * rnd()).collect();
+            let ta: Vec<f32> = (0..t).map(|_| 1.0 + 0.1 * rnd().abs()).collect();
+            let xad = DeviceBuffer::from_slice(&xa)?;
+            let scd = DeviceBuffer::from_slice(&sc)?;
+            let tad = DeviceBuffer::from_slice(&ta)?;
+            let yo = DeviceBuffer::zeroed(rows * dim * 4)?;
+            let thr = 8.0f32;
+            let tau_arg: Arg = if tau { (&tad).into() } else { Arg::U64(0) };
+            k.get(name).launch(
+                (rows as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                &s,
+                &[
+                    (&yo).into(),
+                    (&xad).into(),
+                    (&scd).into(),
+                    tau_arg,
+                    t.into(),
+                    heads.into(),
+                    dim.into(),
+                    thr.into(),
+                ],
+            )?;
+            s.synchronize()?;
+            let got = yo.download::<f32>(rows * dim)?;
+            let mut want = vec![0f32; rows * dim];
+            for r in 0..rows {
+                let v: Vec<f32> = (0..dim).map(|i| xa[r * dim + i] * sc[(r % heads) * dim + i]).collect();
+                let norm = v.iter().map(|q| q * q).sum::<f32>().sqrt();
+                let kk = (thr / (norm + 1e-6)).min(1.0) * if tau { ta[r / heads] } else { 1.0 };
+                for i in 0..dim {
+                    want[r * dim + i] = v[i] * kk;
+                }
+            }
+            println!(
+                "{name:18} tau={tau:<5} rel err {:.2e} (scaled={scaled})",
+                rel_err(&want, &got)
+            );
+        }
+        let rows = t * heads;
+        let xa: Vec<f32> = (0..rows * dim).map(|_| rnd() * 3.0).collect();
+        let xad = DeviceBuffer::from_slice(&xa)?;
+        let yo = DeviceBuffer::zeroed(rows * dim * 4)?;
+        k.get("inkling2_rms_unnorm").launch(
+            (rows as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            &s,
+            &[(&yo).into(), (&xad).into(), rows.into(), dim.into(), 1e-6f32.into()],
+        )?;
+        s.synchronize()?;
+        let got = yo.download::<f32>(rows * dim)?;
+        let mut want = vec![0f32; rows * dim];
+        for r in 0..rows {
+            let ms = (0..dim).map(|i| xa[r * dim + i] * xa[r * dim + i]).sum::<f32>() / dim as f32;
+            for i in 0..dim {
+                want[r * dim + i] = xa[r * dim + i] / (ms + 1e-6).sqrt();
+            }
+        }
+        println!("inkling2_rms_unnorm rel err {:.2e}", rel_err(&want, &got));
+        // Relative bias and attention: one sliding-shaped case with a whole window.
+        let (t2, h2, nkv2, drel, extent) = (5usize, 2usize, 1usize, 4usize, 3usize);
+        let rel: Vec<f32> = (0..t2 * h2 * drel).map(|_| rnd()).collect();
+        let proj: Vec<f32> = (0..drel * extent).map(|_| rnd()).collect();
+        let reld = DeviceBuffer::from_slice(&rel)?;
+        let projd = DeviceBuffer::from_slice(&proj)?;
+        let biasd = DeviceBuffer::zeroed(h2 * t2 * t2 * 4)?;
+        k.get("inkling2_rel_bias").launch(
+            (((h2 * t2 * t2) as f32 / 256.0).ceil() as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &s,
+            &[
+                (&biasd).into(),
+                (&reld).into(),
+                (&projd).into(),
+                t2.into(),
+                h2.into(),
+                drel.into(),
+                extent.into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let bias = biasd.download::<f32>(h2 * t2 * t2)?;
+        let mut wantb = vec![0f32; h2 * t2 * t2];
+        for hh in 0..h2 {
+            for qq in 0..t2 {
+                for ss in 0..t2 {
+                    let d = qq as isize - ss as isize;
+                    if d >= 0 && (d as usize) < extent {
+                        let mut acc = 0f32;
+                        for i in 0..drel {
+                            acc += rel[(qq * h2 + hh) * drel + i] * proj[i * extent + d as usize];
+                        }
+                        wantb[(hh * t2 + qq) * t2 + ss] = acc;
+                    }
+                }
+            }
+        }
+        println!("inkling2_rel_bias  rel err {:.2e}", rel_err(&wantb, &bias));
+        let qa: Vec<f32> = (0..t2 * h2 * dim).map(|_| rnd()).collect();
+        let ka: Vec<f32> = (0..t2 * nkv2 * dim).map(|_| rnd()).collect();
+        let va: Vec<f32> = (0..t2 * nkv2 * dim).map(|_| rnd()).collect();
+        let ga: Vec<f32> = (0..t2 * h2 * dim).map(|_| rnd() * 3.0).collect();
+        let sa: Vec<f32> = (0..t2 * h2).map(|_| rnd()).collect();
+        let (qad, kad, vad, gad, sad) = (
+            DeviceBuffer::from_slice(&qa)?,
+            DeviceBuffer::from_slice(&ka)?,
+            DeviceBuffer::from_slice(&va)?,
+            DeviceBuffer::from_slice(&ga)?,
+            DeviceBuffer::from_slice(&sa)?,
+        );
+        let oa = DeviceBuffer::zeroed(t2 * h2 * dim * 4)?;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+        k.get("inkling2_attn").launch(
+            ((t2 * h2) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            &s,
+            &[
+                (&oa).into(),
+                (&qad).into(),
+                (&kad).into(),
+                (&vad).into(),
+                (&biasd).into(),
+                (&sad).into(),
+                (&gad).into(),
+                t2.into(),
+                h2.into(),
+                nkv2.into(),
+                dim.into(),
+                0.into(),
+                scale.into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let got = oa.download::<f32>(t2 * h2 * dim)?;
+        let mut want = vec![0f32; t2 * h2 * dim];
+        for tt in 0..t2 {
+            for hh in 0..h2 {
+                let kh = hh / (h2 / nkv2);
+                let mut sc = vec![0f32; tt + 1];
+                let mut mx = sa[tt * h2 + hh];
+                for ss in 0..=tt {
+                    let mut acc = 0f32;
+                    for i in 0..dim {
+                        acc += qa[(tt * h2 + hh) * dim + i] * ka[(ss * nkv2 + kh) * dim + i];
+                    }
+                    sc[ss] = acc * scale + bias[(hh * t2 + tt) * t2 + ss];
+                    mx = mx.max(sc[ss]);
+                }
+                let sum: f32 = sc.iter().map(|v| (v - mx).exp()).sum::<f32>() + (sa[tt * h2 + hh] - mx).exp();
+                for i in 0..dim {
+                    let mut acc = 0f32;
+                    for ss in 0..=tt {
+                        acc += (sc[ss] - mx).exp() / sum * va[(ss * nkv2 + kh) * dim + i];
+                    }
+                    let g = ga[(tt * h2 + hh) * dim + i];
+                    want[(tt * h2 + hh) * dim + i] = acc / (1.0 + (-g).exp());
+                }
+            }
+        }
+        println!("inkling2_attn      rel err {:.2e}", rel_err(&want, &got));
+    }
     Ok(())
 }
 
