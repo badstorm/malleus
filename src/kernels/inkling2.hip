@@ -204,3 +204,67 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_res(float* out, 
         out[((size_t)t * nq + qi) * hidden + i] = acc;
     }
 }
+
+// MoE router: sigmoid scores, the bias added only for the selection, the weights renormalized over the k chosen
+// scores and scaled by `route_scale`. No shared expert (issue #62). ids and w are [T, topk].
+extern "C" __global__ void __launch_bounds__(256) inkling2_moe_route(int* ids, float* w, const float* logits,
+                                                                    const float* bias, int E, int topk,
+                                                                    float route_scale) {
+    __shared__ float bv[8];
+    __shared__ int bi[8];
+    __shared__ int chosen[64];
+    const int t = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const float* l = logits + (size_t)t * E;
+    for (int j = 0; j < topk; ++j) {
+        float v = -INFINITY;
+        int idx = 0x7fffffff;
+        for (int e = threadIdx.x; e < E; e += 256) {
+            bool taken = false;
+            for (int c = 0; c < j; ++c) taken |= chosen[c] == e;
+            const float x = 1.f / (1.f + expf(-l[e])) + bias[e];
+            if (!taken && (x > v || (x == v && e < idx))) v = x, idx = e;
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor(v, o, 32);
+            const int oi = __shfl_xor(idx, o, 32);
+            if (ov > v || (ov == v && oi < idx)) v = ov, idx = oi;
+        }
+        if (lane == 0) bv[warp] = v, bi[warp] = idx;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int q = 1; q < 8; ++q)
+                if (bv[q] > bv[0] || (bv[q] == bv[0] && bi[q] < bi[0])) bv[0] = bv[q], bi[0] = bi[q];
+            chosen[j] = bi[0];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float s = 0.f, sc[64];
+        for (int j = 0; j < topk; ++j) sc[j] = 1.f / (1.f + expf(-l[chosen[j]])), s += sc[j];
+        for (int j = 0; j < topk; ++j) {
+            ids[t * topk + j] = chosen[j];
+            w[t * topk + j] = sc[j] / (s + 1e-20f) * route_scale;
+        }
+    }
+}
+
+// The expert activation: softcap(gate) * sigmoid(gate) * softcap(up), with softcap(x) = tanh(x / c) * c, then the
+// randomized Hadamard of every 128-block like moe_act (the down weights are in the rotated basis).
+extern "C" __global__ void __launch_bounds__(128) inkling2_moe_act(float* out, const float* gu, const int8_t* signs,
+                                                                  int I, float gate_cap, float up_cap) {
+    __shared__ float s[128];
+    const int nb = I / 128, p = blockIdx.x / nb, b = blockIdx.x % nb, i = threadIdx.x;
+    const float g = gu[(size_t)p * 2 * I + b * 128 + i], u = gu[(size_t)p * 2 * I + I + b * 128 + i];
+    const float gc = tanhf(g / gate_cap) * gate_cap;
+    const float uc = tanhf(u / up_cap) * up_cap;
+    s[i] = gc / (1.f + expf(-g)) * uc * (float)signs[i];
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        const int j = i ^ h;
+        const float a = s[i], c = s[j];
+        __syncthreads();
+        s[i] = (i & h) ? c - a : a + c;
+        __syncthreads();
+    }
+    out[(size_t)p * I + b * 128 + i] = s[i] * 0.08838834764831845f;
+}

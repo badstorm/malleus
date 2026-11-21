@@ -2092,6 +2092,105 @@ fn kernel_test() -> Result<()> {
             }
         }
         println!("inkling2_attn_res  rel err {:.2e}", rel_err(&want, &got));
+        // Router and expert activation.
+        let (er, topk, rs) = (128usize, 8usize, 8.0f32);
+        let lg: Vec<f32> = (0..t * er).map(|_| rnd() * 3.0).collect();
+        let bs: Vec<f32> = (0..er).map(|_| rnd() * 0.1).collect();
+        let (lgd, bsd) = (DeviceBuffer::from_slice(&lg)?, DeviceBuffer::from_slice(&bs)?);
+        let ids = DeviceBuffer::zeroed(t * topk * 4)?;
+        let wts = DeviceBuffer::zeroed(t * topk * 4)?;
+        k.get("inkling2_moe_route").launch(
+            (t as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &s,
+            &[
+                (&ids).into(),
+                (&wts).into(),
+                (&lgd).into(),
+                (&bsd).into(),
+                er.into(),
+                topk.into(),
+                rs.into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let gid = ids.download::<i32>(t * topk)?;
+        let gw = wts.download::<f32>(t * topk)?;
+        let mut wid = vec![0i32; t * topk];
+        let mut ww = vec![0f32; t * topk];
+        for tt in 0..t {
+            let mut order: Vec<usize> = (0..er).collect();
+            order.sort_by(|&a, &b| {
+                let sa = 1.0f32 / (1.0 + (-lg[tt * er + a]).exp()) + bs[a];
+                let sb = 1.0f32 / (1.0 + (-lg[tt * er + b]).exp()) + bs[b];
+                sb.partial_cmp(&sa).unwrap().then(a.cmp(&b))
+            });
+            let sel: Vec<usize> = order[..topk].to_vec();
+            let mut sum = 0f32;
+            for &e in &sel {
+                sum += 1.0 / (1.0 + (-lg[tt * er + e]).exp());
+            }
+            for (j, &e) in sel.iter().enumerate() {
+                wid[tt * topk + j] = e as i32;
+                ww[tt * topk + j] = (1.0 / (1.0 + (-lg[tt * er + e]).exp())) / sum * rs;
+            }
+        }
+        let ids_ok = gid == wid;
+        println!(
+            "inkling2_moe_route ids equal={ids_ok} weights rel err {:.2e}",
+            rel_err(&ww, &gw)
+        );
+        // Activation: I = 512, 3 pairs, against the host formula.
+        let (ii, np) = (512usize, 3usize);
+        let gu: Vec<f32> = (0..np * 2 * ii).map(|_| rnd() * 8.0).collect();
+        let gud = DeviceBuffer::from_slice(&gu)?;
+        let act = DeviceBuffer::zeroed(np * ii * 4)?;
+        k.get("inkling2_moe_act").launch(
+            ((np * ii / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            &s,
+            &[
+                (&act).into(),
+                (&gud).into(),
+                (&signs).into(),
+                ii.into(),
+                4.0f32.into(),
+                25.0f32.into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let ga = act.download::<f32>(np * ii)?;
+        let mut wa = vec![0f32; np * ii];
+        let sgn = malleus_gguf::quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED);
+        for p in 0..np {
+            let mut row = vec![0f32; ii];
+            for b in 0..ii / 128 {
+                let mut blk = [0f32; 128];
+                for i in 0..128 {
+                    let g = gu[p * 2 * ii + b * 128 + i];
+                    let u = gu[p * 2 * ii + ii + b * 128 + i];
+                    blk[i] = (g / 4.0).tanh() * 4.0 / (1.0 + (-g).exp()) * (u / 25.0).tanh() * 25.0 * sgn[i] as f32;
+                }
+                for h in [1usize, 2, 4, 8, 16, 32, 64] {
+                    let mut next = blk;
+                    for i in 0..128 {
+                        next[i] = if i & h == 0 {
+                            blk[i] + blk[i ^ h]
+                        } else {
+                            blk[i ^ h] - blk[i]
+                        };
+                    }
+                    blk = next;
+                }
+                for i in 0..128 {
+                    row[b * 128 + i] = blk[i] * 0.088_388_35;
+                }
+            }
+            wa[p * ii..(p + 1) * ii].copy_from_slice(&row);
+        }
+        println!("inkling2_moe_act   rel err {:.2e}", rel_err(&wa, &ga));
     }
     Ok(())
 }
