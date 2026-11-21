@@ -502,11 +502,11 @@ class Hy4Layerwise:
     builds them, so the captured inputs are the ones `malleus golden` compares against.
     """
 
-    def __init__(self, model_dir, dev):
+    def __init__(self, model_dir, dev, no_engram=False):
         from transformers import AutoConfig
         from transformers.models.hy_v4_flash import modeling_hy_v4_flash as H
 
-        self.H, self.dev = H, dev
+        self.H, self.dev, self.no_engram = H, dev, no_engram
         self.cfg = AutoConfig.from_pretrained(model_dir).text_config
         self.cfg._attn_implementation = "eager"
         self.shards = Shards(Path(model_dir), dev)
@@ -606,6 +606,11 @@ class Hy4Layerwise:
                 el.lookup_table = self.shards.get(prefix + "engram_layer.lookup_table").to(dev)
                 el.hash_multipliers = el.draw_hash_multipliers(int(el.lookup_table.max()) + 1).to(dev)
         layer.eval()
+        if self.no_engram:
+            # The hashed table costs one random read per (token, head, n-gram): a 65k-token corpus touches ~1M
+            # rows of a 31 GB tensor and takes tens of minutes per layer. The memory adds to the hidden state
+            # but its own projections then stay round-to-nearest; the MLA and MoE still see real text.
+            layer.engram_layer = None
         self.cur = (li, layer)
         return layer
 
@@ -776,6 +781,9 @@ def main():
                          "output stays MLS4, this is a screen and not a conversion")
     ap.add_argument("--mls2-grid", default="e2m1", choices=sorted(MLS2_GRIDS),
                     help="MLS2 grid for --mls2-report")
+    ap.add_argument("--no-engram", action="store_true",
+                    help="hy4: skip the Engram memory during calibration (it stays round-to-nearest) instead of "
+                         "reading ~1M random table rows per layer")
     ap.add_argument("--hc", action="store_true",
                     help="also calibrate the hyper-connection mixing (input_mix_weight_down/up, "
                          "block_inject_weight) of every layer, but not the final hyper_connection_mixer")
@@ -801,7 +809,13 @@ def main():
     is_hy4 = family.startswith("hy_v4")
     if is_hy4 and not layerwise:
         ap.error("hy4-flash is 411 GB: it has to be calibrated layer by layer (--layerwise yes)")
-    backend = Hy4Layerwise(args.model, dev) if is_hy4 else Layerwise(args.model, dev) if layerwise else Whole(args.model, dev)
+    backend = (
+        Hy4Layerwise(args.model, dev, args.no_engram)
+        if is_hy4
+        else Layerwise(args.model, dev)
+        if layerwise
+        else Whole(args.model, dev)
+    )
     print(f"{size >> 30} GB checkpoint, {'layer by layer' if layerwise else 'whole model'}", flush=True)
     batched = is_hy4  # one forward for the whole calibration set (see Hy4Layerwise.capture)
     types = backend.types

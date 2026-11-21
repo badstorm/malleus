@@ -54,9 +54,21 @@ class Shards:
             return f.get_slice(name).get_shape()
 
     def rows(self, name: str, idx: list[int]) -> torch.Tensor:
+        if not idx:
+            return None
         with self._open(name) as f:
             s = f.get_slice(name)
-            return torch.cat([s[i : i + 1].clone() for i in idx]) if idx else None
+            # The ids of an embedding lookup arrive sorted and mostly consecutive; one slice per run keeps the
+            # number of tensor reads (and their overhead) proportional to the runs, not to the tokens.
+            runs = []
+            i = 0
+            while i < len(idx):
+                j = i + 1
+                while j < len(idx) and idx[j] == idx[j - 1] + 1:
+                    j += 1
+                runs.append(s[idx[i] : idx[j]].clone())
+                i = j
+            return torch.cat(runs)
 
 
 class ShardedRows(nn.Module):
