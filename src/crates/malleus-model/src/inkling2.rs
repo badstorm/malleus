@@ -991,124 +991,291 @@ fn argmax(v: &[f32], n: usize) -> u32 {
     bi
 }
 
-/// Runs `tokens` through the whole graph and returns the argmax of the last position's logits.
-fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
-    let c = &model.cfg;
-    let i = c.inkling2.as_ref().context("no inkling2 config")?;
-    let w = model.inkling2.as_ref().context("no inkling2 weights")?;
-    let st = &model.stream;
-    let t = tokens.len();
-    let h = c.hidden;
-    let heads = i.heads;
-    let kv = i.kv_heads;
-    let hd = i.head_dim;
-    let d_rel = i.d_rel;
-    let qd = heads * hd;
-    let kvd = kv * hd;
-    let eps = c.eps;
-    let inter = i.moe_inter;
-    let experts = i.experts;
-    let topk = i.top_k;
-    let kmax = qd.max(h);
-    let rd = heads * d_rel;
+/// The buffers a layer reads and writes, allocated once per `step` and reused by every layer and every pass. The
+/// graph runs on the whole sequence, so there is no per-layer state: the loop's extra passes replay the same
+/// buffers from the prelude's output.
+struct Graph {
+    t: usize,
+    h: usize,
+    eps: f32,
+    x: DeviceBuffer,
+    blocks: Vec<DeviceBuffer>,
+    pre_loop_hidden: DeviceBuffer,
+    block_residual: DeviceBuffer,
+    xr: DeviceBuffer,
+    xh: DeviceBuffer,
+    xsc: DeviceBuffer,
+    normed: DeviceBuffer,
+    states: DeviceBuffer,
+    mix_out: DeviceBuffer,
+    msg_out: DeviceBuffer,
+    msg: [DeviceBuffer; 4],
+    msg_queries: DeviceBuffer,
+    msg_q4: DeviceBuffer,
+    attn_in: DeviceBuffer,
+    q: DeviceBuffer,
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    r: DeviceBuffer,
+    gate: DeviceBuffer,
+    sink: DeviceBuffer,
+    bias: DeviceBuffer,
+    attn_out: DeviceBuffer,
+    y: DeviceBuffer,
+    moe_out: DeviceBuffer,
+    logits: DeviceBuffer,
+    route_ids: DeviceBuffer,
+    route_w: DeviceBuffer,
+    gu: DeviceBuffer,
+    act: DeviceBuffer,
+    ones_k: DeviceBuffer,
+    past: DeviceBuffer,
+    qin: DeviceBuffer,
+    kin: DeviceBuffer,
+    vin: DeviceBuffer,
+    qn: DeviceBuffer,
+    kn: DeviceBuffer,
+    vn: DeviceBuffer,
+    kt: DeviceBuffer,
+    vt: DeviceBuffer,
+    yt: DeviceBuffer,
+    taud: Option<DeviceBuffer>,
+}
 
-    let mut xr = f32s(t * kmax)?;
-    let mut xh = DeviceBuffer::alloc(t * kmax * 2)?;
-    let mut xsc = f32s(t * kmax.div_ceil(128))?;
-    let x = f32s(t * h)?;
-    let ids32: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
-    let idbuf = DeviceBuffer::from_slice(&ids32)?;
-    model.k.get("embed_bf16").launch(
-        (t as u32, 1, 1),
-        (256, 1, 1),
-        0,
-        st,
-        &[(&x).into(), (&w.embed).into(), (&idbuf).into(), h.into()],
-    )?;
-    rms(model, st, &x, &x, &w.embed_norm, t, h, eps)?;
-
-    // The buffers the layers share.
-    let normed = f32s(t * h)?;
-    let states = f32s(8 * t * h)?;
-    let mix_out = f32s(t * 3 * h)?;
-    let q = f32s(t * qd)?;
-    let k = f32s(t * kvd)?;
-    let v = f32s(t * kvd)?;
-    let r = f32s(t * rd)?;
-    let gate = f32s(t * qd)?;
-    let sink = f32s(t * heads)?;
-    let bias = f32s(heads * t * t)?;
-    let attn_out = f32s(t * qd)?;
-    let y = f32s(t * h)?;
-    let moe_out = f32s(t * h)?;
-    let logits = f32s(t * experts)?;
-    let route_ids = DeviceBuffer::zeroed(t * topk * 4)?;
-    let route_w = f32s(t * topk)?;
-    let gu = f32s(t * topk * 2 * inter)?;
-    let act = f32s(t * topk * inter)?;
-    let ones_k = DeviceBuffer::from_slice(&vec![1.0f32; kv * hd])?;
-    // The log-scaled positions: 1 below the floor, so 1 for any sequence shorter than it.
-    let mut tau: Vec<f32> = (0..t)
-        .map(|p| 1.0 + i.log_alpha * (((p + 1) as f32) / i.log_floor as f32).max(1.0).ln())
-        .collect();
-    if tau.iter().all(|x| *x == 1.0) {
-        tau.clear();
+impl Graph {
+    fn new(model: &Model, t: usize) -> Result<Self> {
+        let c = &model.cfg;
+        let i = c.inkling2.as_ref().context("no inkling2 config")?;
+        let h = c.hidden;
+        let heads = i.heads;
+        let kv = i.kv_heads;
+        let hd = i.head_dim;
+        let qd = heads * hd;
+        let kvd = kv * hd;
+        let kmax = qd.max(h);
+        // The log-scaled positions: 1 below the floor, so 1 for any sequence shorter than it.
+        let mut tau: Vec<f32> = (0..t)
+            .map(|p| 1.0 + i.log_alpha * (((p + 1) as f32) / i.log_floor as f32).max(1.0).ln())
+            .collect();
+        if tau.iter().all(|x| *x == 1.0) {
+            tau.clear();
+        }
+        let taud = if tau.is_empty() {
+            None
+        } else {
+            Some(DeviceBuffer::from_slice(&tau)?)
+        };
+        Ok(Self {
+            t,
+            h,
+            eps: c.eps,
+            x: f32s(t * h)?,
+            blocks: Vec::with_capacity(8),
+            pre_loop_hidden: f32s(t * h)?,
+            block_residual: f32s(t * h)?,
+            xr: f32s(t * kmax)?,
+            xh: DeviceBuffer::alloc(t * kmax * 2)?,
+            xsc: f32s(t * kmax.div_ceil(128))?,
+            normed: f32s(t * h)?,
+            states: f32s(8 * t * h)?,
+            mix_out: f32s(t * 3 * h)?,
+            msg_out: f32s(t * 4 * h)?,
+            msg: [f32s(t * h)?, f32s(t * h)?, f32s(t * h)?, f32s(t * h)?],
+            msg_queries: f32s((i.loop_end - i.loop_start) * 4 * h)?,
+            msg_q4: f32s(4 * h)?,
+            attn_in: f32s(t * h)?,
+            q: f32s(t * qd)?,
+            k: f32s(t * kvd)?,
+            v: f32s(t * kvd)?,
+            r: f32s(t * heads * i.d_rel)?,
+            gate: f32s(t * qd)?,
+            sink: f32s(t * heads)?,
+            bias: f32s(heads * t * t)?,
+            attn_out: f32s(t * qd)?,
+            y: f32s(t * h)?,
+            moe_out: f32s(t * h)?,
+            logits: f32s(t * i.experts)?,
+            route_ids: DeviceBuffer::zeroed(t * i.top_k * 4)?,
+            route_w: f32s(t * i.top_k)?,
+            gu: f32s(t * i.top_k * 2 * i.moe_inter)?,
+            act: f32s(t * i.top_k * i.moe_inter)?,
+            ones_k: DeviceBuffer::from_slice(&vec![1.0f32; kvd])?,
+            past: DeviceBuffer::zeroed(3 * h * 4)?,
+            qin: f32s(t * h)?,
+            kin: f32s(t * h)?,
+            vin: f32s(t * h)?,
+            qn: f32s(t * h)?,
+            kn: f32s(t * h)?,
+            vn: f32s(t * h)?,
+            kt: f32s(t * kvd)?,
+            vt: f32s(t * kvd)?,
+            yt: f32s(t * h)?,
+            taud,
+        })
     }
-    let taud = if tau.is_empty() {
-        None
-    } else {
-        Some(DeviceBuffer::from_slice(&tau)?)
-    };
-    // The short-convolution history of a full-sequence pass: three zero tokens.
-    let past = DeviceBuffer::zeroed(3 * h * 4)?;
 
-    let mut blocks: Vec<DeviceBuffer> = Vec::with_capacity(8);
-    // The attention inputs and the normalized forms, one buffer each: the projections read them by name.
-    let mut qin = f32s(t * h)?;
-    let mut kin = f32s(t * h)?;
-    let mut vin = f32s(t * h)?;
-    let qn = f32s(t * h)?;
-    let kn = f32s(t * h)?;
-    let vn = f32s(t * h)?;
-    let kt = f32s(t * kvd)?;
-    let vt = f32s(t * kvd)?;
-    let yt = f32s(t * h)?;
-
-    for l in 0..c.n_layers {
+    /// Runs one decoder layer. `messages` is `Some((previous core blocks, previous pass output))` on the loop's
+    /// extra passes: the four cross-pass queries then mix a message bank into the attention and MLP inputs.
+    #[allow(clippy::too_many_arguments)]
+    fn layer(
+        &mut self,
+        model: &Model,
+        st: &Stream,
+        i: &Inkling2Config,
+        w: &Weights,
+        l: usize,
+        messages: Option<(&[DeviceBuffer], &DeviceBuffer)>,
+    ) -> Result<()> {
         let layer = &w.layers[l];
         let full = layer.full;
-        let block_residual = f32s(t * h)?;
-        block_residual.copy_from_shared(0, &x, 0, t * h * 4, st)?;
+        let t = self.t;
+        let h = self.h;
+        let eps = self.eps;
+        let heads = i.heads;
+        let kv = i.kv_heads;
+        let hd = i.head_dim;
+        let d_rel = i.d_rel;
+        let kvd = kv * hd;
+        let inter = i.moe_inter;
+        let experts = i.experts;
+        let topk = i.top_k;
+
+        self.block_residual.copy_from_shared(0, &self.x, 0, t * h * 4, st)?;
 
         // 1. The attention input: the raw state for layer 0, the attention residual above it.
         let nq = if full { 3 } else { 1 };
         if l == 0 {
-            qin.copy_from_shared(0, &x, 0, t * h * 4, st)?;
-            kin.copy_from_shared(0, &x, 0, t * h * 4, st)?;
-            vin.copy_from_shared(0, &x, 0, t * h * 4, st)?;
+            self.qin.copy_from_shared(0, &self.x, 0, t * h * 4, st)?;
+            self.kin.copy_from_shared(0, &self.x, 0, t * h * 4, st)?;
+            self.vin.copy_from_shared(0, &self.x, 0, t * h * 4, st)?;
         } else {
             mix(
                 model,
                 st,
-                &mix_out,
-                &states,
-                &blocks,
-                &x,
+                &self.mix_out,
+                &self.states,
+                &self.blocks,
+                &self.x,
                 &w.attn_queries[l - 1],
                 nq,
                 t,
                 h,
                 eps,
             )?;
-            copy_nq(&mix_out, &mut qin, 0, t, h, nq, st)?;
+            copy_nq(&self.mix_out, &self.qin, 0, t, h, nq, st)?;
             if full {
-                copy_nq(&mix_out, &mut kin, 1, t, h, 3, st)?;
-                copy_nq(&mix_out, &mut vin, 2, t, h, 3, st)?;
+                copy_nq(&self.mix_out, &self.kin, 1, t, h, 3, st)?;
+                copy_nq(&self.mix_out, &self.vin, 2, t, h, 3, st)?;
             } else {
-                kin.copy_from_shared(0, &qin, 0, t * h * 4, st)?;
-                vin.copy_from_shared(0, &qin, 0, t * h * 4, st)?;
+                self.kin.copy_from_shared(0, &self.qin, 0, t * h * 4, st)?;
+                self.vin.copy_from_shared(0, &self.qin, 0, t * h * 4, st)?;
             }
         }
+
+        // 1b. The cross-pass message gates, on the extra passes only. The four queries of a core layer attend over
+        // the previous pass's core blocks and its output; the controller then mixes the four messages into the
+        // query, key, value and MLP inputs.
+        if let Some((prev_blocks, prev_hidden)) = messages {
+            let ci = l - i.loop_start;
+            self.msg_q4
+                .copy_from_shared(0, &self.msg_queries, ci * 4 * h * 4, 4 * h * 4, st)?;
+            mix(
+                model,
+                st,
+                &self.msg_out,
+                &self.states,
+                prev_blocks,
+                prev_hidden,
+                &self.msg_q4,
+                4,
+                t,
+                h,
+                eps,
+            )?;
+            for qi in 0..4 {
+                copy_nq(&self.msg_out, &self.msg[qi], qi, t, h, 4, st)?;
+            }
+            let ctrl = layer.controller.as_ref().context("loop layer without controller")?;
+            if full {
+                control(
+                    model,
+                    st,
+                    &self.qin,
+                    &self.qin,
+                    &self.msg[0],
+                    &ctrl.attn,
+                    t,
+                    h,
+                    i.loop_rank,
+                    eps,
+                )?;
+                control(
+                    model,
+                    st,
+                    &self.kin,
+                    &self.kin,
+                    &self.msg[1],
+                    &ctrl.k,
+                    t,
+                    h,
+                    i.loop_rank,
+                    eps,
+                )?;
+                control(
+                    model,
+                    st,
+                    &self.vin,
+                    &self.vin,
+                    &self.msg[2],
+                    &ctrl.v,
+                    t,
+                    h,
+                    i.loop_rank,
+                    eps,
+                )?;
+            } else {
+                // The sliding layer's attention input is one query for all three streams, so each gate reads the
+                // same state and writes its own copy.
+                self.attn_in.copy_from_shared(0, &self.qin, 0, t * h * 4, st)?;
+                control(
+                    model,
+                    st,
+                    &self.qin,
+                    &self.attn_in,
+                    &self.msg[0],
+                    &ctrl.attn,
+                    t,
+                    h,
+                    i.loop_rank,
+                    eps,
+                )?;
+                control(
+                    model,
+                    st,
+                    &self.kin,
+                    &self.attn_in,
+                    &self.msg[1],
+                    &ctrl.k,
+                    t,
+                    h,
+                    i.loop_rank,
+                    eps,
+                )?;
+                control(
+                    model,
+                    st,
+                    &self.vin,
+                    &self.attn_in,
+                    &self.msg[2],
+                    &ctrl.v,
+                    t,
+                    h,
+                    i.loop_rank,
+                    eps,
+                )?;
+            }
+        }
+
         // 2. The input norms and the projections.
         let (dyn_k, dyn_v) = if full {
             let (q_norm, k_norm, v_norm) = match &layer.sconv {
@@ -1117,30 +1284,85 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
                 } => (q_norm, k_norm, v_norm),
                 _ => unreachable!(),
             };
-            rms(model, st, &qn, &qin, q_norm, t, h, eps)?;
-            rms(model, st, &kn, &kin, k_norm, t, h, eps)?;
-            rms(model, st, &vn, &vin, v_norm, t, h, eps)?;
+            rms(model, st, &self.qn, &self.qin, q_norm, t, h, eps)?;
+            rms(model, st, &self.kn, &self.kin, k_norm, t, h, eps)?;
+            rms(model, st, &self.vn, &self.vin, v_norm, t, h, eps)?;
             let (dk, dv) = (f32s(t * kv * i.sconv_k)?, f32s(t * kv * i.sconv_k)?);
             let (k_proj, v_proj) = match &layer.sconv {
                 Sconv::Dynamic { k_proj, v_proj, .. } => (k_proj, v_proj),
                 _ => unreachable!(),
             };
-            raw_gemm(model, st, &dk, &kn, k_proj, t, kv * i.sconv_k, h)?;
-            raw_gemm(model, st, &dv, &vn, v_proj, t, kv * i.sconv_k, h)?;
+            raw_gemm(model, st, &dk, &self.kn, k_proj, t, kv * i.sconv_k, h)?;
+            raw_gemm(model, st, &dv, &self.vn, v_proj, t, kv * i.sconv_k, h)?;
             (Some(dk), Some(dv))
         } else {
             let an = layer.attn_norm.as_ref().context("sliding layer without attn_norm")?;
-            rms(model, st, &qn, &qin, an, t, h, eps)?;
-            kn.copy_from_shared(0, &qn, 0, t * h * 4, st)?;
-            vn.copy_from_shared(0, &qn, 0, t * h * 4, st)?;
+            rms(model, st, &self.qn, &self.qin, an, t, h, eps)?;
+            if messages.is_some() {
+                rms(model, st, &self.kn, &self.kin, an, t, h, eps)?;
+                rms(model, st, &self.vn, &self.vin, an, t, h, eps)?;
+            } else {
+                self.kn.copy_from_shared(0, &self.qn, 0, t * h * 4, st)?;
+                self.vn.copy_from_shared(0, &self.qn, 0, t * h * 4, st)?;
+            }
             (None, None)
         };
-        lin(model, st, &mut xr, &mut xh, &mut xsc, &q, &qn, &layer.wq, t)?;
-        lin(model, st, &mut xr, &mut xh, &mut xsc, &k, &kn, &layer.wk, t)?;
-        lin(model, st, &mut xr, &mut xh, &mut xsc, &v, &vn, &layer.wv, t)?;
-        lin(model, st, &mut xr, &mut xh, &mut xsc, &r, &qn, &layer.wr, t)?;
-        lin(model, st, &mut xr, &mut xh, &mut xsc, &gate, &qn, &layer.gate, t)?;
-        raw_gemm(model, st, &sink, &qn, &layer.sink, t, heads, h)?;
+        lin(
+            model,
+            st,
+            &mut self.xr,
+            &mut self.xh,
+            &mut self.xsc,
+            &self.q,
+            &self.qn,
+            &layer.wq,
+            t,
+        )?;
+        lin(
+            model,
+            st,
+            &mut self.xr,
+            &mut self.xh,
+            &mut self.xsc,
+            &self.k,
+            &self.kn,
+            &layer.wk,
+            t,
+        )?;
+        lin(
+            model,
+            st,
+            &mut self.xr,
+            &mut self.xh,
+            &mut self.xsc,
+            &self.v,
+            &self.vn,
+            &layer.wv,
+            t,
+        )?;
+        lin(
+            model,
+            st,
+            &mut self.xr,
+            &mut self.xh,
+            &mut self.xsc,
+            &self.r,
+            &self.qn,
+            &layer.wr,
+            t,
+        )?;
+        lin(
+            model,
+            st,
+            &mut self.xr,
+            &mut self.xh,
+            &mut self.xsc,
+            &self.gate,
+            &self.qn,
+            &layer.gate,
+            t,
+        )?;
+        raw_gemm(model, st, &self.sink, &self.qn, &layer.sink, t, heads, h)?;
         // 3. The short convolutions of the keys and the values, then the clips.
         let (k_w, v_w) = match &layer.sconv {
             Sconv::Local { k, v } => (k, v),
@@ -1150,39 +1372,49 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
         sconv2(
             model,
             st,
-            &kt,
-            &k,
-            &vt,
-            &v,
+            &self.kt,
+            &self.k,
+            &self.vt,
+            &self.v,
             k_w,
             v_w,
             dyn_k.as_ref(),
             dyn_v.as_ref(),
-            &past,
+            &self.past,
             t,
             kvd,
             kv,
             div,
         )?;
-        k.copy_from_shared(0, &kt, 0, t * kvd * 4, st)?;
-        v.copy_from_shared(0, &vt, 0, t * kvd * 4, st)?;
-        let tau = if full { taud.as_ref() } else { None };
-        clip(model, st, &q, &layer.q_clip, tau, t, heads, hd, i.qk_clip)?;
-        clip(model, st, &k, &ones_k, None, t, kv, hd, i.qk_clip)?;
-        rms_unnorm(model, st, &v, t, kv, hd, eps)?;
-        clip(model, st, &r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
-        rel_bias(model, st, &bias, &r, &layer.rel_logits, t, heads, d_rel, i.rel_extent)?;
+        self.k.copy_from_shared(0, &self.kt, 0, t * kvd * 4, st)?;
+        self.v.copy_from_shared(0, &self.vt, 0, t * kvd * 4, st)?;
+        let tau = if full { self.taud.as_ref() } else { None };
+        clip(model, st, &self.q, &layer.q_clip, tau, t, heads, hd, i.qk_clip)?;
+        clip(model, st, &self.k, &self.ones_k, None, t, kv, hd, i.qk_clip)?;
+        rms_unnorm(model, st, &self.v, t, kv, hd, eps)?;
+        clip(model, st, &self.r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
+        rel_bias(
+            model,
+            st,
+            &self.bias,
+            &self.r,
+            &layer.rel_logits,
+            t,
+            heads,
+            d_rel,
+            i.rel_extent,
+        )?;
         let window = if full { 0 } else { i.window };
         attn(
             model,
             st,
-            &attn_out,
-            &q,
-            &k,
-            &v,
-            &bias,
-            &sink,
-            &gate,
+            &self.attn_out,
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.bias,
+            &self.sink,
+            &self.gate,
             t,
             heads,
             kv,
@@ -1190,57 +1422,82 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
             window,
             1.0 / (hd as f32).sqrt(),
         )?;
-        lin(model, st, &mut xr, &mut xh, &mut xsc, &y, &attn_out, &layer.wo, t)?;
+        lin(
+            model,
+            st,
+            &mut self.xr,
+            &mut self.xh,
+            &mut self.xsc,
+            &self.y,
+            &self.attn_out,
+            &layer.wo,
+            t,
+        )?;
         sconv_one(
             model,
             st,
-            &yt,
-            &y,
+            &self.yt,
+            &self.y,
             &layer.attn_sconv,
-            &past,
+            &self.past,
             t,
             h,
             (i.sconv_k as f32 + 1.0).sqrt(),
         )?;
-        y.copy_from_shared(0, &yt, 0, t * h * 4, st)?;
+        self.y.copy_from_shared(0, &self.yt, 0, t * h * 4, st)?;
 
         // 4. The block bookkeeping.
-        let boundary = l % i.attn_res_block == 0;
+        let boundary = l.is_multiple_of(i.attn_res_block);
         if boundary {
             let pushed = f32s(t * h)?;
-            pushed.copy_from_shared(0, &block_residual, 0, t * h * 4, st)?;
-            blocks.push(pushed);
-            x.copy_from_shared(0, &y, 0, t * h * 4, st)?;
+            pushed.copy_from_shared(0, &self.block_residual, 0, t * h * 4, st)?;
+            self.blocks.push(pushed);
+            self.x.copy_from_shared(0, &self.y, 0, t * h * 4, st)?;
         } else {
-            x.copy_from_shared(0, &block_residual, 0, t * h * 4, st)?;
-            add(model, st, &x, &y, t * h)?;
+            self.x.copy_from_shared(0, &self.block_residual, 0, t * h * 4, st)?;
+            add(model, st, &self.x, &self.y, t * h)?;
         }
         // 5. The MLP input: the attention residual over the block stack.
         mix(
             model,
             st,
-            &mix_out,
-            &states,
-            &blocks,
-            &x,
+            &self.mix_out,
+            &self.states,
+            &self.blocks,
+            &self.x,
             &w.mlp_queries[l],
             1,
             t,
             h,
             eps,
         )?;
+        if messages.is_some() {
+            let ctrl = layer.controller.as_ref().context("loop layer without controller")?;
+            control(
+                model,
+                st,
+                &self.mix_out,
+                &self.mix_out,
+                &self.msg[3],
+                &ctrl.mlp,
+                t,
+                h,
+                i.loop_rank,
+                eps,
+            )?;
+        }
         // 6. The MoE.
-        rms(model, st, &normed, &mix_out, &layer.mlp_norm, t, h, eps)?;
-        raw_gemm(model, st, &logits, &normed, &layer.moe.gate, t, experts, h)?;
+        rms(model, st, &self.normed, &self.mix_out, &layer.mlp_norm, t, h, eps)?;
+        raw_gemm(model, st, &self.logits, &self.normed, &layer.moe.gate, t, experts, h)?;
         model.k.get("inkling2_moe_route").launch(
             (t as u32, 1, 1),
             (256, 1, 1),
             0,
             st,
             &[
-                (&route_ids).into(),
-                (&route_w).into(),
-                (&logits).into(),
+                (&self.route_ids).into(),
+                (&self.route_w).into(),
+                (&self.logits).into(),
                 (&layer.moe.bias).into(),
                 experts.into(),
                 topk.into(),
@@ -1253,11 +1510,11 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
             0,
             st,
             &[
-                (&gu).into(),
-                (&normed).into(),
+                (&self.gu).into(),
+                (&self.normed).into(),
                 (&layer.moe.gate_up.0).into(),
                 (&layer.moe.gate_up.1).into(),
-                (&route_ids).into(),
+                (&self.route_ids).into(),
                 topk.into(),
                 (2 * inter).into(),
                 h.into(),
@@ -1270,8 +1527,8 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
             0,
             st,
             &[
-                (&act).into(),
-                (&gu).into(),
+                (&self.act).into(),
+                (&self.gu).into(),
                 (&model.signs).into(),
                 inter.into(),
                 i.gate_softcap.into(),
@@ -1284,12 +1541,12 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
             0,
             st,
             &[
-                (&moe_out).into(),
-                (&act).into(),
+                (&self.moe_out).into(),
+                (&self.act).into(),
                 (&layer.moe.down.0).into(),
                 (&layer.moe.down.1).into(),
-                (&route_ids).into(),
-                (&route_w).into(),
+                (&self.route_ids).into(),
+                (&self.route_w).into(),
                 topk.into(),
                 h.into(),
                 inter.into(),
@@ -1299,26 +1556,113 @@ fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
         sconv_one(
             model,
             st,
-            &yt,
-            &moe_out,
+            &self.yt,
+            &self.moe_out,
             &layer.mlp_sconv,
-            &past,
+            &self.past,
             t,
             h,
             (i.sconv_k as f32 + 1.0).sqrt(),
         )?;
-        moe_out.copy_from_shared(0, &yt, 0, t * h * 4, st)?;
-        add(model, st, &x, &moe_out, t * h)?;
+        self.moe_out.copy_from_shared(0, &self.yt, 0, t * h * 4, st)?;
+        add(model, st, &self.x, &self.moe_out, t * h)?;
+        Ok(())
+    }
+}
+
+/// Runs `tokens` through the whole graph and returns the argmax of the last position's logits.
+fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
+    let c = &model.cfg;
+    let i = c.inkling2.as_ref().context("no inkling2 config")?;
+    let w = model.inkling2.as_ref().context("no inkling2 weights")?;
+    let st = &model.stream;
+    let t = tokens.len();
+    let h = c.hidden;
+    let mut g = Graph::new(model, t)?;
+
+    let ids32: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
+    let idbuf = DeviceBuffer::from_slice(&ids32)?;
+    model.k.get("embed_bf16").launch(
+        (t as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&g.x).into(), (&w.embed).into(), (&idbuf).into(), h.into()],
+    )?;
+    rms(model, st, &g.x, &g.x, &w.embed_norm, t, h, c.eps)?;
+
+    // The cross-pass queries, [core, 4, hidden]: the checkpoint stores two rows per core layer in each table, and
+    // the message attention reads [query, key, value, mlp] as [q[2i], kv[2i], kv[2i+1], q[2i+1]].
+    let core = i.loop_end - i.loop_start;
+    for ci in 0..core {
+        g.msg_queries
+            .copy_from_shared(ci * 4 * h * 4, &w.cross_pass_q, 2 * ci * h * 4, h * 4, st)?;
+        g.msg_queries
+            .copy_from_shared((ci * 4 + 1) * h * 4, &w.cross_pass_kv, 2 * ci * h * 4, h * 4, st)?;
+        g.msg_queries
+            .copy_from_shared((ci * 4 + 2) * h * 4, &w.cross_pass_kv, (2 * ci + 1) * h * 4, h * 4, st)?;
+        g.msg_queries
+            .copy_from_shared((ci * 4 + 3) * h * 4, &w.cross_pass_q, (2 * ci + 1) * h * 4, h * 4, st)?;
+    }
+
+    // The prelude, then the first pass over the core layers.
+    for l in 0..i.loop_start {
+        g.layer(model, st, i, w, l, None)?;
+    }
+    g.pre_loop_hidden.copy_from_shared(0, &g.x, 0, t * h * 4, st)?;
+    let num_pre_blocks = (0..i.loop_start).filter(|l| l.is_multiple_of(i.attn_res_block)).count();
+    for l in i.loop_start..i.loop_end {
+        g.layer(model, st, i, w, l, None)?;
+    }
+
+    // The extra passes restart from the prelude's output and its block stack, and read the previous pass's core
+    // blocks (everything after the first one) and its output as the message bank.
+    for _pass in 1..i.loop_passes {
+        let prev_blocks: Vec<DeviceBuffer> = g.blocks.split_off(num_pre_blocks + 1);
+        let prev_hidden = f32s(t * h)?;
+        prev_hidden.copy_from_shared(0, &g.x, 0, t * h * 4, st)?;
+        g.x.copy_from_shared(0, &g.pre_loop_hidden, 0, t * h * 4, st)?;
+        g.blocks.truncate(num_pre_blocks);
+        for l in i.loop_start..i.loop_end {
+            g.layer(model, st, i, w, l, Some((&prev_blocks, &prev_hidden)))?;
+        }
+    }
+
+    // The tail.
+    for l in i.loop_end..c.n_layers {
+        g.layer(model, st, i, w, l, None)?;
     }
 
     // The final attention residual, the norm and the head.
-    mix(model, st, &mix_out, &states, &blocks, &x, &w.output_query, 1, t, h, eps)?;
-    rms(model, st, &normed, &mix_out, &w.norm, t, h, eps)?;
+    mix(
+        model,
+        st,
+        &g.mix_out,
+        &g.states,
+        &g.blocks,
+        &g.x,
+        &w.output_query,
+        1,
+        t,
+        h,
+        c.eps,
+    )?;
+    rms(model, st, &g.normed, &g.mix_out, &w.norm, t, h, c.eps)?;
     // The last row only.
     let last = f32s(h)?;
-    last.copy_from_shared(0, &normed, (t - 1) * h * 4, h * 4, st)?;
+    last.copy_from_shared(0, &g.normed, (t - 1) * h * 4, h * 4, st)?;
     let logits_out = f32s(c.vocab)?;
-    lin(model, st, &mut xr, &mut xh, &mut xsc, &logits_out, &last, &w.unembed, 1)?;
+    lin(
+        model,
+        st,
+        &mut g.xr,
+        &mut g.xh,
+        &mut g.xsc,
+        &logits_out,
+        &last,
+        &w.unembed,
+        1,
+    )?;
     softcap(model, st, &logits_out, c.vocab, i.logit_softcap)?;
     let raw: Vec<f32> = logits_out.download(c.vocab)?;
     Ok(argmax(&raw, i.unpadded_vocab))
@@ -1433,7 +1777,7 @@ fn mix(
 /// Copies the `qi`-th of `nq` outputs of a mix (`[t, nq, h]`) into a `[t, h]` buffer.
 fn copy_nq(
     src: &DeviceBuffer,
-    dst: &mut DeviceBuffer,
+    dst: &DeviceBuffer,
     qi: usize,
     t: usize,
     h: usize,
@@ -1443,6 +1787,41 @@ fn copy_nq(
     for p in 0..t {
         dst.copy_from_shared(p * h * 4, src, (p * nq + qi) * h * 4, h * 4, st)?;
     }
+    Ok(())
+}
+
+/// The cross-pass controller: `out = (1 - tanh(forget)) * cur + tanh(gain) * message`, with the gate read from
+/// the RMS-normed concatenation of the state and the message.
+#[allow(clippy::too_many_arguments)]
+fn control(
+    model: &Model,
+    st: &Stream,
+    out: &DeviceBuffer,
+    cur: &DeviceBuffer,
+    msg: &DeviceBuffer,
+    gate: &Gate,
+    t: usize,
+    h: usize,
+    rank: usize,
+    eps: f32,
+) -> Result<()> {
+    model.k.get("inkling2_control").launch(
+        (t as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            out.into(),
+            cur.into(),
+            msg.into(),
+            (&gate.down).into(),
+            (&gate.gain).into(),
+            (&gate.forget).into(),
+            h.into(),
+            rank.into(),
+            eps.into(),
+        ],
+    )?;
     Ok(())
 }
 
