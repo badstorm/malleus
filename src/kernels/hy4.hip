@@ -428,10 +428,11 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_split(float* part, con
     }
     __syncwarp();
     const int nkeys = len + ti + 1;
-    const int per = (nkeys + nsplit - 1) / nsplit;
-    // The sliding layers see only the last `window` keys, counting the query's own position.
+    // The sliding layers see only the last `window` keys, counting the query's own position. The splits share
+    // the visible range: clamping each split's start to the window instead made them overlap and count keys twice.
     const int first = window > 0 ? max(0, nkeys - window) : 0;
-    const int k0 = max(first, split * per), k_end = min(nkeys, k0 + per);
+    const int per = (nkeys - first + nsplit - 1) / nsplit;
+    const int k0 = first + split * per, k_end = min(nkeys, k0 + per);
     float m = split == 0 ? sinh[h] : -INFINITY;
     float l = split == 0 ? 1.f : 0.f;
     float acc[16];

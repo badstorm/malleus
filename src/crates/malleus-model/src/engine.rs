@@ -696,8 +696,9 @@ impl Model {
         for b in s.conv.iter().chain(&s.rec).chain(&s.ple_state) {
             b.memset(0, &st)?;
         }
-        if let Some(p) = &self.cfg.ple {
-            s.ngram_ctx = vec![p.eos; p.ngram - 1];
+        match &self.cfg.ple {
+            Some(p) => s.ngram_ctx = vec![p.eos; p.ngram - 1],
+            None => s.ngram_ctx.clear(),
         }
         st.synchronize()?;
         s.len = 0;
@@ -1829,7 +1830,14 @@ impl Model {
         argmax_only: bool,
     ) -> Result<Vec<f32>> {
         if self.hy4.is_some() {
-            return crate::hy4::forward(self, sess, tokens, positions, n_logits);
+            let logits = crate::hy4::forward(self, sess, tokens, positions, n_logits)?;
+            // `argmax_only` callers read the token id from the first element, not a row of logits.
+            if argmax_only {
+                let v = &logits[logits.len() - self.cfg.vocab..];
+                let best = (0..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b });
+                return Ok(vec![best as f32]);
+            }
+            return Ok(logits);
         }
         let c = &self.cfg;
         let t = tokens.len();
