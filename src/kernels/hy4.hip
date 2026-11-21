@@ -917,3 +917,208 @@ extern "C" __global__ void __launch_bounds__(256) hy4_gemv_long(float* out, cons
         }
     }
 }
+
+// Engram gate of one stream, one block per token, the stream updated in place:
+//   m     = main + value_bias,                 gamma = pre_gamma * m * rsqrt(mean(m^2) + eps)
+//   q     = stream * rsqrt(mean(stream^2) + eps) * norm_query[s]
+//   k     = (key + key_bias[s]) * rsqrt(mean(.^2) + eps) * norm_key[s]
+//   g     = sigmoid(sign(d) * sqrt(max(|d|, 1e-6))),  d = (q . k) / sqrt(h)
+//   stream += gamma * (g + scale[s])           (nothing on an image placeholder)
+// params: [value_bias | pre_gamma | per stream (key_bias, norm_query, norm_key, scale)], each h wide.
+extern "C" __global__ void __launch_bounds__(256) hy4_engram_gate(float* streams, const float* main, const float* key,
+                                                                 const float* params, const int* ids, int image_token,
+                                                                 int hc, int s, int h, float eps) {
+    __shared__ float red[3][8];
+    const int ti = blockIdx.x, tid = threadIdx.x, lane = tid % 32, wl = tid / 32;
+    if (ids[ti] == image_token) return;
+    const float* vb = params;
+    const float* pg = params + h;
+    const float* kb = params + (size_t)(2 + 4 * s) * h;
+    const float* nq = kb + h;
+    const float* nk = kb + 2 * h;
+    const float* scl = kb + 3 * h;
+    float* q = streams + ((size_t)ti * hc + s) * h;
+    const float* m = main + (size_t)ti * h;
+    const float* k = key + (size_t)ti * h;
+    float sm = 0.f, sq = 0.f, sk = 0.f;
+    for (int i = tid; i < h; i += 256) {
+        const float mv = m[i] + vb[i], kv = k[i] + kb[i], qv = q[i];
+        sm += mv * mv;
+        sq += qv * qv;
+        sk += kv * kv;
+    }
+    for (int d = 16; d > 0; d >>= 1) {
+        sm += __shfl_xor(sm, d);
+        sq += __shfl_xor(sq, d);
+        sk += __shfl_xor(sk, d);
+    }
+    if (lane == 0) red[0][wl] = sm, red[1][wl] = sq, red[2][wl] = sk;
+    __syncthreads();
+    float tm = 0.f, tq = 0.f, tk = 0.f;
+    for (int w = 0; w < 8; ++w) tm += red[0][w], tq += red[1][w], tk += red[2][w];
+    const float minv = rsqrtf(tm / (float)h + eps), qinv = rsqrtf(tq / (float)h + eps), kinv = rsqrtf(tk / (float)h + eps);
+    __syncthreads();
+    float dot = 0.f;
+    for (int i = tid; i < h; i += 256) dot += (q[i] * qinv * nq[i]) * ((k[i] + kb[i]) * kinv * nk[i]);
+    for (int d = 16; d > 0; d >>= 1) dot += __shfl_xor(dot, d);
+    if (lane == 0) red[0][wl] = dot;
+    __syncthreads();
+    float g = 0.f;
+    for (int w = 0; w < 8; ++w) g += red[0][w];
+    g /= sqrtf((float)h);
+    g = 1.f / (1.f + expf(-(sqrtf(fmaxf(fabsf(g), 1e-6f)) * (g > 0.f ? 1.f : g < 0.f ? -1.f : 0.f))));
+    for (int i = tid; i < h; i += 256) q[i] += pg[i] * (m[i] + vb[i]) * minv * (g + scl[i]);
+}
+
+// The absorbed query of a chunk on WMMA: qt[t, h, :] = q_nope[t, h, :] . W[h] with W[h] the [nope, kv] QK half of
+// kv_b as stored (row = nope index, contiguous over kv), i.e. out[T, N] = x[T, K] . W[K, N] per head on
+// blockIdx.z. 64 x 64 tiles, 8 waves of 16 x 32, K staged 32 at a time (K a multiple of 32). `xz` is the per-head
+// offset into x (the q row holds nope + rope per head), `ldx`/`ldo` the row strides. The per-(token, head) GEMV it
+// replaces for a chunk read the head's 196 KB of W from L2 once per token.
+typedef short hy4_bf16x16 __attribute__((ext_vector_type(16)));
+typedef float hy4_f32x8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ unsigned short hy4_f2bf(float f) {
+    const unsigned u = __float_as_uint(f);
+    return (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+extern "C" __global__ void __launch_bounds__(256) hy4_absorb_wmma(float* out, const float* x, const unsigned short* W,
+                                                                 int T, int N, int K, int ldx, int xz, int ldo,
+                                                                 int wld) {
+    __shared__ __attribute__((aligned(16))) unsigned short xs[64][40];
+    __shared__ __attribute__((aligned(16))) unsigned short ws[64][40];
+    const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+    const int t0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    const float* xb = x + (size_t)blockIdx.z * xz;
+    float* ob = out + (size_t)blockIdx.z * N;
+    const unsigned short* Wb = W + (size_t)blockIdx.z * wld;
+    const int wt = (wave / 2) * 16, wn = (wave % 2) * 32;
+    hy4_f32x8 acc[2] = {(hy4_f32x8){0, 0, 0, 0, 0, 0, 0, 0}, (hy4_f32x8){0, 0, 0, 0, 0, 0, 0, 0}};
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        __syncthreads();
+        for (int e = tid; e < 64 * 32; e += 256) {
+            const int r = e / 32, c = e % 32;
+            xs[r][c] = hy4_f2bf(xb[(size_t)min(t0 + r, T - 1) * ldx + k0 + c]);
+            // Consecutive threads read consecutive n of one W row: coalesced in the [K, N] layout.
+            const int rn = e % 64, ck = e / 64;
+            ws[rn][ck] = Wb[(size_t)(k0 + ck) * N + min(n0 + rn, N - 1)];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            const hy4_bf16x16 a = *(const hy4_bf16x16*)&xs[wt + lane % 16][kk];
+#pragma unroll
+            for (int f = 0; f < 2; ++f) {
+                const hy4_bf16x16 b = *(const hy4_bf16x16*)&ws[wn + f * 16 + lane % 16][kk];
+                acc[f] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[f]);
+            }
+        }
+    }
+#pragma unroll
+    for (int f = 0; f < 2; ++f)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int t = t0 + wt + 2 * i + lane / 16, n = n0 + wn + f * 16 + lane % 16;
+            if (t < T && n < N) ob[(size_t)t * ldo + n] = acc[f][i];
+        }
+}
+
+// Absorbed MLA attention of a chunk on fp16 WMMA, the sink included, writing the weighted latent [t, nh, kv] that the
+// split + merge pair writes for a decode step. A block is 32 heads of one token: they read the same latent keys (one
+// shared kv, MQA), so a 16-key tile staged once in LDS serves all of them, both as K ([key][kv + rd]) for the scores
+// and transposed as V ([kv][key]) for the output. Waves 4g .. 4g + 3 own rows 16g .. 16g + 15; for the scores wave
+// qd covers dims 144 qd .. 144 qd + 143 of the 576 (Q held in registers, prescaled), and the four partial tiles are
+// summed through LDS; for the output it covers latent dims 128 qd .. 128 qd + 127. The online softmax starts from
+// (m, l) = (sink, 1), as the first split does. Keys [first, len + ti]: the window of a sliding layer or everything.
+// Requires nh % 32 == 0, kv == 512, rd == 64.
+typedef _Float16 hy4_h16 __attribute__((ext_vector_type(16)));
+extern "C" __global__ void __launch_bounds__(256) hy4_mla_attn_wmma(float* lat, const float* qt, const float* q,
+                                                                   const __half* ckv, const __half* krot,
+                                                                   const float* sinh, int len, int nh, int nope, int kv,
+                                                                   int rd, float scale, int window) {
+    constexpr int KT = 16, KS = 584, VS = 24;
+    __shared__ __attribute__((aligned(16))) _Float16 ks[KT][KS];
+    __shared__ __attribute__((aligned(16))) _Float16 vt[512][VS];
+    __shared__ float sp[4][32][KT];
+    const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32, g = wave / 4, qd = wave % 4;
+    const int bpt = nh / 32, ti = blockIdx.x / bpt, h0 = (blockIdx.x % bpt) * 32;
+    const int row = lane % 16, h = h0 + g * 16 + row;
+    hy4_h16 qf[9];
+#pragma unroll
+    for (int f = 0; f < 9; ++f)
+#pragma unroll
+        for (int e = 0; e < 16; ++e) {
+            const int d = (qd * 9 + f) * 16 + e;
+            const float v = d < kv ? qt[((size_t)ti * nh + h) * kv + d]
+                                   : q[((size_t)ti * nh + h) * (nope + rd) + nope + d - kv];
+            qf[f][e] = (_Float16)(v * scale);
+        }
+    const int last = len + ti, first = window > 0 ? max(0, last - window + 1) : 0;
+    float m = sinh[h], l = 1.f;
+    hy4_f32x8 o[8];
+#pragma unroll
+    for (int f = 0; f < 8; ++f) o[f] = (hy4_f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+    for (int k0 = (first / KT) * KT; k0 <= last; k0 += KT) {
+        __syncthreads();
+        for (int e = tid; e < KT * 72; e += 256) {
+            const int kk = e / 72, c = e % 72, key = min(k0 + kk, last);
+            const uint4 u = c < 64 ? ((const uint4*)(ckv + (size_t)key * kv))[c]
+                                   : ((const uint4*)(krot + (size_t)key * rd))[c - 64];
+            *(uint4*)&ks[kk][c * 8] = u;
+            if (c < 64) {
+                const _Float16* hv = (const _Float16*)&u;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) vt[c * 8 + i][kk] = hv[i];
+            }
+        }
+        __syncthreads();
+        hy4_f32x8 s = (hy4_f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+        for (int f = 0; f < 9; ++f) {
+            const hy4_h16 b = *(const hy4_h16*)&ks[row][(qd * 9 + f) * 16];
+            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qf[f], b, s);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sp[qd][g * 16 + 2 * i + lane / 16][row] = s[i];
+        __syncthreads();
+        float p[KT];
+        float mt = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < KT; ++k) {
+            const int r = g * 16 + row, key = k0 + k;
+            float v = sp[0][r][k] + sp[1][r][k] + sp[2][r][k] + sp[3][r][k];
+            if (key < first || key > last) v = -INFINITY;
+            p[k] = v;
+            mt = fmaxf(mt, v);
+        }
+        const float mn = fmaxf(m, mt), alpha = expf(m - mn);
+        float ls = 0.f;
+        hy4_h16 pa;
+#pragma unroll
+        for (int k = 0; k < KT; ++k) {
+            const float e = expf(p[k] - mn);
+            ls += e;
+            pa[k] = (_Float16)e;
+        }
+        l = l * alpha + ls;
+        m = mn;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float a = __shfl(alpha, 2 * i + lane / 16, 32);
+#pragma unroll
+            for (int f = 0; f < 8; ++f) o[f][i] *= a;
+        }
+#pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const hy4_h16 b = *(const hy4_h16*)&vt[qd * 128 + f * 16 + row][0];
+            o[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, b, o[f]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = 2 * i + lane / 16;
+        const float li = __shfl(l, r, 32);
+#pragma unroll
+        for (int f = 0; f < 8; ++f)
+            lat[((size_t)ti * nh + h0 + g * 16 + r) * kv + qd * 128 + f * 16 + row] = o[f][i] / li;
+    }
+}

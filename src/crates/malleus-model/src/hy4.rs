@@ -386,6 +386,9 @@ pub(crate) struct Engram {
     /// The odd multipliers `hash_ngrams` mixes the n-gram with, one per order: drawn by the checkpoint's seed
     /// (`engram_seed + 10007 * layer_id`, numpy PCG64) from the loaded map, so they are a property of the file.
     pub(crate) hash_mult: [i64; 3],
+    /// f32 on the device for `hy4_engram_gate`: `[value_bias | pre_gamma | per stream (key_bias, norm_query,
+    /// norm_key, scale)]`, each `hidden` wide.
+    pub(crate) gate_params: DeviceBuffer,
 }
 
 /// One Engram row table as the file stores it: `rows` rows of `k` 4-bit codes (bias 8) with an f16 scale each,
@@ -427,19 +430,30 @@ impl Table {
 
     /// Dequantized rows `ids` as `[ids, k]` f32: the 4-bit codes (bias 8) times the f16 scale of the row.
     pub(crate) fn rows(&self, ids: &[usize]) -> Result<Vec<f32>> {
+        use rayon::prelude::*;
         let rb = self.k / 2;
-        let mut buf = vec![0u8; rb];
-        let mut sb = [0u8; 2];
-        let mut out = Vec::with_capacity(ids.len() * self.k);
-        for &id in ids {
+        let mut out = vec![0f32; ids.len() * self.k];
+        // The rows are hashed, so a prompt reads them at random from a table mostly on NVMe: one read after the
+        // other waited ~80 us each, 2.2 s per Engram layer for a 2048-token prompt. In parallel the drive overlaps
+        // them; a decode step (16 rows) stays on one thread.
+        let read = |(id, dst): (&usize, &mut [f32])| -> Result<()> {
+            let id = *id;
             ensure!(id < self.rows, "engram row {id} out of range");
+            let mut buf = vec![0u8; rb];
+            let mut sb = [0u8; 2];
             self.file.read_at(id * rb, &mut buf)?;
             self.scales.read_at(id * 2, &mut sb)?;
             let s = half::f16::from_le_bytes(sb).to_f32();
-            for &b in &buf {
-                out.push(((b & 0xF) as f32 - 8.0) * s);
-                out.push(((b >> 4) as f32 - 8.0) * s);
+            for (i, &b) in buf.iter().enumerate() {
+                dst[2 * i] = ((b & 0xF) as f32 - 8.0) * s;
+                dst[2 * i + 1] = ((b >> 4) as f32 - 8.0) * s;
             }
+            Ok(())
+        };
+        if ids.len() > 64 {
+            ids.par_iter().zip(out.par_chunks_mut(self.k)).try_for_each(read)?;
+        } else {
+            ids.iter().zip(out.chunks_mut(self.k)).try_for_each(read)?;
         }
         Ok(out)
     }
@@ -788,16 +802,28 @@ fn load_engram(
         .typed(src, &p("lookup_table"), DType::I32, &[e.lookup])?
         .download(e.lookup)?;
     let head_vocab: Vec<usize> = sizes.iter().flatten().copied().collect();
+    let pre_gamma = bf16_vec(src, &p("unified_pre_gamma"), c.hidden)?;
+    let value_bias = bf16_vec(src, &p("value_proj.bias"), c.hidden)?;
+    let mut params = Vec::with_capacity((2 + 4 * key_bias.len()) * c.hidden);
+    params.extend_from_slice(&value_bias);
+    params.extend_from_slice(&pre_gamma);
+    for s in 0..key_bias.len() {
+        for v in [&key_bias[s], &norm_query[s], &norm_key[s], &scales[s]] {
+            ensure!(v.len() == c.hidden, "engram gate vector width");
+            params.extend_from_slice(v);
+        }
+    }
     Ok(Engram {
         key,
         value: up.linear(src, &p("value_proj"), c.hidden, width)?,
         norm_key,
         norm_query,
         head_norms,
-        pre_gamma: bf16_vec(src, &p("unified_pre_gamma"), c.hidden)?,
+        pre_gamma,
         scales,
-        value_bias: bf16_vec(src, &p("value_proj.bias"), c.hidden)?,
+        value_bias,
         key_bias,
+        gate_params: DeviceBuffer::from_slice(&params)?,
         head_vocab,
         heads: e.heads,
         dim: e.embed / e.heads,
@@ -1583,80 +1609,28 @@ fn engram(
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &buf, Act::X(&emb), k, t, false)?;
         keys.push(buf);
     }
-    st.synchronize()?;
-    let mut main: Vec<f32> = main.download(t * hidden)?;
-    for ti in 0..t {
-        for i in 0..hidden {
-            main[ti * hidden + i] += e.value_bias[i];
-        }
+    // The gate per stream on the device: the value and the keys get their bias there, and the streams are updated
+    // in place. On the host this was a download and an upload of all the streams per Engram layer.
+    for (si, key) in keys.iter().enumerate() {
+        model.k.get("hy4_engram_gate").launch(
+            (t as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&*streams).into(),
+                (&main).into(),
+                key.into(),
+                (&e.gate_params).into(),
+                (&sc.ids).into(),
+                (h.image_token as i32).into(),
+                hc.into(),
+                si.into(),
+                hidden.into(),
+                BF16_EPS.into(),
+            ],
+        )?;
     }
-    let mut keys_host = Vec::with_capacity(hc);
-    for (s, k) in keys.iter().enumerate() {
-        let mut v: Vec<f32> = k.download(t * hidden)?;
-        for ti in 0..t {
-            for i in 0..hidden {
-                v[ti * hidden + i] += e.key_bias[s][i];
-            }
-        }
-        keys_host.push(v);
-    }
-    let trace_engram = std::env::var("MALLEUS_HY4_TRACE").is_ok();
-    if trace_engram && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR") {
-        let bytes: Vec<u8> = main.iter().flat_map(|x| x.to_le_bytes()).collect();
-        std::fs::write(std::path::Path::new(&dir).join("E_main.f32"), bytes)?;
-    }
-    let mut st_host: Vec<f32> = streams.download(t * hc * hidden)?;
-    let nh = hidden as f32;
-    let mut out = vec![0f32; t * hc * hidden];
-    for ti in 0..t {
-        let m = &main[ti * hidden..][..hidden];
-        let ms = m.iter().map(|v| v * v).sum::<f32>() / nh;
-        let inv = 1.0 / (ms + BF16_EPS).sqrt();
-        let mut gamma = vec![0f32; hidden];
-        for i in 0..hidden {
-            gamma[i] = e.pre_gamma[i] * m[i] * inv;
-        }
-        for s in 0..hc {
-            let q0 = &st_host[(ti * hc + s) * hidden..][..hidden];
-            let qs = q0.iter().map(|v| v * v).sum::<f32>() / nh;
-            let qinv = 1.0 / (qs + BF16_EPS).sqrt();
-            let k0 = &keys_host[s][ti * hidden..][..hidden];
-            let ks = k0.iter().map(|v| v * v).sum::<f32>() / nh;
-            let kinv = 1.0 / (ks + BF16_EPS).sqrt();
-            let mut dot = 0f32;
-            for i in 0..hidden {
-                let q = q0[i] * qinv * e.norm_query[s][i];
-                let k = k0[i] * kinv * e.norm_key[s][i];
-                dot += k * q;
-            }
-            let g = dot / nh.sqrt();
-            let g = 1.0 / (1.0 + (-(g.abs().max(1e-6).sqrt() * g.signum())).exp());
-            if tokens[ti] == h.image_token {
-                // A visual placeholder has no token to hash: the memory contributes nothing there.
-                continue;
-            }
-            for i in 0..hidden {
-                out[(ti * hc + s) * hidden + i] = gamma[i] * (g + e.scales[s][i]);
-            }
-        }
-    }
-    if trace_engram && let Ok(dir) = std::env::var("MALLEUS_DUMP_DIR") {
-        let bytes: Vec<u8> = out.iter().flat_map(|x| x.to_le_bytes()).collect();
-        std::fs::write(std::path::Path::new(&dir).join("E_out.f32"), bytes)?;
-    }
-    if trace_engram {
-        let r = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
-        eprintln!(
-            "engram out rms {:.5} gamma0 {:.4} out_row0 {:.5}",
-            r(&out),
-            r(&out[..hidden.min(out.len())]),
-            r(&out[..hidden.min(out.len())])
-        );
-    }
-    for (a, b) in st_host.iter_mut().zip(&out) {
-        *a += b;
-    }
-    streams.upload(&st_host)?;
     Ok(())
 }
 
@@ -2736,23 +2710,45 @@ pub(crate) fn forward(
         // latents (the sliding layers only the last `window` of them), and the combine applies its V half and the gate.
         let nsplit = 8usize;
         let qt = crate::session::f32s(t * a.heads * h.kv_lora)?;
-        model.k.get("hy4_absorb").launch(
-            ((t * a.heads) as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[
-                (&qt).into(),
-                (&q).into(),
-                (&a.kv_b).into(),
-                t.into(),
-                a.heads.into(),
-                a.nope.into(),
-                h.kv_lora.into(),
-                a.rope.into(),
-                (a.nope + a.v).into(),
-            ],
-        )?;
+        if t > 8 {
+            // A chunk: one WMMA GEMM per head over all its tokens.
+            model.k.get("hy4_absorb_wmma").launch(
+                (h.kv_lora.div_ceil(64) as u32, t.div_ceil(64) as u32, a.heads as u32),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&qt).into(),
+                    (&q).into(),
+                    (&a.kv_b).into(),
+                    t.into(),
+                    h.kv_lora.into(),
+                    a.nope.into(),
+                    (a.heads * (a.nope + a.rope)).into(),
+                    (a.nope + a.rope).into(),
+                    (a.heads * h.kv_lora).into(),
+                    ((a.nope + a.v) * h.kv_lora).into(),
+                ],
+            )?;
+        } else {
+            model.k.get("hy4_absorb").launch(
+                ((t * a.heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&qt).into(),
+                    (&q).into(),
+                    (&a.kv_b).into(),
+                    t.into(),
+                    a.heads.into(),
+                    a.nope.into(),
+                    h.kv_lora.into(),
+                    a.rope.into(),
+                    (a.nope + a.v).into(),
+                ],
+            )?;
+        }
         dump("qt", li, &qt, t * a.heads * h.kv_lora)?;
         if let Ok(dir) = std::env::var("MALLEUS_HY4_DUMP_W") {
             st.synchronize()?;
@@ -2784,92 +2780,121 @@ pub(crate) fn forward(
         }
         model.gemm(st, &sc.xr, &sc.xh, &sc.xsc, &gate, Act::X(&hn2), &a.gate, t, false)?;
         dump("gate", li, &gate, t * vd)?;
-        let part = crate::session::f32s(t * a.heads * nsplit * (h.kv_lora + 2))?;
         let sink = a.sink.as_ref().context("hy4 gated MLA needs the learned sink")?;
         let window = match c.kind[li] {
             crate::config::MixerKind::Hy4Sliding => h.window,
             _ => 0,
         };
-        if let Some(list) = &ix_list {
-            // The groups this query recalled (`index_topk / pool - 1` plus its own), or every closed one under
-            // `MALLEUS_HY4_IX_ALL`; the same split and merge as the dense path, one kernel over the list.
-            let slots = list.len() / (t * 4);
-            model.k.get("hy4_mla_split_ix").launch(
-                ((t * a.heads) as u32, 1, 1),
+        let lat_merged = crate::session::f32s(t * a.heads * h.kv_lora)?;
+        // A chunk on the dense path: one WMMA kernel per 32 heads of a token, which writes the weighted latent itself.
+        let wmma_attn = t > 8
+            && ix_list.is_none()
+            && a.heads % 32 == 0
+            && std::env::var("MALLEUS_HY4_ATTN_WMMA").map_or(true, |v| v != "0");
+        if wmma_attn {
+            model.k.get("hy4_mla_attn_wmma").launch(
+                ((t * a.heads / 32) as u32, 1, 1),
                 (256, 1, 1),
                 0,
                 st,
                 &[
-                    (&part).into(),
-                    (&qt).into(),
-                    (&q).into(),
-                    ckv.into(),
-                    ckrot.into(),
-                    list.into(),
-                    sink.into(),
-                    sess.len.into(),
-                    t.into(),
-                    a.heads.into(),
-                    a.nope.into(),
-                    h.kv_lora.into(),
-                    a.rope.into(),
-                    (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
-                    nsplit.into(),
-                    h.index_pool.into(),
-                    slots.into(),
-                ],
-            )?;
-        } else {
-            model.k.get("hy4_mla_split").launch(
-                ((t * a.heads) as u32, 1, 1),
-                (256, 1, 1),
-                0,
-                st,
-                &[
-                    (&part).into(),
+                    (&lat_merged).into(),
                     (&qt).into(),
                     (&q).into(),
                     ckv.into(),
                     ckrot.into(),
                     sink.into(),
                     sess.len.into(),
-                    t.into(),
                     a.heads.into(),
                     a.nope.into(),
                     h.kv_lora.into(),
                     a.rope.into(),
                     (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
-                    nsplit.into(),
                     window.into(),
                 ],
             )?;
-        }
-        // The merge into a global buffer, then the V half of kv_b_proj and the gate: two kernels so that the
-        // latent the V projection reads is the one written, not a block of shared memory.
-        let lat_merged = crate::session::f32s(t * a.heads * h.kv_lora)?;
-        model.k.get("hy4_mla_merge").launch(
-            ((t * a.heads) as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            st,
-            &[(&lat_merged).into(), (&part).into(), h.kv_lora.into(), nsplit.into()],
-        )?;
-        if std::env::var("MALLEUS_HY4_DUMP_PART").is_ok() && li == 0 {
-            st.synchronize()?;
-            let dir = std::env::var("MALLEUS_DUMP_DIR")?;
-            let n_lat = crate::weights::kv_ctx(sess.max_ctx) * h.kv_lora;
-            let cache: Vec<u16> = ckv.download(n_lat)?;
-            let bytes: Vec<u8> = cache.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("T0_ckv.f16"), bytes)?;
-            let v: Vec<f32> = part.download(t * a.heads * nsplit * (h.kv_lora + 2))?;
-            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("T0_part.f32"), bytes)?;
-            let lm: Vec<f32> = lat_merged.download(t * a.heads * h.kv_lora)?;
-            let bytes: Vec<u8> = lm.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("T0_latmerged.f32"), bytes)?;
-            let gl: Vec<f32> = gate.download(t * vd)?;
-            let bytes: Vec<u8> = gl.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(std::path::Path::new(&dir).join("T0_gate2.f32"), bytes)?;
+        } else {
+            let part = crate::session::f32s(t * a.heads * nsplit * (h.kv_lora + 2))?;
+            if let Some(list) = &ix_list {
+                // The groups this query recalled (`index_topk / pool - 1` plus its own), or every closed one under
+                // `MALLEUS_HY4_IX_ALL`; the same split and merge as the dense path, one kernel over the list.
+                let slots = list.len() / (t * 4);
+                model.k.get("hy4_mla_split_ix").launch(
+                    ((t * a.heads) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    st,
+                    &[
+                        (&part).into(),
+                        (&qt).into(),
+                        (&q).into(),
+                        ckv.into(),
+                        ckrot.into(),
+                        list.into(),
+                        sink.into(),
+                        sess.len.into(),
+                        t.into(),
+                        a.heads.into(),
+                        a.nope.into(),
+                        h.kv_lora.into(),
+                        a.rope.into(),
+                        (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                        nsplit.into(),
+                        h.index_pool.into(),
+                        slots.into(),
+                    ],
+                )?;
+            } else {
+                model.k.get("hy4_mla_split").launch(
+                    ((t * a.heads) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    st,
+                    &[
+                        (&part).into(),
+                        (&qt).into(),
+                        (&q).into(),
+                        ckv.into(),
+                        ckrot.into(),
+                        sink.into(),
+                        sess.len.into(),
+                        t.into(),
+                        a.heads.into(),
+                        a.nope.into(),
+                        h.kv_lora.into(),
+                        a.rope.into(),
+                        (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
+                        nsplit.into(),
+                        window.into(),
+                    ],
+                )?;
+            }
+            // The merge into a global buffer, then the V half of kv_b_proj and the gate: two kernels so that the
+            // latent the V projection reads is the one written, not a block of shared memory.
+            model.k.get("hy4_mla_merge").launch(
+                ((t * a.heads) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[(&lat_merged).into(), (&part).into(), h.kv_lora.into(), nsplit.into()],
+            )?;
+            if std::env::var("MALLEUS_HY4_DUMP_PART").is_ok() && li == 0 {
+                st.synchronize()?;
+                let dir = std::env::var("MALLEUS_DUMP_DIR")?;
+                let n_lat = crate::weights::kv_ctx(sess.max_ctx) * h.kv_lora;
+                let cache: Vec<u16> = ckv.download(n_lat)?;
+                let bytes: Vec<u8> = cache.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join("T0_ckv.f16"), bytes)?;
+                let v: Vec<f32> = part.download(t * a.heads * nsplit * (h.kv_lora + 2))?;
+                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join("T0_part.f32"), bytes)?;
+                let lm: Vec<f32> = lat_merged.download(t * a.heads * h.kv_lora)?;
+                let bytes: Vec<u8> = lm.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join("T0_latmerged.f32"), bytes)?;
+                let gl: Vec<f32> = gate.download(t * vd)?;
+                let bytes: Vec<u8> = gl.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(std::path::Path::new(&dir).join("T0_gate2.f32"), bytes)?;
+            }
         }
         // The V half of `kv_b_proj`: one bf16 WMMA GEMM per head over the whole chunk (a batch on `blockIdx.z`), then
         // the per-(head, dim) gate. As a per-(token, head) GEMV this read the 256 rows of a head one per thread — 32
