@@ -56,6 +56,96 @@ pub struct Config {
     pub swiglu: Option<Swiglu>,
     /// Hy4-flash geometry: iHC, the two attention shapes, the compressed indexer, the latent MoE and Engram.
     pub hy4: Option<Hy4Config>,
+    /// Inkling-2 geometry: attention residuals, short convolutions, the relative-position bias, the loop, the
+    /// vision tower and the MTP head.
+    pub inkling2: Option<Inkling2Config>,
+}
+
+/// Inkling-2 (`inkling2_loop`, issue #62): 24 layers of which the middle 12 run `passes` times, one attention
+/// residual per block of `attn_res_block` layers, a short convolution on every layer input and output, a
+/// relative-position bias in the full layers, 128 experts per layer, a vision tower and a loop-aware MTP head.
+#[derive(Clone, Debug)]
+pub struct Inkling2Config {
+    /// Query heads, their width, and the shared key/value heads of both attention kinds.
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    /// Backward distance the relative-position bias of the full layers covers, and the width of the per-head
+    /// relative state mixed into it.
+    pub rel_extent: usize,
+    pub d_rel: usize,
+    /// Position from which queries and relative states are scaled up logarithmically, and how strongly.
+    pub log_floor: usize,
+    pub log_alpha: f32,
+    /// Largest L2 norm of a query/key head vector and of a relative state; longer ones are scaled down.
+    pub qk_clip: f32,
+    pub rel_clip: f32,
+    /// Layers summed into one attention-residual block (`n_layers_per_attn_res_block`).
+    pub attn_res_block: usize,
+    /// Short-convolution kernel (`sconv_kernel_size`) and the window of the sliding layers.
+    pub sconv_k: usize,
+    pub window: usize,
+    /// Routed experts per layer, how many a token takes, their width, and the router scaling.
+    pub experts: usize,
+    pub top_k: usize,
+    pub moe_inter: usize,
+    pub route_scale: f32,
+    /// Softcaps of the experts' gate and up projections, and of the output logits.
+    pub gate_softcap: f32,
+    pub up_softcap: f32,
+    pub logit_softcap: f32,
+    /// Rows of the unembedding that hold real tokens (`unpadded_vocab_size`).
+    pub unpadded_vocab: usize,
+    /// The loop: the inclusive layer range it repeats, how many passes, and the rank of its gates.
+    pub loop_start: usize,
+    pub loop_end: usize,
+    pub loop_passes: usize,
+    pub loop_rank: usize,
+    /// The vision tower, when the checkpoint carries one.
+    pub vision: Option<Inkling2Vision>,
+    /// The MTP head (`mtp_config`), when the checkpoint carries one.
+    pub mtp: Option<Inkling2Mtp>,
+}
+
+/// Inkling-2's vision tower (`vision_config`): a 23-layer ViT with axial RoPE, then a two-layer merger.
+#[derive(Clone, Debug)]
+pub struct Inkling2Vision {
+    pub hidden: usize,
+    pub inter: usize,
+    pub heads: usize,
+    pub layers: usize,
+    /// Side of a native patch, the temporal patch size, and the side of the square merged into one token.
+    pub patch: usize,
+    pub temporal: usize,
+    pub merge: usize,
+    /// Side of the learned position grid.
+    pub grid: usize,
+    /// Width of the projector between the tower and the language model.
+    pub proj_hidden: usize,
+    pub eps: f32,
+    /// Token id of an image placeholder in the prompt.
+    pub image_token: u32,
+}
+
+/// The MTP head (`mtp_config`): 3 layers that propose a block of tokens, with a Markov correction on the logits.
+/// Its attention is the full/sliding pair of the text stack at its own head geometry (24 query heads here).
+#[derive(Clone, Debug)]
+pub struct Inkling2Mtp {
+    pub layers: usize,
+    pub inter: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_theta: f32,
+    pub window: usize,
+    /// Layers of the head that slide; the rest are full attention.
+    pub local: Vec<usize>,
+    /// Tokens per proposed block (`block_size`).
+    pub block: usize,
+    /// Width of the Markov embedding mixed into the logits (`markov_rank`).
+    pub markov_rank: usize,
+    /// Layer applications whose hidden states the head reads.
+    pub target_layers: Vec<usize>,
 }
 
 /// Hy4-flash (`hy_v4_flash`, issue #40). The two attention shapes and the two RoPE bases are per layer type, so
@@ -150,6 +240,9 @@ pub enum Family {
     /// Hy4-flash (`hy_v4_flash`): iHC streams, gated MLA with a learned sink, hybrid indexed/sliding attention,
     /// latent MoE and the Engram n-gram memories. Issue #40.
     Hy4,
+    /// Inkling-2 (`inkling2_loop`): attention residuals, short convolutions, a relative-position bias, a 12-layer
+    /// loop with cross-pass messages, 128 experts, a vision tower and an MTP head. Issue #62.
+    Inkling2,
 }
 
 impl Family {
@@ -159,6 +252,7 @@ impl Family {
             "qwen4_exp" => Family::Qwen4Exp,
             "bailing_hybrid" => Family::Ling3,
             "hy_v4_flash" => Family::Hy4,
+            "inkling2" | "inkling2_loop" | "inkling2_text" | "inkling2_loop_text" => Family::Inkling2,
             _ => return None,
         })
     }
@@ -179,6 +273,9 @@ pub enum MixerKind {
     Hy4Indexed,
     /// Hy4's local layer: gated MLA over the last `window` tokens, with its own (wider) head geometry.
     Hy4Sliding,
+    /// Inkling-2's global layer: full attention with a relative-position bias, a learned sink and an output gate,
+    /// instead of the sliding window of its other layers.
+    AttnFull,
 }
 
 /// MLA geometry, from `kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim` and `v_head_dim`.
@@ -280,6 +377,9 @@ impl Config {
             .context("config: unknown or missing model_type")?;
         if family == Family::Hy4 {
             return crate::hy4::config(&cfg, generation_config);
+        }
+        if family == Family::Inkling2 {
+            return crate::inkling2::config(&cfg, generation_config);
         }
         let ling = family == Family::Ling3;
         let t = if ling { &cfg } else { &cfg["text_config"] };
@@ -404,6 +504,7 @@ impl Config {
             dense_ffn: if ling { u("first_k_dense_replace")? } else { 0 },
             swiglu,
             hy4: None,
+            inkling2: None,
         };
         c.validate()?;
         Ok(c)
@@ -416,6 +517,9 @@ impl Config {
         );
         if self.family == Family::Hy4 {
             return crate::hy4::validate(self);
+        }
+        if self.family == Family::Inkling2 {
+            return crate::inkling2::validate(self);
         }
         ensure!(self.conv_k == 4, "reference kernels require conv kernel 4");
         ensure!(

@@ -192,6 +192,22 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
     ("mls3", &["gemv_mls3", "gemm_mls3", "moe_gate_up3", "moe_down3"]),
     ("kda", &["kda_scan", "kda_conv_norm"]),
     (
+        "inkling2",
+        &[
+            "inkling2_sconv",
+            "inkling2_l2_clip",
+            "inkling2_rms_unnorm",
+            "inkling2_rel_bias",
+            "inkling2_attn",
+            "inkling2_attn_res",
+            "inkling2_moe_route",
+            "inkling2_moe_act",
+            "inkling2_control",
+            "inkling2_softcap",
+            "inkling2_moe_acc",
+        ],
+    ),
+    (
         "hy4",
         &[
             "ihc_pre",

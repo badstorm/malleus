@@ -30,6 +30,17 @@ impl Default for RenderOptions<'_> {
     }
 }
 
+/// Hugging Face templates bracket the assistant spans with `{% generation %}` / `{% endgeneration %}`, the markers
+/// `return_assistant_tokens_mask` needs. They do not change the rendered text, and minijinja has no such statement,
+/// so they become `if true` blocks: the same whitespace control, and the pairing stays balanced.
+fn without_generation_markers(template: &str) -> String {
+    template
+        .replace("{%- generation -%}", "{%- if true -%}")
+        .replace("{%- endgeneration -%}", "{%- endif -%}")
+        .replace("{% generation %}", "{% if true %}")
+        .replace("{% endgeneration %}", "{% endif %}")
+}
+
 fn raise_exception(msg: String) -> Result<Value, Error> {
     Err(Error::new(ErrorKind::InvalidOperation, msg))
 }
@@ -43,7 +54,7 @@ impl Chat {
 
     pub fn from_parts(tokenizer_json: &[u8], template: String) -> Result<Self> {
         let tok = Tokenizer::from_bytes(tokenizer_json).map_err(|e| anyhow!("tokenizer: {e}"))?;
-        let tpl = template.clone();
+        let tpl = without_generation_markers(&template);
         let mut env = Environment::new();
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);

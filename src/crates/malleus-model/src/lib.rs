@@ -6,6 +6,7 @@ pub mod engine;
 pub mod expert_cache;
 pub mod hy4;
 pub mod image_pre;
+pub mod inkling2;
 pub mod kernels;
 pub mod layer;
 pub mod ling3;
