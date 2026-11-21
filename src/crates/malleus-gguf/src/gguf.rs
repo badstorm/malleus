@@ -117,6 +117,11 @@ impl Value {
     }
 }
 
+/// Longest metadata string a file may carry. A tokenizer of a 200k vocabulary is ~26 MB (`tokenizer.json` of
+/// Inkling-2), so the old 16 MiB cap refused a legitimate file; 256 MiB still keeps a corrupt length from asking
+/// the allocator for a machine's worth of memory.
+const MAX_STRING: usize = 1 << 28;
+
 struct Rd<R: Read> {
     r: R,
 }
@@ -135,7 +140,7 @@ impl<R: Read> Rd<R> {
     }
     fn string(&mut self) -> Result<String> {
         let n = self.u64()? as usize;
-        if n > 1 << 24 {
+        if n > MAX_STRING {
             bail!("string too long");
         }
         let mut b = vec![0u8; n];
@@ -551,6 +556,23 @@ mod tests {
         assert_eq!(g.read_all("a").unwrap(), a);
         assert_eq!(g.read_all("b").unwrap(), vec![7u8; 10]);
         assert!(g.malleus_arch().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A vocabulary larger than the old 16 MiB cap is still a file we must read: the tokenizer travels in the
+    /// metadata, not in a tensor.
+    #[test]
+    fn a_tokenizer_sized_string_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("malleus-gguf-bigstr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.gguf");
+        let tok = "{\"model\":{\"vocab\":".to_string() + &"a".repeat(20 << 20) + "}}";
+        let mut w = GgufWriter::new();
+        w.meta("tokenizer.huggingface.json", Value::Str(tok.clone()));
+        let s = w.begin(&p).unwrap();
+        s.finish().unwrap();
+        let g = Gguf::open(&p).unwrap();
+        assert_eq!(g.meta_str("tokenizer.huggingface.json").unwrap(), tok);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

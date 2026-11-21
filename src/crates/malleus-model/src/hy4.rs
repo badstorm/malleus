@@ -217,6 +217,7 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         dense_ffn: 1,
         swiglu: None,
         hy4: Some(hy4),
+        inkling2: None,
     };
     c.validate()?;
     Ok(c)

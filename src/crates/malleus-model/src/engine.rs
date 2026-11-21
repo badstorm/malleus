@@ -128,6 +128,14 @@ impl Model {
         if c.family == Family::Hy4 {
             return Self::load_hy4(cfg, src, opts, kernels, progress);
         }
+        // Inkling-2 has the map of its text tensors but not the graph yet: check the file against the map and say
+        // so, instead of failing later with a missing tensor.
+        if c.family == Family::Inkling2 {
+            for line in crate::inkling2::check(src, c)? {
+                eprintln!("{line}");
+            }
+            bail!("inkling2: text tensors mapped, the loader and the forward are the next increment of #62");
+        }
         // Read before `kernels` moves into the model: the int4 default for the MoE prefill depends on the GPU.
         let arch = kernels.arch.clone();
         // Ling stores its weights under `model.` and calls the embedding `word_embeddings`; Qwen nests them

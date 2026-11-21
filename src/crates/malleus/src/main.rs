@@ -290,7 +290,7 @@ fn open_converted(path: &Path) -> Result<Gguf> {
     let g = Gguf::open(path)?;
     let arch = g.malleus_arch()?;
     anyhow::ensure!(
-        matches!(arch, "qwen35" | "qwen4exp" | "ling3" | "hy4"),
+        matches!(arch, "qwen35" | "qwen4exp" | "ling3" | "hy4" | "inkling2"),
         "unsupported model family `{arch}`"
     );
     Ok(g)
