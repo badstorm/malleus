@@ -438,8 +438,111 @@ pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-/// The text graph, as the buffers the forward will read. The vision tower and the MTP head are still flat: their
-/// structures come with their own slices of the graph.
+/// The text graph and the vision tower, as the buffers the forward will read. The MTP head is still flat: its
+/// structure comes with its slice of the graph.
+/// The vision tower as the buffers its graph reads: 23 pre-norm blocks at 1024 wide, 16 heads of 64, a 4096-wide MLP
+/// with exact GELU, and the 2x2 merger projecting 4096 lanes to the text width.
+pub struct Vision {
+    pub proj_in: DeviceBuffer,
+    pub proj_out: DeviceBuffer,
+    pub ln_pre: (DeviceBuffer, DeviceBuffer),
+    pub class_embedding: DeviceBuffer,
+    pub cls_position: DeviceBuffer,
+    pub patch: DeviceBuffer,
+    pub position: DeviceBuffer,
+    pub layers: Vec<VisLayer>,
+    /// Patch side (the patch embedding covers one frame), temporal patch, merge side and the side of the learned
+    /// position grid.
+    pub patch_side: usize,
+    pub temporal: usize,
+    pub merge: usize,
+    pub grid: usize,
+}
+
+pub struct VisLayer {
+    pub ln_1: (DeviceBuffer, DeviceBuffer),
+    pub ln_2: (DeviceBuffer, DeviceBuffer),
+    pub ls_1: DeviceBuffer,
+    pub ls_2: DeviceBuffer,
+    pub fc: (DeviceBuffer, DeviceBuffer),
+    pub proj: (DeviceBuffer, DeviceBuffer),
+    pub q: (DeviceBuffer, DeviceBuffer),
+    pub k: (DeviceBuffer, DeviceBuffer),
+    pub v: (DeviceBuffer, DeviceBuffer),
+    pub out: (DeviceBuffer, DeviceBuffer),
+}
+
+impl Vision {
+    fn load(src: &dyn TensorSource, c: &Config, up: &mut Uploader) -> Result<Option<Self>> {
+        let v = match c.inkling2.as_ref().and_then(|i| i.vision.as_ref()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let p = |s: &str| format!("model.visual.{s}");
+        let b = |up: &mut Uploader, s: &str, shape: &[usize]| up.tensor(src, &p(s), shape);
+        let mut layers = Vec::with_capacity(v.layers);
+        for l in 0..v.layers {
+            let q = |s: &str| format!("backbone.layers.{l}.{s}");
+            let bb = |up: &mut Uploader, s: &str, shape: &[usize]| up.tensor(src, &p(&q(s)), shape);
+            layers.push(VisLayer {
+                ln_1: (bb(up, "ln_1.weight", &[v.hidden])?, bb(up, "ln_1.bias", &[v.hidden])?),
+                ln_2: (bb(up, "ln_2.weight", &[v.hidden])?, bb(up, "ln_2.bias", &[v.hidden])?),
+                ls_1: bb(up, "ls_1.gamma", &[v.hidden])?,
+                ls_2: bb(up, "ls_2.gamma", &[v.hidden])?,
+                fc: (
+                    bb(up, "mlp.c_fc.weight", &[v.inter, v.hidden])?,
+                    bb(up, "mlp.c_fc.bias", &[v.inter])?,
+                ),
+                proj: (
+                    bb(up, "mlp.c_proj.weight", &[v.hidden, v.inter])?,
+                    bb(up, "mlp.c_proj.bias", &[v.hidden])?,
+                ),
+                q: (
+                    bb(up, "self_attn.q_proj.weight", &[v.hidden, v.hidden])?,
+                    bb(up, "self_attn.q_proj.bias", &[v.hidden])?,
+                ),
+                k: (
+                    bb(up, "self_attn.k_proj.weight", &[v.hidden, v.hidden])?,
+                    bb(up, "self_attn.k_proj.bias", &[v.hidden])?,
+                ),
+                v: (
+                    bb(up, "self_attn.v_proj.weight", &[v.hidden, v.hidden])?,
+                    bb(up, "self_attn.v_proj.bias", &[v.hidden])?,
+                ),
+                out: (
+                    bb(up, "self_attn.out_proj.weight", &[v.hidden, v.hidden])?,
+                    bb(up, "self_attn.out_proj.bias", &[v.hidden])?,
+                ),
+            });
+        }
+        Ok(Some(Vision {
+            proj_in: b(up, "proj_in.weight", &[v.proj_hidden, v.proj_hidden])?,
+            proj_out: b(up, "proj_out.weight", &[c.hidden, v.proj_hidden])?,
+            ln_pre: (
+                b(up, "backbone.ln_pre.weight", &[v.hidden])?,
+                b(up, "backbone.ln_pre.bias", &[v.hidden])?,
+            ),
+            class_embedding: b(up, "backbone.embeddings.class_embedding", &[v.hidden])?,
+            cls_position: b(up, "backbone.embeddings.cls_position_embedding", &[v.hidden])?,
+            patch: b(
+                up,
+                "backbone.embeddings.patch_embedding.weight",
+                &[v.hidden, 3 * v.patch * v.patch],
+            )?,
+            position: b(
+                up,
+                "backbone.embeddings.position_embedding",
+                &[v.hidden, v.grid * v.grid],
+            )?,
+            layers,
+            patch_side: v.patch,
+            temporal: v.temporal,
+            merge: v.merge,
+            grid: v.grid,
+        }))
+    }
+}
+
 pub struct Weights {
     pub embed: DeviceBuffer,
     pub embed_norm: DeviceBuffer,
@@ -452,7 +555,7 @@ pub struct Weights {
     pub cross_pass_q: DeviceBuffer,
     pub cross_pass_kv: DeviceBuffer,
     pub layers: Vec<Layer>,
-    pub vision: Vec<(String, DeviceBuffer)>,
+    pub vision: Option<Vision>,
     pub mtp: Vec<(String, DeviceBuffer)>,
     pub bytes: usize,
 }
@@ -637,16 +740,12 @@ impl Weights {
             });
         }
         progress(c.n_layers, c.n_layers);
-        // The two halves that do not have a structure yet: their names and buffers, in map order.
-        let mut flat = |part: fn(&Config) -> Result<Vec<Expected>>| -> Result<Vec<(String, DeviceBuffer)>> {
-            let mut v = Vec::new();
-            for e in part(c)? {
-                v.push((e.name.clone(), up.typed(src, &e.name, e.dtype, &e.shape)?));
-            }
-            Ok(v)
-        };
-        let vision = flat(vision_map)?;
-        let mtp = flat(mtp_map)?;
+        let vision = Vision::load(src, c, &mut up)?;
+        // The MTP head has no structure yet: its names and buffers, in map order.
+        let mut mtp = Vec::new();
+        for e in mtp_map(c)? {
+            mtp.push((e.name.clone(), up.typed(src, &e.name, e.dtype, &e.shape)?));
+        }
         Ok(Weights {
             embed,
             embed_norm,
