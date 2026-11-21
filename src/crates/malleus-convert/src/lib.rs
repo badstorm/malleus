@@ -12,7 +12,10 @@
 //! - `model.layers.N.mlp.experts.{gate_up_proj,down_proj}` (Ling-3.0-flash): the per-expert tensors fused into one
 //!   [E, rows, K] tensor per layer; in `gate_up` the gate rows of each expert come before its up rows (ADR 0002).
 
+pub mod dequant;
+
 use anyhow::{Context, Result, bail, ensure};
+use malleus_gguf::fpquant::{MXFP8_BLOCK, NVFP4_BLOCK, mxfp8_rows, nvfp4_rows};
 use malleus_gguf::gguf::{ARCH_PREFIX, GgufWriter, Value};
 use malleus_gguf::quant::{self, BLOCK, HADAMARD_SEED, Int2Grid, LAYOUT_VERSION};
 use malleus_gguf::safetensors::SafeTensors;
@@ -112,6 +115,10 @@ pub enum Family {
     /// Hy4-flash (`hy_v4_flash`): iHC streams, gated MLA with a learned sink, hybrid sparse/sliding layers, a
     /// compressed indexer, latent MoE, Engram n-gram memories and a vision tower.
     Hy4,
+    /// Inkling-2 (`inkling2_loop`): 24 layers of which 12 run three times, attention residuals per block, short
+    /// convolutions and a relative-position bias, 128 experts per layer, a vision tower and a loop-aware MTP head.
+    /// Its routed experts arrive packed (NVFP4 or MXFP8) and are dequantised while they are read.
+    Inkling2,
 }
 
 impl Family {
@@ -122,6 +129,7 @@ impl Family {
             "qwen4_exp" => Family::Qwen4Exp,
             "bailing_hybrid" => Family::Ling3,
             "hy_v4_flash" => Family::Hy4,
+            "inkling2" | "inkling2_loop" | "inkling2_text" | "inkling2_loop_text" => Family::Inkling2,
             t => bail!("unsupported model_type `{t}`"),
         })
     }
@@ -148,6 +156,7 @@ impl Family {
             Family::Ling3 => "ling3",
             Family::Dflash => "dflash",
             Family::Hy4 => "hy4",
+            Family::Inkling2 => "inkling2",
         }
     }
 
@@ -162,6 +171,8 @@ impl Family {
             Family::Dflash => false,
             // The routed experts alone are ~75 GB: a second copy is 75 GB more on a machine that holds 122 GB.
             Family::Hy4 => false,
+            // Inkling-2 has no measurement of what an MLS8 prefill would buy: single copy until one exists.
+            Family::Inkling2 => false,
         }
     }
 
@@ -175,7 +186,7 @@ impl Family {
         mls3: Option<(usize, usize)>,
         mls2: Option<(usize, usize)>,
     ) -> Kind {
-        if name == "lm_head.weight" {
+        if name == "lm_head.weight" || (self == Family::Inkling2 && name.ends_with(".unembed.weight")) {
             return Kind::Mls8;
         }
         // The vision tower is 0.9 GB and runs on a handful of positions per image: it stays bf16 as stored.
@@ -190,6 +201,7 @@ impl Family {
             Family::Ling3 => LING3_MLS4_SUFFIXES,
             Family::Dflash => DFLASH_MLS4_SUFFIXES,
             Family::Hy4 => HY4_MLS4_SUFFIXES,
+            Family::Inkling2 => INKLING2_MLS4_SUFFIXES,
         };
         // The Engram key projections are one 2-D linear per hyper-connection channel (`key_projs.N.weight`), so a
         // suffix does not name them.
@@ -245,7 +257,7 @@ impl Family {
                 let last = u("num_hidden_layers") + u("num_nextn_predict_layers");
                 last.checked_sub(1 + MLS3_SKIP_LAST_LAYERS).map(|to| (from, to))
             }
-            Family::Qwen35 | Family::Qwen4Exp | Family::Dflash | Family::Hy4 => None,
+            Family::Qwen35 | Family::Qwen4Exp | Family::Dflash | Family::Hy4 | Family::Inkling2 => None,
         }
     }
 
@@ -261,7 +273,7 @@ impl Family {
                 };
                 t["num_hidden_layers"].as_u64().map(|n| (0, n as usize - 1))
             }
-            Family::Qwen35 | Family::Ling3 | Family::Dflash | Family::Hy4 => None,
+            Family::Qwen35 | Family::Ling3 | Family::Dflash | Family::Hy4 | Family::Inkling2 => None,
         }
     }
 }
@@ -382,6 +394,32 @@ const LING3_MLS4_SUFFIXES: &[&str] = &[
 /// qwen4_exp tensors that stay MLS8 in decode too.
 const MLS8_SUFFIXES: &[&str] = &["ple.key_proj.weight", "ple.value_proj.weight"];
 
+/// Inkling-2 linears that go to MLS4: the attention projections and the routed experts. Everything else stays raw:
+/// the norms, the short-convolution kernels, the L2 clip scales, the attention sink, the router (`mlp.gate`) and its
+/// bias, the attention-residual queries (f32), the loop controllers and the vision tower.
+///
+/// `attn.rel_logits_proj.proj` stays raw on purpose: it does not compute an output, it *scores* relative positions,
+/// and 4 bits there move the scores that decide what the attention reads.
+const INKLING2_MLS4_SUFFIXES: &[&str] = &[
+    "attn.wq_du.weight",
+    "attn.wk_dv.weight",
+    "attn.wv_dv.weight",
+    "attn.wo_ud.weight",
+    "attn.wr_du.weight",
+    "attn.gate_attn.weight",
+    // The MTP head's own layers and its two dense projections.
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+    // Routed experts: packed in the checkpoint, fused already, dequantised while the file is written.
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+];
+
 fn layer_index(name: &str) -> Option<usize> {
     let rest = name.split("layers.").nth(1)?;
     rest.split('.').next()?.parse().ok()
@@ -456,6 +494,73 @@ fn read_calibrated(c: &SafeTensors, o: &Out, rows: usize, k: usize) -> Result<(V
         s[p.row0 * sn * 2..(p.row0 + p.rows) * sn * 2].copy_from_slice(&sc);
     }
     Ok((q, s))
+}
+
+/// Reads `rows` rows starting at flat row `row0` of a part as f32 values. A source in a packed expert format
+/// (NVFP4: U8 codes with one e4m3 scale per 16 columns and an outer `amax / denominator`; MXFP8: e4m3 codes with
+/// one ue8m0 scale per 32) is dequantised on the way, so the caller sees the weights the checkpoint means.
+fn read_part(st: &SafeTensors, p: &Part, row0: usize, rows: usize) -> Result<Vec<f32>> {
+    let info = st
+        .info(&p.src)
+        .with_context(|| format!("{}: not in the checkpoint", p.src))?;
+    match info.dtype {
+        DType::BF16 => {
+            let mut raw = vec![0u8; rows * p.k * 2];
+            st.read(&p.src, row0 * p.k * 2, &mut raw)?;
+            Ok(bf16_rows(&raw))
+        }
+        DType::U8 | DType::F8E4M3 => {
+            let nvfp4 = info.dtype == DType::U8;
+            ensure!(
+                info.shape.len() == 3,
+                "{}: a packed expert tensor is [experts, rows, cols], got {:?}",
+                p.src,
+                info.shape
+            );
+            let per = info.shape[1];
+            let cols = if nvfp4 { info.shape[2] * 2 } else { info.shape[2] };
+            ensure!(cols == p.k, "{}: {cols} columns, the part says {}", p.src, p.k);
+            let (row_bytes, block) = if nvfp4 {
+                (cols / 2, NVFP4_BLOCK)
+            } else {
+                (cols, MXFP8_BLOCK)
+            };
+            let scale = format!("{}_scale", p.src);
+            let mut out = vec![0f32; rows * cols];
+            let (mut rel, mut done) = (row0, 0);
+            while done < rows {
+                let (e, r) = (rel / per, rel % per);
+                let nr = (per - r).min(rows - done);
+                let mut q = vec![0u8; nr * row_bytes];
+                let mut s = vec![0u8; nr * (cols / block)];
+                st.read(&p.src, (e * per + r) * row_bytes, &mut q)?;
+                st.read(&scale, (e * per + r) * (cols / block), &mut s)?;
+                let chunk = &mut out[done * cols..(done + nr) * cols];
+                if nvfp4 {
+                    nvfp4_rows(&q, &s, outer_scale(st, &p.src, e)?, cols, chunk);
+                } else {
+                    mxfp8_rows(&q, &s, cols, chunk);
+                }
+                rel += nr;
+                done += nr;
+            }
+            Ok(out)
+        }
+        d => bail!("{}: {d:?} cannot be read as rows", p.src),
+    }
+}
+
+/// The outer scale of expert `e` of a packed NVFP4 tensor: `amax / denominator`, from its companions.
+fn outer_scale(st: &SafeTensors, name: &str, e: usize) -> Result<f32> {
+    let amax = st.read_all(&format!("{name}_amax"))?;
+    let den = st.read_all(&format!("{name}_outer_scale_denominator"))?;
+    ensure!(den.len() == 4, "{name}_outer_scale_denominator: not one f32");
+    ensure!(amax.len() >= (e + 1) * 4, "{name}_amax: shorter than its expert count");
+    let d = f32::from_le_bytes([den[0], den[1], den[2], den[3]]);
+    let a = f32::from_le_bytes([amax[e * 4], amax[e * 4 + 1], amax[e * 4 + 2], amax[e * 4 + 3]]);
+    ensure!(d > 0.0 && d.is_finite(), "{name}_outer_scale_denominator: {d}");
+    ensure!(a >= 0.0 && a.is_finite(), "{name}_amax expert {e}: {a}");
+    Ok(a / d)
 }
 
 fn bf16_rows(bytes: &[u8]) -> Vec<f32> {
@@ -690,6 +795,48 @@ fn plan(
                 prefill: false,
             }
         };
+        // Inkling-2 packs its routed experts per layer into two tensors (`w13` = gate+up, `w2` = down), already in
+        // the fused shape and row order: the plan only renames them. The companions (`_scale`, `_amax`,
+        // `_outer_scale_denominator`) are read by the dequantiser and dropped here.
+        if name.ends_with(".mlp.experts.w13_weight") || name.ends_with(".mlp.experts.w2_weight") {
+            let gate_up = name.ends_with("w13_weight");
+            let prefix = name
+                .strip_suffix(if gate_up { "w13_weight" } else { "w2_weight" })
+                .unwrap();
+            // The packed tensor's last dimension counts codes, not columns: two per byte for NVFP4.
+            ensure!(
+                info.shape.len() == 3 && matches!(info.dtype, DType::U8 | DType::F8E4M3),
+                "{name}: a packed expert tensor is [E, rows, codes] in U8 or F8_E4M3, got {:?} {:?}",
+                info.dtype,
+                info.shape
+            );
+            let last = info.shape[2];
+            let cols = if info.dtype == DType::U8 { last * 2 } else { last };
+            let rows = info.shape[0] * info.shape[1];
+            let shape = vec![info.shape[0], info.shape[1], cols];
+            let out_name = format!("{prefix}{}", if gate_up { "gate_up_proj" } else { "down_proj" });
+            let kind = fam.classify(&out_name, &shape, opts, mls3, mls2);
+            ensure!(kind != Kind::Raw, "{out_name}: experts must be quantized");
+            outs.push(Out {
+                name: out_name,
+                kind,
+                shape,
+                parts: vec![Part {
+                    src: name.clone(),
+                    row0: 0,
+                    rows,
+                    k: cols,
+                }],
+                prefill: false,
+            });
+            continue;
+        }
+        if name.ends_with("_weight_scale")
+            || name.ends_with("_weight_amax")
+            || name.ends_with("_weight_outer_scale_denominator")
+        {
+            continue;
+        }
         if let Some(hc) = name.strip_suffix("input_mix_weight_down.weight") {
             let (r, k) = rows_cols(&info.shape);
             let inject = format!("{hc}block_inject_weight.weight");
@@ -858,6 +1005,8 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
         Family::Dflash => None,
         // Hy4 stores its routed experts fused (`[E, 2 * latent, latent]`), latent MoE included.
         Family::Hy4 => None,
+        // Inkling-2 already stores its routed experts fused, one 3-D tensor per projection and layer.
+        Family::Inkling2 => None,
         Family::Qwen35 | Family::Qwen4Exp => {
             let t = if cfg["text_config"].is_object() {
                 &cfg["text_config"]
@@ -1088,9 +1237,7 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
                 if a >= b {
                     continue;
                 }
-                let mut raw = vec![0u8; (b - a) * p.k * 2];
-                st.read(&p.src, (a - p.row0) * p.k * 2, &mut raw)?;
-                let src = bf16_rows(&raw);
+                let src = read_part(&st, p, a - p.row0, b - a)?;
                 for r in 0..b - a {
                     let d = (a - r0 + r) * k;
                     wf[d..d + p.k].copy_from_slice(&src[r * p.k..(r + 1) * p.k]);

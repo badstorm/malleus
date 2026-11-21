@@ -31,6 +31,10 @@ pub const GGML_MLS3: u32 = 0x4D4C_0003;
 pub const GGML_MLS4: u32 = 0x4D4C_0004;
 pub const GGML_MLS8: u32 = 0x4D4C_0008;
 pub const GGML_ROW_I4: u32 = 0x4D4C_0014;
+/// Raw bytes and e4m3 bytes: what a release's packed experts are read as before dequantisation. A `.malleus` file
+/// never carries them; the ids exist so the dtype round-trips.
+pub const GGML_U8: u32 = 0x4D4C_0015;
+pub const GGML_F8_E4M3: u32 = 0x4D4C_0016;
 
 fn dtype_to_ggml(d: DType) -> u32 {
     match d {
@@ -45,6 +49,8 @@ fn dtype_to_ggml(d: DType) -> u32 {
         DType::Mls4 => GGML_MLS4,
         DType::Mls8 => GGML_MLS8,
         DType::RowI4 => GGML_ROW_I4,
+        DType::U8 => GGML_U8,
+        DType::F8E4M3 => GGML_F8_E4M3,
     }
 }
 
@@ -61,6 +67,8 @@ fn ggml_to_dtype(t: u32) -> Result<DType> {
         GGML_MLS4 => DType::Mls4,
         GGML_MLS8 => DType::Mls8,
         GGML_ROW_I4 => DType::RowI4,
+        GGML_U8 => DType::U8,
+        GGML_F8_E4M3 => DType::F8E4M3,
         _ => bail!("unsupported ggml type {t}"),
     })
 }
