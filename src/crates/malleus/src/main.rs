@@ -2040,6 +2040,58 @@ fn kernel_test() -> Result<()> {
             }
         }
         println!("inkling2_attn      rel err {:.2e}", rel_err(&want, &got));
+        // Attention residual: 4 states, 3 queries, 2304 wide, at 2 positions.
+        let (tr, nr, hd, nqr) = (2usize, 4usize, 2304usize, 3usize);
+        let xr: Vec<f32> = (0..tr * nr * hd).map(|_| rnd()).collect();
+        let qr: Vec<f32> = (0..nqr * hd).map(|_| rnd()).collect();
+        let (xrd, qrd) = (DeviceBuffer::from_slice(&xr)?, DeviceBuffer::from_slice(&qr)?);
+        let ord = DeviceBuffer::zeroed(tr * nqr * hd * 4)?;
+        k.get("inkling2_attn_res").launch(
+            ((tr * nqr) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &s,
+            &[
+                (&ord).into(),
+                (&qrd).into(),
+                (&xrd).into(),
+                tr.into(),
+                nr.into(),
+                hd.into(),
+                nqr.into(),
+                1e-6f32.into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let got = ord.download::<f32>(tr * nqr * hd)?;
+        let mut want = vec![0f32; tr * nqr * hd];
+        for tt in 0..tr {
+            for qi in 0..nqr {
+                let mut sc = vec![0f32; nr];
+                let mut fac = vec![0f32; nr];
+                for j in 0..nr {
+                    let row = &xr[(tt * nr + j) * hd..(tt * nr + j + 1) * hd];
+                    let ms = row.iter().map(|v| v * v).sum::<f32>() / hd as f32;
+                    fac[j] = 1.0 / (ms + 1e-6).sqrt();
+                    sc[j] = row
+                        .iter()
+                        .zip(&qr[qi * hd..(qi + 1) * hd])
+                        .map(|(v, qv)| v * fac[j] * qv)
+                        .sum::<f32>()
+                        / (hd as f32).sqrt();
+                }
+                let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let sum: f32 = sc.iter().map(|v| (v - mx).exp()).sum();
+                for i in 0..hd {
+                    let mut acc = 0f32;
+                    for j in 0..nr {
+                        acc += (sc[j] - mx).exp() / sum * xr[(tt * nr + j) * hd + i] * fac[j];
+                    }
+                    want[(tt * nqr + qi) * hd + i] = acc;
+                }
+            }
+        }
+        println!("inkling2_attn_res  rel err {:.2e}", rel_err(&want, &got));
     }
     Ok(())
 }

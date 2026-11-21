@@ -146,3 +146,61 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, cons
     const float g = gate ? gate[((size_t)t * heads + h) * dim + r] : 1.f;
     out[((size_t)t * heads + h) * dim + r] = acc / (1.f + expf(-g));
 }
+
+// The attention residual (issue #62): a learned query attends over the running stack of block states plus the
+// current partial state. `x` is [T, n, hidden] (the stack of `n` states at every position), `q` is [nq, hidden]
+// (1 query per layer, 3 in the full layers), and `out` is [T, nq, hidden]. Every state row is normed with an
+// unweighted RMSNorm first, and the softmax is over the n states.
+extern "C" __global__ void __launch_bounds__(256) inkling2_attn_res(float* out, const float* q, const float* x, int T,
+                                                                   int n, int hidden, int nq, float eps) {
+    __shared__ float red[256];
+    __shared__ float sc[16];
+    __shared__ float fac[16];
+    const int t = blockIdx.x / nq, qi = blockIdx.x % nq;
+    const int r = threadIdx.x;
+    for (int j = 0; j < n; ++j) {
+        float s = 0.f;
+        for (int i = r; i < hidden; i += 256) {
+            const float v = x[((size_t)t * n + j) * hidden + i];
+            s += v * v;
+        }
+        red[r] = s;
+        __syncthreads();
+        for (int o = 128; o > 0; o >>= 1) {
+            if (r < o) red[r] += red[r + o];
+            __syncthreads();
+        }
+        if (r == 0) fac[j] = rsqrtf(red[0] / (float)hidden + eps);
+        __syncthreads();
+    }
+    for (int j = 0; j < n; ++j) {
+        float s = 0.f;
+        for (int i = r; i < hidden; i += 256) {
+            s += q[qi * hidden + i] * x[((size_t)t * n + j) * hidden + i] * fac[j];
+        }
+        red[r] = s;
+        __syncthreads();
+        for (int o = 128; o > 0; o >>= 1) {
+            if (r < o) red[r] += red[r + o];
+            __syncthreads();
+        }
+        if (r == 0) sc[j] = red[0] * rsqrtf((float)hidden);
+        __syncthreads();
+    }
+    if (r == 0) {
+        float mx = sc[0];
+        for (int j = 1; j < n; ++j) mx = fmaxf(mx, sc[j]);
+        float sum = 0.f;
+        for (int j = 0; j < n; ++j) {
+            sc[j] = expf(sc[j] - mx);
+            sum += sc[j];
+        }
+        for (int j = 0; j < n; ++j) sc[j] /= sum;
+    }
+    __syncthreads();
+    for (int i = r; i < hidden; i += 256) {
+        float acc = 0.f;
+        for (int j = 0; j < n; ++j) acc += sc[j] * x[((size_t)t * n + j) * hidden + i] * fac[j];
+        out[((size_t)t * nq + qi) * hidden + i] = acc;
+    }
+}
