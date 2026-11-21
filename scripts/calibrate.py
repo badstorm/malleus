@@ -662,6 +662,7 @@ class expert_stats:
         self.h_gu = torch.zeros(e, k, k, device=dev)
         self.h_dn = torch.zeros(e, n2 // 2, n2 // 2, device=dev)
         self.count = torch.zeros(e, dtype=torch.long)
+        self.accumulate = True
         self.orig = mod.forward
         mod.forward = self.forward
 
@@ -674,17 +675,18 @@ class expert_stats:
         for e in torch.unique(top_k_index).tolist():
             tok_idx, pos = torch.where(top_k_index == e)
             x = hidden_states[tok_idx]
-            xr = rotate(x.float(), self.rot)
-            self.h_gu[e] += xr.T @ xr
             gu = torch.nn.functional.linear(x, m.gate_up_proj[e])
             if hasattr(m, "_apply_gate"):  # Hy4 clamps its SwiGLU; the module owns the exact gate.
                 a = m._apply_gate(gu)
             else:
                 gate, up = gu.chunk(2, dim=-1)
                 a = m.act_fn(gate) * up
-            ar = rotate(a.float(), self.rot)
-            self.h_dn[e] += ar.T @ ar
-            self.count[e] += x.shape[0]
+            if self.accumulate:
+                xr = rotate(x.float(), self.rot)
+                self.h_gu[e] += xr.T @ xr
+                ar = rotate(a.float(), self.rot)
+                self.h_dn[e] += ar.T @ ar
+                self.count[e] += x.shape[0]
             y = torch.nn.functional.linear(a, m.down_proj[e]) * top_k_weights[tok_idx, pos, None]
             out.index_add_(0, tok_idx, y.to(out.dtype))
         return out
@@ -872,8 +874,6 @@ def main():
                     layer(x, **kw[j][types[li]])
         for h in hooks:
             h.remove()
-        if routed is not None:
-            moe.detach()
         t_h = time.time() - tl
 
         with torch.no_grad():
@@ -922,7 +922,9 @@ def main():
                     if "rtn2" in loss:
                         line += f" | rtn2 {loss['rtn2']:.3e} gptq2 {loss['gptq2']:.3e}"
                     print(line, flush=True)
-                del moe
+                # The Hessians are done: the same fast loop now just propagates the dequantized weights, instead of
+                # the module's one_hot over 513 experts on a 65k-token batch.
+                moe.accumulate = False
             t_q = time.time() - tl - t_h
             from safetensors.torch import save_file
             save_file(tensors, str(out / f"layer_{li:02d}.safetensors"), metadata={"format": "mls4-gptq"})
@@ -932,6 +934,8 @@ def main():
             else:
                 for j, x in enumerate(hidden):
                     hidden[j] = layer(x, **kw[j][types[li]])
+            if routed is not None:
+                moe.detach()
         meta = {"samples": len(samples), "length": args.length, "damp": args.damp, "holdout": args.holdout}
         json.dump({**meta, "tensors": report}, open(out / "report.json", "w"), indent=1)
         print(f"layer {li} done in {time.time() - tl:.0f}s (stats {t_h:.0f}s, gptq {t_q:.0f}s, "
