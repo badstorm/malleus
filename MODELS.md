@@ -222,6 +222,40 @@ flash-attention: 16 rows per tile reuse one K/V read, which is where the other ~
 loop to lift the `[heads, T, T]` bias buffer (6.4 GB at 8K tokens) and to allow chunked prefill — today a prompt goes
 through one forward and the server uses the whole prompt.
 
+What 1 000 tok/s would take: 8.7 GFLOP per token in 1 ms, i.e. 8.7 TFLOPS sustained over the whole graph. The
+grouped MoE alone already measures ~8 TFLOPS, so the experts are not the problem; the projections run at ~0.9 (they
+are 2.4 GFLOP per token and 2.7 ms of the 3.46 the non-attention path costs) and the machine's practical int8-WMMA
+ceiling, measured on that same MoE, is ~9.6 TFLOPS. A tiled attention plus projections at the level the engine
+already reaches for Ornith (5-6 TFLOPS) gives ~1.5-1.7 ms per token, i.e. **600-660 tok/s**: that is the honest
+target on a 16-CU gfx1150. The 1 000 mark needs 40 CUs: on gfx1151 the same kernels are 2.5× the compute and 2.9×
+the bandwidth, and that is where the number becomes reachable.
+
+### What the context costs
+
+Fresh prompt at every depth (one forward, as the graph runs today), and the same prompt with the attention kernel
+removed by ablation — the rest of the graph, at the same weights:
+
+| depth | prefill today | prefill without the attention kernel | decode today |
+|---|---|---|---|
+| 512 | 214.3 tok/s | **288.3** | 12.9 tok/s |
+| 2 048 | 119.4 | **289.1** | 9.6 |
+| 4 096 | 91.6 | — | 8.5 |
+| 8 192 | 63.4 | 289.1 | 6.95 |
+
+Everything that is not attention is **flat with depth**: 289 tok/s at 512 tokens and 289 at 8 192, i.e. 3.46 ms per
+token for 8.7 GFLOP of experts and projections (2.5 TFLOPS). The degradation is one kernel: `inkling2_attn` reads the
+K and V of every visible key for every query row, with no reuse across the 16 rows a tile could share, so its traffic
+is `depth × 8 KiB` per slot per token — 832 MiB per token at 8 192 tokens over the 48 slots, which is 10.4 ms of
+bandwidth against the 15.8 ms a token takes. Tiling the queries would divide that traffic by 16 and make the
+attention compute-bound: ~0.2 ms per token at 8 K, so the projection is ~270 tok/s at 8 K (retention 95 % instead of
+30 %) and ~200 at 32 K.
+
+Decode has the same shape of problem from the other side: 78 ms per token at a 512-token context, of which 28 is the
+2.24 GB of weights at the bandwidth wall, ~4 the sliding layers' 1024-key window and the rest the decode attention
+kernel, which runs at ~5 GB/s of effective traffic where the machine does 80. At the wall decode would keep
+~30 tok/s to 8 K and ~23 at 32 K with fp16 keys and values (halving the full slots' traffic); today the eight
+full-attention slots read `32 KiB` per position per token in fp32.
+
 **Against the production model** (Ornith-1.5-35B-A3B, same machine, `malleus bench`): prefill 214.1 against 968.5
 tok/s at depth 0, decode 12.8 against 29.08 (MTP off on both sides). The prefill gap is now all in the attention;
 the decode gap is the bandwidth of 2.24 GB per token against Ornith's ~0.7, i.e. the loop reading the core layers
