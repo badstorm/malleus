@@ -1654,12 +1654,17 @@ fn resize_u8(src: &[u8], h: usize, w: usize, nh: usize, nw: usize, c: usize) -> 
 /// row-major patches of `patch x patch` in `(channel, y, x)` order. Returns the flat patch tensor and the patch
 /// grid.
 pub(crate) fn preprocess(rgb: &[u8], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize)> {
+    preprocess_with(rgb, h, w, 4194304)
+}
+
+/// The same with the patch budget the request path imposes (`MALLEUS_VISION_MAX_PATCHES`): the tower's attention is
+/// quadratic in the patches, so the API caps it instead of accepting a 12 Mpx photo.
+pub(crate) fn preprocess_with(rgb: &[u8], h: usize, w: usize, max_pixels: usize) -> Result<(Vec<f32>, usize, usize)> {
     const PATCH: usize = 16;
     const MERGE: usize = 2;
     const MIN_PIXELS: usize = 4096;
-    const MAX_PIXELS: usize = 4194304;
     ensure!(rgb.len() >= h * w * 3, "rgb buffer too small");
-    let (rh, rw) = smart_resize(h, w, PATCH * MERGE, MIN_PIXELS, MAX_PIXELS);
+    let (rh, rw) = smart_resize(h, w, PATCH * MERGE, MIN_PIXELS, max_pixels.max(MIN_PIXELS));
     let img = resize_u8(rgb, h, w, rh, rw, 3);
     let (gh, gw) = (rh / PATCH, rw / PATCH);
     let mut out = vec![0f32; gh * gw * 3 * PATCH * PATCH];
@@ -1727,6 +1732,39 @@ pub(crate) fn image_positions(
     }
     ensure!(img == grids.len(), "fewer image blocks than images");
     Ok(out)
+}
+
+/// The image path the request scheduler needs, without exposing `Vision` outside the model crate.
+impl crate::engine::Model {
+    pub fn hy4_vision_merge(&self) -> Option<usize> {
+        self.hy4_vision.as_ref().map(|v| v.rows)
+    }
+
+    /// Preprocess one decoded RGB image with Hy4's own policy, run the tower and return the merged features
+    /// `[rows, hidden]` plus the patch grid. The caller expands the prompt and matches the block positions.
+    pub fn hy4_image_features(
+        &self,
+        rgb: &[u8],
+        h: usize,
+        w: usize,
+        max_patches: usize,
+    ) -> Result<(Vec<f32>, usize, usize)> {
+        let v = self.hy4_vision.as_ref().context("the file has no vision tower")?;
+        let (pixels, gh, gw) = preprocess_with(rgb, h, w, max_patches.max(1) * 16 * 16)?;
+        let (_, merged) = vision_forward(self, v, &pixels, gh, gw)?;
+        Ok((merged, gh, gw))
+    }
+
+    /// The 3-D M-RoPE positions of a prompt whose image placeholders were expanded with the newline column.
+    pub fn hy4_image_positions(
+        &self,
+        tokens: &[u32],
+        image_token: u32,
+        grids: &[(usize, usize, usize)],
+    ) -> Result<Vec<[i32; 3]>> {
+        let merge = self.hy4_vision_merge().context("the file has no vision tower")?;
+        image_positions(tokens, image_token, merge, grids)
+    }
 }
 
 /// The precision `nn.RMSNorm` uses when its eps is left to the dtype (the Engram norms do that).
@@ -2990,6 +3028,7 @@ pub(crate) fn forward(
     tokens: &[u32],
     positions: Option<&[[i32; 3]]>,
     n_logits: usize,
+    inserts: &[(usize, &DeviceBuffer)],
 ) -> Result<Vec<f32>> {
     use crate::engine::Act;
     let c = &model.cfg;
@@ -3036,9 +3075,9 @@ pub(crate) fn forward(
             tokens.split_at(t - hy4_max_chunk())
         };
         for part in head.chunks(hy4_max_chunk()) {
-            forward(model, sess, part, None, 1)?;
+            forward(model, sess, part, None, 1, &[])?;
         }
-        return forward(model, sess, tail, None, n_logits);
+        return forward(model, sess, tail, None, n_logits, &[]);
     }
     ensure!(
         t <= hy4_max_chunk() || (0..c.n_layers).all(|li| ring_rows(c, li, sess.max_ctx) == 0),
@@ -3167,6 +3206,12 @@ pub(crate) fn forward(
     if let Some((start, rows, feat)) = &image {
         let buf = DeviceBuffer::from_slice(feat)?;
         sc.x.copy_from(start * c.hidden * 4, &buf, 0, rows * c.hidden * 4, st)?;
+    }
+    // The request scheduler's image blocks: merged features already on the device, indexed against this call.
+    for (start, buf) in inserts {
+        let rows = buf.len() / (c.hidden * 4);
+        ensure!(start + rows <= t, "embedding insert out of range");
+        sc.x.copy_from(start * c.hidden * 4, buf, 0, rows * c.hidden * 4, st)?;
     }
     // The streams are the embedding repeated `hc_mult` times.
     let sd = h.hc_mult * c.hidden;
