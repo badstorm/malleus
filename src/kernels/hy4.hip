@@ -1029,12 +1029,15 @@ extern "C" __global__ void __launch_bounds__(256) hy4_absorb_wmma(float* out, co
 // qd covers dims 144 qd .. 144 qd + 143 of the 576 (Q held in registers, prescaled), and the four partial tiles are
 // summed through LDS; for the output it covers latent dims 128 qd .. 128 qd + 127. The online softmax starts from
 // (m, l) = (sink, 1), as the first split does. Keys [first, len + ti]: the window of a sliding layer or everything.
+// With `list` (the compressed indexer's groups of each token, [t, nsel], -1 for none, `pool` == 4 keys each) a tile is
+// four of the token's groups instead of 16 consecutive keys, the same list for all the heads.
 // Requires nh % 32 == 0, kv == 512, rd == 64.
 typedef _Float16 hy4_h16 __attribute__((ext_vector_type(16)));
 extern "C" __global__ void __launch_bounds__(256) hy4_mla_attn_wmma(float* lat, const float* qt, const float* q,
                                                                    const __half* ckv, const __half* krot,
                                                                    const float* sinh, int len, int nh, int nope, int kv,
-                                                                   int rd, float scale, int window) {
+                                                                   int rd, float scale, int window, const int* list,
+                                                                   int nsel, int pool) {
     constexpr int KT = 16, KS = 584, VS = 24;
     __shared__ __attribute__((aligned(16))) _Float16 ks[KT][KS];
     __shared__ __attribute__((aligned(16))) _Float16 vt[512][VS];
@@ -1057,10 +1060,25 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_attn_wmma(float* lat, 
     hy4_f32x8 o[8];
 #pragma unroll
     for (int f = 0; f < 8; ++f) o[f] = (hy4_f32x8){0, 0, 0, 0, 0, 0, 0, 0};
-    for (int k0 = (first / KT) * KT; k0 <= last; k0 += KT) {
+    const int* lrow = list ? list + (size_t)ti * nsel : nullptr;
+    const int base = (first / KT) * KT;
+    const int ntiles = list ? (nsel * pool + KT - 1) / KT : (last - base) / KT + 1;
+    // The cache row of slot kk of tile `tile`, or -1 when the slot holds no visible key.
+    auto key_of = [&](int tile, int kk) -> int {
+        if (!lrow) {
+            const int key = base + tile * KT + kk;
+            return key >= first && key <= last ? key : -1;
+        }
+        const int e = (tile * KT + kk) / pool;
+        if (e >= nsel) return -1;
+        const int g = lrow[e];
+        const int key = g * pool + (tile * KT + kk) % pool;
+        return g >= 0 && key <= last ? key : -1;
+    };
+    for (int tile = 0; tile < ntiles; ++tile) {
         __syncthreads();
         for (int e = tid; e < KT * 72; e += 256) {
-            const int kk = e / 72, c = e % 72, key = min(k0 + kk, last);
+            const int kk = e / 72, c = e % 72, kq = key_of(tile, kk), key = kq < 0 ? last : kq;
             const uint4 u = c < 64 ? ((const uint4*)(ckv + (size_t)key * kv))[c]
                                    : ((const uint4*)(krot + (size_t)key * rd))[c - 64];
             *(uint4*)&ks[kk][c * 8] = u;
@@ -1084,9 +1102,9 @@ extern "C" __global__ void __launch_bounds__(256) hy4_mla_attn_wmma(float* lat, 
         float mt = -INFINITY;
 #pragma unroll
         for (int k = 0; k < KT; ++k) {
-            const int r = g * 16 + row, key = k0 + k;
+            const int r = g * 16 + row;
             float v = sp[0][r][k] + sp[1][r][k] + sp[2][r][k] + sp[3][r][k];
-            if (key < first || key > last) v = -INFINITY;
+            if (key_of(tile, k) < 0) v = -INFINITY;
             p[k] = v;
             mt = fmaxf(mt, v);
         }

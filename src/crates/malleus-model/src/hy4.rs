@@ -2602,6 +2602,10 @@ pub(crate) fn forward(
     let gate = crate::session::f32s(t * vd)?;
     let attn_out = crate::session::f32s(t * vd)?;
     let o = crate::session::f32s(t * hidden)?;
+    // The absorbed query and the weighted latent of every layer, sized for the wider (sliding) head count: above the
+    // buffer pool's size limit, a per-layer allocation was a hipMalloc (~60 ms per layer at 2048 tokens).
+    let qt = crate::session::f32s(t * nh_max * h.kv_lora)?;
+    let lat_merged = crate::session::f32s(t * nh_max * h.kv_lora)?;
     let _ = (sess.len + t, kvd);
     // The tokens before this call that the Engram n-grams reach (`engram_max_ngram_size - 1` of them).
     let hist: Vec<u32> = if sess.len == 0 {
@@ -2709,7 +2713,6 @@ pub(crate) fn forward(
         // Absorbed MLA: `kv_b`'s QK half is folded into the query once per token and head, the split walks the cached
         // latents (the sliding layers only the last `window` of them), and the combine applies its V half and the gate.
         let nsplit = 8usize;
-        let qt = crate::session::f32s(t * a.heads * h.kv_lora)?;
         if t > 8 {
             // A chunk: one WMMA GEMM per head over all its tokens.
             model.k.get("hy4_absorb_wmma").launch(
@@ -2785,10 +2788,9 @@ pub(crate) fn forward(
             crate::config::MixerKind::Hy4Sliding => h.window,
             _ => 0,
         };
-        let lat_merged = crate::session::f32s(t * a.heads * h.kv_lora)?;
         // A chunk on the dense path: one WMMA kernel per 32 heads of a token, which writes the weighted latent itself.
         let wmma_attn = t > 8
-            && ix_list.is_none()
+            && (ix_list.is_none() || h.index_pool == 4)
             && a.heads % 32 == 0
             && std::env::var("MALLEUS_HY4_ATTN_WMMA").map_or(true, |v| v != "0");
         if wmma_attn {
@@ -2811,6 +2813,9 @@ pub(crate) fn forward(
                     a.rope.into(),
                     (1.0f32 / ((a.nope + a.rope) as f32).sqrt()).into(),
                     window.into(),
+                    ix_list.as_ref().map_or(Arg::U64(0), |l| l.into()),
+                    ix_list.as_ref().map_or(0, |l| l.len() / (t * 4)).into(),
+                    h.index_pool.into(),
                 ],
             )?;
         } else {
