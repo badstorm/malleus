@@ -106,6 +106,16 @@ enum Cmd {
         #[arg(long)]
         hc_mls4: bool,
     },
+    /// Dequantise a checkpoint whose routed experts are packed (NVFP4 / MXFP8) into a bf16 safetensors
+    /// directory: the file `convert` and the layer-by-layer reference read
+    Dequant {
+        /// The safetensors directory to read
+        #[arg(long)]
+        model: PathBuf,
+        /// The safetensors directory to write
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Rewrite a model file with a single weight copy: drop the MLS8 prefill copies, keep every other tensor
     /// byte-for-byte. For a file converted before `--prefill-int8` became opt-in (no bf16 source needed).
     Slim {
@@ -1921,6 +1931,25 @@ fn main() -> Result<()> {
             let t0 = Instant::now();
             malleus_convert::convert(&model, &out, &opts, &|m| eprintln!("{m}"))?;
             eprintln!("converted in {:.0}s", t0.elapsed().as_secs_f64());
+        }
+        Cmd::Dequant { model, out } => {
+            let t0 = Instant::now();
+            let s = malleus_convert::dequant::dequantize(&model, &out)?;
+            eprintln!(
+                "{} tensors, {:.1} GB, {} experts dequantised, {} companions folded, in {} shard(s)",
+                s.tensors,
+                s.bytes as f64 / 1e9,
+                s.experts,
+                s.dropped,
+                s.shards.len()
+            );
+            if s.amax_ratio.1 > 0.0 {
+                eprintln!(
+                    "amax / max|w| over the NVFP4 experts: {:.3} .. {:.3}",
+                    s.amax_ratio.0, s.amax_ratio.1
+                );
+            }
+            eprintln!("dequantised in {:.0}s", t0.elapsed().as_secs_f64());
         }
         Cmd::Slim {
             model,

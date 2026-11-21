@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod fpquant;
 pub mod gguf;
 pub mod quant;
 pub mod safetensors;
@@ -10,6 +11,10 @@ pub enum DType {
     F16,
     BF16,
     I8,
+    /// Raw bytes: the packed experts of a release (NVFP4 nibbles) and their e4m3 scales.
+    U8,
+    /// e4m3 bytes: MXFP8 weights.
+    F8E4M3,
     I32,
     I64,
     Mls2,
@@ -26,7 +31,7 @@ impl DType {
             DType::F32 | DType::I32 => n * 4,
             DType::I64 => n * 8,
             DType::F16 | DType::BF16 => n * 2,
-            DType::I8 => n,
+            DType::I8 | DType::U8 | DType::F8E4M3 => n,
             // MLS2 packs 4 codes per byte, MLS3 8 codes per 3 bytes; quantized tensors always have a K that is a
             // multiple of 128.
             DType::Mls2 => n / 4,
