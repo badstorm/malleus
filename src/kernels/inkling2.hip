@@ -52,9 +52,11 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_l2_clip(float* y, con
     __shared__ float ss[128];
     const int row = blockIdx.x;  // token * heads + head
     const int r = threadIdx.x;
-    if (r >= dim) return;
+    // Lanes past `dim` (the relative-bias stream is 16 wide) contribute nothing to the tree below and write
+    // nothing back: returning early used to leave their `ss` slots to whatever the previous launch left there.
+    const bool live = r < dim;
     const int t = row / heads;
-    const float v = x[(size_t)row * dim + r] * scale[(size_t)(row % heads) * dim + r];
+    const float v = live ? x[(size_t)row * dim + r] * scale[(size_t)(row % heads) * dim + r] : 0.f;
     ss[r] = v * v;
     __syncthreads();
     for (int o = 64; o > 0; o >>= 1) {
@@ -63,7 +65,7 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_l2_clip(float* y, con
     }
     const float norm = sqrtf(ss[0]);
     const float k = min(1.f, thr / (norm + 1e-6f)) * (tau ? tau[t] : 1.f);
-    y[(size_t)row * dim + r] = v * k;
+    if (live) y[(size_t)row * dim + r] = v * k;
 }
 
 // Unweighted RMSNorm over the last dim: y = x / sqrt(mean(x^2) + eps).
@@ -72,81 +74,154 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_rms_unnorm(float* y, 
     __shared__ float ss[128];
     const int row = blockIdx.x;
     const int r = threadIdx.x;
-    if (r >= dim) return;
-    const float v = x[(size_t)row * dim + r];
+    const bool live = r < dim;
+    const float v = live ? x[(size_t)row * dim + r] : 0.f;
     ss[r] = v * v;
     __syncthreads();
     for (int o = 64; o > 0; o >>= 1) {
         if (r < o) ss[r] += ss[r + o];
         __syncthreads();
     }
-    y[(size_t)row * dim + r] = v * rsqrtf(ss[0] / dim + eps);
+    if (live) y[(size_t)row * dim + r] = v * rsqrtf(ss[0] / dim + eps);
 }
 
-// bias[head][q][s] = rel[q][head] . proj[:, s - q] when 0 <= q - s < rel_extent, else 0.
-// rel is [T, heads, d_rel], proj is [d_rel, rel_extent] row-major, bias is [heads, T, T].
-extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias(float* bias, const float* rel, const float* proj,
-                                                                   int T, int heads, int d_rel, int extent) {
+// Causal attention with the relative bias, the learned sink and the output gate.
+// q, k, v, gate and rel are [T, heads|nkv, dim] for q/k/v/gate and [T, heads, d_rel] for rel; `proj` is
+// [d_rel, extent] row-major and `sink` is [T, heads] or null. The window is the number of keys a token sees (0 = all
+// of them, the full layers).
+//
+// A block is 16 query rows of one head: the four warps each own four of them, and the keys are staged in shared in
+// chunks of KBATCH, so one read of K and V serves sixteen query rows. The relative bias is computed inside the block
+// from the query's 16-wide `rel` row and the `proj` columns the chunk needs — the [heads, T, T] buffer it used to be
+// materialised into is 103 GB at a 32K prompt, and its kernel was O(heads x T^2) on every layer.
+#define IKA_KB 16
+#define IKA_TQ 16
+#define IKA_MAXD (IKA_KB + IKA_TQ - 1)
+extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, const float* q, const float* k,
+                                                                const float* v, const float* rel, const float* proj,
+                                                                const float* sink, const float* gate, int T, int heads,
+                                                                int nkv, int dim, int d_rel, int extent, int window,
+                                                                float scale) {
+    __shared__ float ks[IKA_KB][128];
+    __shared__ float vs[IKA_KB][128];
+    __shared__ float rs[IKA_TQ][16];
+    __shared__ float bt[IKA_TQ][IKA_KB];
+    const int h = blockIdx.x % heads, q0 = (blockIdx.x / heads) * IKA_TQ;
+    const int kh = h / (heads / nkv);
+    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int qlast = min(T - 1, q0 + IKA_TQ - 1);
+    const int k0 = window > 0 ? max(0, q0 - window + 1) : 0;
+    // The query rows this warp owns: four, one set of four dims per lane.
+    const int qb = q0 + wave * 4;
+    float4 qv[4];
+    float m[4], l[4];
+    float4 acc[4];
+    for (int i = 0; i < 4; ++i) {
+        const int t = qb + i;
+        qv[i] = t < T ? *(const float4*)(q + ((size_t)t * heads + h) * dim + 4 * lane)
+                      : make_float4(0.f, 0.f, 0.f, 0.f);
+        m[i] = sink && t < T ? sink[(size_t)t * heads + h] : -INFINITY;
+        l[i] = sink && t < T ? 1.f : 0.f;
+        acc[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    for (int e = threadIdx.x; e < IKA_TQ * d_rel; e += 128) {
+        rs[e / d_rel][e % d_rel] = q0 + e / d_rel <= qlast ? rel[((size_t)(q0 + e / d_rel) * heads + h) * d_rel + e % d_rel]
+                                                            : 0.f;
+    }
+    __syncthreads();
+    for (int kc = k0; kc <= qlast; kc += IKA_KB) {
+        for (int e = threadIdx.x; e < IKA_KB * dim; e += 128) {
+            const int s = kc + e / dim, d = e % dim;
+            ks[e / dim][d] = s <= qlast ? k[((size_t)s * nkv + kh) * dim + d] : 0.f;
+            vs[e / dim][d] = s <= qlast ? v[((size_t)s * nkv + kh) * dim + d] : 0.f;
+        }
+        // The bias tile: bt[iq][j] = rel[q0+iq] . proj[:, (q0+iq) - (kc+j)], zero outside the extent or the causal
+        // window of that row. `proj` is d_rel x extent and stays hot in L1, so it is read straight from global.
+        for (int e = threadIdx.x; e < IKA_TQ * IKA_KB; e += 128) {
+            const int iq = e / IKA_KB, j = e % IKA_KB, s = kc + j, t = q0 + iq;
+            float acc_b = 0.f;
+            const int d = t - s;
+            if (d >= 0 && d < extent && s <= t && t < T && (window == 0 || s >= t - window + 1)) {
+                for (int i = 0; i < d_rel; ++i) acc_b += rs[iq][i] * proj[(size_t)i * extent + d];
+            }
+            bt[iq][j] = acc_b;
+        }
+        __syncthreads();
+        // The softmax of a 16-key chunk in one shot: the sixteen dots of a row are independent, so they pipeline, and
+        // the row is rescaled once per chunk instead of once per key. Per-key the alternative was a chain of a
+        // shuffle tree, an exponential and an update, and it ran at 0.3 TFLOPS at a 32K prompt.
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int t = qb + i;
+            if (t >= T) continue;
+            const int w0 = window > 0 ? max(0, t - window + 1) : 0;
+            const int row = wave * 4 + i;
+            float sc[IKA_KB], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < IKA_KB; ++j) {
+                const int s = kc + j;
+                float d = -INFINITY;
+                if (s <= t && s >= w0) {
+                    const float4 kv = *(const float4*)&ks[j][4 * lane];
+                    d = qv[i].x * kv.x + qv[i].y * kv.y + qv[i].z * kv.z + qv[i].w * kv.w;
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
+                    d = d * scale + bt[row][j];
+                }
+                sc[j] = d;
+                mx = fmaxf(mx, d);
+            }
+            const float mn = fmaxf(m[i], mx);
+            const float corr = mn == -INFINITY ? 1.f : expf(m[i] - mn);
+            float sum = l[i] * corr;
+            float4 o = {acc[i].x * corr, acc[i].y * corr, acc[i].z * corr, acc[i].w * corr};
+#pragma unroll
+            for (int j = 0; j < IKA_KB; ++j) {
+                const float p = sc[j] == -INFINITY ? 0.f : expf(sc[j] - mn);
+                const float4 vv = *(const float4*)&vs[j][4 * lane];
+                sum += p;
+                o.x += p * vv.x;
+                o.y += p * vv.y;
+                o.z += p * vv.z;
+                o.w += p * vv.w;
+            }
+            acc[i] = o;
+            l[i] = sum;
+            m[i] = mn;
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; ++i) {
+        const int t = qb + i;
+        if (t >= T) continue;
+        const float inv = l[i] > 0.f ? 1.f / l[i] : 0.f;
+        float4 o = {acc[i].x * inv, acc[i].y * inv, acc[i].z * inv, acc[i].w * inv};
+        if (gate) {
+            const float4 g = *(const float4*)(gate + ((size_t)t * heads + h) * dim + 4 * lane);
+            o.x /= 1.f + expf(-g.x);
+            o.y /= 1.f + expf(-g.y);
+            o.z /= 1.f + expf(-g.z);
+            o.w /= 1.f + expf(-g.w);
+        }
+        *(float4*)(out + ((size_t)t * heads + h) * dim + 4 * lane) = o;
+    }
+}
+
+// The relative bias of one query row against `nk` cached keys, for the decode path: bias is [heads, nk], `rel` is
+// [heads, d_rel] of the single query row. One thread per (head, key).
+extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias_dec(float* bias, const float* rel,
+                                                                      const float* proj, int pos, int k0, int nk,
+                                                                      int heads, int d_rel, int extent) {
     const long long idx = (long long)blockIdx.x * 256 + threadIdx.x;
-    if (idx >= (long long)heads * T * T) return;
-    const int h = (int)(idx / ((long long)T * T));
-    const int q = (int)((idx % ((long long)T * T)) / T);
-    const int s = (int)(idx % T);
-    const int d = q - s;
+    if (idx >= (long long)heads * nk) return;
+    const int h = (int)(idx / nk), s = (int)(idx % nk);
+    const int d = pos - (k0 + s);
     float acc = 0.f;
     if (d >= 0 && d < extent) {
-        const float* rp = rel + ((size_t)q * heads + h) * d_rel;
+        const float* rp = rel + (size_t)h * d_rel;
         for (int i = 0; i < d_rel; ++i) acc += rp[i] * proj[(size_t)i * extent + d];
     }
     bias[idx] = acc;
-}
-
-// Causal attention with the relative bias, the learned sink and the output gate: one block per (token, head).
-// q, k, v, out and gate are [T, heads|nkv, dim] (kh = h / (heads / nkv) for k and v); bias is [heads, T, T]; `sink`
-// is [T, heads] or null. The window is the number of keys a token sees (0 = all of them, the full layers), and the
-// scores live in shared memory, so a full layer with a long context needs the tiling of `attention_split` — this
-// kernel is the correctness path used to check the pieces, not the long-context one.
-extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, const float* q, const float* k,
-                                                                const float* v, const float* bias, const float* sink,
-                                                                const float* gate, int T, int heads, int nkv, int dim,
-                                                                int window, float scale) {
-    __shared__ float red[128];
-    __shared__ float sc[4096];
-    __shared__ float sinkv;
-    const int t = blockIdx.x / heads, h = blockIdx.x % heads;
-    const int kh = h / (heads / nkv);
-    const int r = threadIdx.x;
-    const int w0 = window > 0 ? max(0, t - window + 1) : 0;
-    const int n = t - w0 + 1;
-    if (r == 0) sinkv = sink ? sink[(size_t)t * heads + h] : -INFINITY;
-    __syncthreads();
-    for (int i = 0; i < n; ++i) {
-        const int s = w0 + i;
-        red[r] = q[((size_t)t * heads + h) * dim + r] * k[((size_t)s * nkv + kh) * dim + r];
-        __syncthreads();
-        for (int o = 64; o > 0; o >>= 1) {
-            if (r < o) red[r] += red[r + o];
-            __syncthreads();
-        }
-        if (r == 0) sc[i] = red[0] * scale + bias[((size_t)h * T + t) * T + s];
-        __syncthreads();
-    }
-    if (r == 0) {
-        float mx = sink ? sinkv : -INFINITY;
-        for (int i = 0; i < n; ++i) mx = fmaxf(mx, sc[i]);
-        float sum = 0.f;
-        for (int i = 0; i < n; ++i) {
-            sc[i] = expf(sc[i] - mx);
-            sum += sc[i];
-        }
-        if (sink) sum += expf(sinkv - mx);
-        for (int i = 0; i < n; ++i) sc[i] /= sum;
-    }
-    __syncthreads();
-    float acc = 0.f;
-    for (int i = 0; i < n; ++i) acc += sc[i] * v[((size_t)(w0 + i) * nkv + kh) * dim + r];
-    const float g = gate ? gate[((size_t)t * heads + h) * dim + r] : 1.f;
-    out[((size_t)t * heads + h) * dim + r] = acc / (1.f + expf(-g));
 }
 
 // The attention residual (issue #62): a learned query attends over the running stack of block states plus the
@@ -252,11 +327,16 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_route(int* ids, f
 
 // The expert activation: softcap(gate) * sigmoid(gate) * softcap(up), with softcap(x) = tanh(x / c) * c, then the
 // randomized Hadamard of every 128-block like moe_act (the down weights are in the rotated basis).
+//
+// The checkpoint stores `w13` interleaved (`g0, u0, g1, u1, ...`): the reference deinterleaves it with
+// `Interleave(dim=1)` before splitting the gate and the up. The MLS4 file keeps the checkpoint's row order, so the
+// gate of element `j` is row `2j` and the up is row `2j+1`.
 extern "C" __global__ void __launch_bounds__(128) inkling2_moe_act(float* out, const float* gu, const int8_t* signs,
                                                                   int I, float gate_cap, float up_cap) {
     __shared__ float s[128];
     const int nb = I / 128, p = blockIdx.x / nb, b = blockIdx.x % nb, i = threadIdx.x;
-    const float g = gu[(size_t)p * 2 * I + b * 128 + i], u = gu[(size_t)p * 2 * I + I + b * 128 + i];
+    const int pos = b * 128 + i;
+    const float g = gu[(size_t)p * 2 * I + 2 * pos], u = gu[(size_t)p * 2 * I + 2 * pos + 1];
     const float gc = tanhf(g / gate_cap) * gate_cap;
     const float uc = tanhf(u / up_cap) * up_cap;
     s[i] = gc / (1.f + expf(-g)) * uc * (float)signs[i];
@@ -327,10 +407,130 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, c
     }
 }
 
+// int8 quantization of the rows of `x`, one scale per 128-wide group, in the layout the grouped W4A8 GEMMs read
+// (`rot_quant_i8_w`) but **without** the Hadamard: the Inkling-2 expert activation leaves its rows already rotated
+// (its own signs), so re-rotating here would undo it and the down GEMM would see the wrong basis.
+extern "C" __global__ void __launch_bounds__(32) inkling2_quant_i8(int8_t* q, float* xsc, const float* x) {
+    const size_t base = (size_t)blockIdx.x * 128;
+    const int lane = threadIdx.x;
+    const float4 xv = *(const float4*)(x + base + 4 * lane);
+    float m = fmaxf(fmaxf(fabsf(xv.x), fabsf(xv.y)), fmaxf(fabsf(xv.z), fabsf(xv.w)));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
+    const float sc = m > 0.f ? m / 127.f : 1.f;
+    const char4 o = {(char)__float2int_rn(fminf(fmaxf(xv.x / sc, -128.f), 127.f)),
+                     (char)__float2int_rn(fminf(fmaxf(xv.y / sc, -128.f), 127.f)),
+                     (char)__float2int_rn(fminf(fmaxf(xv.z / sc, -128.f), 127.f)),
+                     (char)__float2int_rn(fminf(fmaxf(xv.w / sc, -128.f), 127.f))};
+    *(char4*)(q + base + 4 * lane) = o;
+    if (lane == 0) xsc[blockIdx.x] = sc;
+}
+
+// y[p, i] = x[p * nq * h + qi * h + i]: the qi-th of the `nq` outputs a mix wrote, for every row. One launch instead
+// of one memcpy per row, which at a long prompt was 2048 hipMemcpyAsync of h floats per layer visit.
+extern "C" __global__ void __launch_bounds__(256) inkling2_copy_nq(float* y, const float* x, int nq, int qi, int h,
+                                                                  int t) {
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (long long)t * h) return;
+    const int p = (int)(i / h), c = (int)(i % h);
+    y[i] = x[((size_t)p * nq + qi) * h + c];
+}
+
 // The final logit softcap: y = tanh(x / cap) * cap. One thread per element.
 extern "C" __global__ void inkling2_softcap(float* y, const float* x, long long n, float cap) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = tanhf(x[i] / cap) * cap;
+}
+
+// ---- the decode path: one token at a time, against the keys and values of the slots it has already seen ----
+
+// The short convolution of one token, with the three-row history (`past`, [3, C], oldest first) shifted in place.
+// Same arithmetic as inkling2_sconv at T=1; the shift is what makes one launch per token enough.
+extern "C" __global__ void __launch_bounds__(256) inkling2_sconv_dec(float* y, const float* x, const ik_bf16* w,
+                                                                   const float* dyn_w, float* past, int C, int heads,
+                                                                   float div) {
+    const int c = (int)blockIdx.x * 256 + threadIdx.x;
+    if (c >= C) return;
+    const int h = c / (C / heads);
+    // Tap 0 is the current token; taps 1..3 are the three rows of the history, newest first.
+    const float v[4] = {x[c], past[(size_t)2 * C + c], past[(size_t)C + c], past[c]};
+    float acc = 0.f;
+#pragma unroll
+    for (int lag = 0; lag < 4; ++lag) {
+        float wj = dyn_w ? ik_bf2f(w[(size_t)lag * C + c]) : ik_bf2f(w[(size_t)c * 4 + (3 - lag)]);
+        if (dyn_w) wj += dyn_w[(size_t)h * 4 + lag];
+        acc += wj * v[lag];
+    }
+    y[c] = (x[c] + acc) / div;
+    past[c] = past[(size_t)C + c];
+    past[(size_t)C + c] = past[(size_t)2 * C + c];
+    past[(size_t)2 * C + c] = x[c];
+}
+
+// One query against the cached keys: k and v are [max_ctx, nkv, dim] with `nk` valid rows from `k0`, q, gate and
+// out are [heads, dim], bias is [heads, nk] and sink is [heads].
+//
+// The wall here is neither bandwidth nor arithmetic but the barrier: a block per (head) with a reduction per key ran
+// at 5-6 GB/s of effective traffic where the machine does 80. Each of the four warps now owns a quarter of the keys,
+// keeps its own (max, sum, output) in registers and never crosses a barrier inside the loop; the four partials are
+// merged once at the end. The sink is the score of a virtual key whose value is zero, so it enters the denominator
+// only, and the output gate is applied after the merge.
+extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, const float* q, const float* k,
+                                                                  const float* v, const float* bias, const float* sink,
+                                                                  const float* gate, int k0, int nk, int heads,
+                                                                  int nkv, int dim, float scale) {
+    __shared__ float sm[4], sl[4], sa[4][128];
+    const int h = blockIdx.x, kh = h / (heads / nkv);
+    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const float4 qv = *(const float4*)(q + (size_t)h * dim + 4 * lane);
+    // This warp's slice of the keys, contiguous so the reads of a warp stay in one L2 window: the per-key chain
+    // measured better here than the 16-key tile the prefill kernel uses, the opposite of the prefill — at a decode
+    // step there is one query row and the loads, not the exponentials, are what has to stay in flight.
+    const int per = (nk + 3) / 4, i0 = wave * per, i1 = min(nk, i0 + per);
+    float m = -INFINITY, l = 0.f;
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int i = i0; i < i1; ++i) {
+        const float4 kv = *(const float4*)(k + ((size_t)(k0 + i) * nkv + kh) * dim + 4 * lane);
+        float d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
+        const float sc = d * scale + bias[(size_t)h * nk + i];
+        const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
+        const float4 vv = *(const float4*)(v + ((size_t)(k0 + i) * nkv + kh) * dim + 4 * lane);
+        acc.x = acc.x * corr + p * vv.x;
+        acc.y = acc.y * corr + p * vv.y;
+        acc.z = acc.z * corr + p * vv.z;
+        acc.w = acc.w * corr + p * vv.w;
+        l = l * corr + p;
+        m = mn;
+    }
+    if (lane == 0) sm[wave] = m, sl[wave] = l;
+    sa[wave][4 * lane] = acc.x;
+    sa[wave][4 * lane + 1] = acc.y;
+    sa[wave][4 * lane + 2] = acc.z;
+    sa[wave][4 * lane + 3] = acc.w;
+    __syncthreads();
+    // Merge: the sink rides in as one more split of weight exp(sink - mn) with a zero output.
+    float mn = sink ? sink[h] : -INFINITY;
+    for (int w = 0; w < 4; ++w) mn = fmaxf(mn, sm[w]);
+    float sum = sink ? __expf(sink[h] - mn) : 0.f, o[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int w = 0; w < 4; ++w) {
+        const float c = sm[w] == -INFINITY ? 0.f : __expf(sm[w] - mn);
+        sum += sl[w] * c;
+        o[0] += sa[w][4 * lane] * c;
+        o[1] += sa[w][4 * lane + 1] * c;
+        o[2] += sa[w][4 * lane + 2] * c;
+        o[3] += sa[w][4 * lane + 3] * c;
+    }
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+    float4 res = {o[0] * inv, o[1] * inv, o[2] * inv, o[3] * inv};
+    if (gate) {
+        const float4 g = *(const float4*)(gate + (size_t)h * dim + 4 * lane);
+        res.x /= 1.f + __expf(-g.x);
+        res.y /= 1.f + __expf(-g.y);
+        res.z /= 1.f + __expf(-g.z);
+        res.w /= 1.f + __expf(-g.w);
+    }
+    *(float4*)(out + (size_t)h * dim + 4 * lane) = res;
 }
 
 // MoE combine: y[t][i] += w[t] * x[t][i]. The route weight of one expert for every token, applied as the expert's

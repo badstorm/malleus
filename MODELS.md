@@ -34,6 +34,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
+| Inkling-2-Mini (text) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. Session state is 393 KiB per token (48 KV slots). **Text only in the engine**: the vision tower's weights are in the file and loaded, but no forward reads them, and the MTP head is not wired either. |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
@@ -184,6 +185,153 @@ quality is being traded for the prefill speed.
 The KL column is not the same number: Malleus computes it over the whole vocabulary, `bench/quality_api.py` only
 over the reference top-10 (the rest charged at the floor of what the engine returned), which is a lower bound by
 construction. Compare the top-1 and the greedy tokens, not the KL.
+
+## Inkling-2-Mini — the looped transformer (2026-11-21)
+
+A 15.3 GB MLS4 file of a **looped** model: 24 physical layers of which the middle 12 (`6..18`) run three passes,
+so a token costs 48 layer visits — three times the expert traffic of a stack of the same depth. Attention residuals
+over a running block stack, a kernel-4 short convolution on every layer input and output, a relative-position bias
+over the last 1024 positions, 128 experts with 8 active, and an 8-bit head over a 201 024-token vocabulary.
+Measured on gfx1150 (Radeon 890M), `malleus bench --prompt 512,2048 --decode 32`, with the decode running against
+the KV cache (48 slots, one per layer and pass).
+
+| | value |
+|---|---|
+| weights on the device | 14.41 GB text + 0.64 GB vision + 0.27 GB (MTP, loaded, not used yet) |
+| session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
+| prefill `pp512` / `pp4096` / `pp8192` / `pp32768` | **305** / — / **179** / **105** tok/s |
+| decode `tg16` at ctx 512 / 2048 / 8192 / 32768 | **16.6** / **15.5** / **14.1** / ~9 tok/s |
+
+Three consecutive runs per point at 512..8192 (spread under 2 %); the 32K points are single runs (312 s for the
+prompt, 16 tokens of decode).
+
+What the prefill costs, and where it goes. The ablation below is from the 2048-token chunk before this session's
+work (70.8 s -> 11.1 s); the split of the 1.81 s a 512-token prompt now takes is from a `rocprofv3 --kernel-trace`
+summary (`percentage` of the GPU time, 48 layer visits):
+
+| kernel | calls | total | share | note |
+|---|---|---|---|---|
+| `inkling2_attn` | 48 | 503 ms | **27 %** | four query rows a block at the time of the profile; sixteen now, with the relative bias folded in |
+| `moe_w4a8` + `moe_w4a8_m32` | 192 | 483 ms | **26 %** | 25 GB of expert weights a chunk (each of the 128 read once); at the wall |
+| `inkling2_control` | 96 | 213 ms | 12 % | scalar bf16 matvecs, 0.6 GFLOP in 2.2 ms; three GEMMs would be 18x fewer FLOPs |
+| `gemm_wmma` | 288 | 170 ms | 9 % | the dense projections: 7.7 TFLOPS, nothing to fix here |
+| `__amd_rocclr_copyBuffer` | 2119 | 107 ms | 6 % | the `mix` block-stack copies, one per call |
+| `inkling2_attn_res` | 120 | 63 ms | 3 % | |
+| `inkling2_rel_bias` | 48 | 37 ms | 2 % | O(heads x T^2) on every layer |
+| the rest (`moe_act`, `hadamard`, `combine`, `sconv`, `copy_nq`, `rmsnorm`, ...) | | ~290 ms | 15 % | |
+
+An earlier ablation on a 2048-token chunk, kept for the shape of it:
+
+| | before | now |
+|---|---|---|
+| MoE experts, read once per (token, slot) pair | 40.9 s | **1.7 s** — `moe_sort` groups the pairs, so each expert crosses the bus once |
+| attention (`inkling2_attn`) | 24.8 s | **2.5 s** — four query rows per block, K/V staged once per chunk of keys |
+| everything else (dense MLS4 GEMMs, convolutions, mixes, head) | 5.1 s | 4.6 s |
+
+The head was the other waste: `unembed` is 201 024 x 2304 and ran on every position of the prompt even when the caller
+wanted one row (`forward(..., n_logits)`); at 8 192 tokens that was a 1.65 GB download per prompt. It now runs on the
+rows asked for: +8 % of prefill and a fixed cost instead of a linear one.
+
+The expert traffic was the first wall and it was pure redundancy: `moe_gate_up` reads an expert once per pair, so a
+512-token chunk read 1.58 GB per token — the same as a decode step — and the prefill sat on the bandwidth wall
+(38.3 tok/s × 2.24 GB/token = 86 GB/s, above the 80 GB/s `bench-bw` measures). Grouping the pairs (the kernels the
+other families already use: `moe_sort`, `moe_gather_g`, `moe_w4a8`, `moe_combine`, plus `inkling2_quant_i8` for the
+expert activation, which is already in the rotated basis) moved the wall to the attention.
+
+The attention is one block per (token, head): the four warps take four keys at a time and the softmax runs online,
+which made it 1.6× faster, but every query row still reads all of its K and V. What is left is the query tiling of a
+flash-attention: 16 rows per tile reuse one K/V read, which is where the other ~5× are. It also needs a real tile
+loop to lift the `[heads, T, T]` bias buffer (6.4 GB at 8K tokens) and to allow chunked prefill — today a prompt goes
+through one forward and the server uses the whole prompt.
+
+What 1 000 tok/s would take: 8.7 GFLOP per token in 1 ms, i.e. 8.7 TFLOPS sustained over the whole graph. The
+grouped MoE alone already measures ~8 TFLOPS, so the experts are not the problem; the projections run at ~0.9 (they
+are 2.4 GFLOP per token and 2.7 ms of the 3.46 the non-attention path costs) and the machine's practical int8-WMMA
+ceiling, measured on that same MoE, is ~9.6 TFLOPS. A tiled attention plus projections at the level the engine
+already reaches for Ornith (5-6 TFLOPS) gives ~1.5-1.7 ms per token, i.e. **600-660 tok/s**: that is the honest
+target on a 16-CU gfx1150. The 1 000 mark needs 40 CUs: on gfx1151 the same kernels are 2.5× the compute and 2.9×
+the bandwidth, and that is where the number becomes reachable.
+
+### What the context costs
+
+Fresh prompt at every depth (one forward, as the graph runs today), and the same prompt with the attention kernel
+removed by ablation — the rest of the graph, at the same weights:
+
+| depth | prefill, before | prefill, now | decode, before | decode, now |
+|---|---|---|---|---|
+| 512 | 214.3 tok/s | **282** | 12.9 tok/s | **16.7** |
+| 2 048 | 119.4 | **213** | 9.6 | **15.5** |
+| 8 192 | 63.4 | **179** | 6.95 | **14.1** |
+| 32 768 | — | **105** | — | ~9 |
+| retention at 8 K | 30 % | **59 %** | 54 % | **85 %** |
+| retention at 32 K | — | **34 %** | — | ~54 % |
+
+32K runs at all because the relative bias is no longer materialised: it used to be a `[heads, T, T]` buffer, which is
+103 GB at a 32 768-token prompt, and its kernel was O(heads x T^2) on every layer. It is computed inside the attention
+from the query's 16-wide `rel` row and the `proj` columns the key chunk needs.
+
+What was left of the degradation was **latency, not traffic**: the attention ran at 0.3 TFLOPS with a chain of five
+`__shfl_xor` + two exponentials + an update per (query, key). The 16-key chunk is now a tile — sixteen independent dots
+and one rescale of the row — so the dots pipeline instead of chaining: 65 -> 105 tok/s at 32K, 137 -> 179 at 8K and
+282 -> 305 at 512. The same tile in the *decode* kernel measured *worse* (16.6 -> 16.1 tok/s) and was kept out: at a
+decode step there is one query row and what has to stay in flight is the loads, not the exponentials.
+
+The session state at 32K is 12.9 GiB of keys and values today (48 slots, fp32): a ring buffer for the 40 sliding slots
+takes it to 3.3 GiB, and fp16 halves it again.
+
+Everything that is not attention is **flat with depth**: 289 tok/s at 512 tokens and 289 at 8 192, i.e. 3.46 ms per
+token for 8.7 GFLOP of experts and projections (2.5 TFLOPS). The degradation was one kernel reading the K and V of
+every visible key once per query row — `depth × 8 KiB` per slot per token, 832 MiB per token at 8 192 over the 48
+slots. The block now holds four query rows, one per warp, and stages the keys in shared memory once per 16-key chunk:
+four times less traffic and eight times fewer barriers. What is left of the slope is the 8 full-attention slots, which
+really do read the whole context — the next factor there is 16 query rows per tile (WMMA), not another barrier trick.
+
+Decode has the same shape of problem from the other side: 78 ms per token at a 512-token context, of which 28 is the
+2.24 GB of weights at the bandwidth wall, ~4 the sliding layers' 1024-key window and the rest the decode attention
+kernel, which runs at ~5 GB/s of effective traffic where the machine does 80. At the wall decode would keep
+~30 tok/s to 8 K and ~23 at 32 K with fp16 keys and values (halving the full slots' traffic); today the eight
+full-attention slots read `32 KiB` per position per token in fp32.
+
+**Against the production model** (Ornith-1.5-35B-A3B, same machine, `malleus bench`): prefill 251.5 against 968.5
+tok/s at depth 0, decode 16.5 against 29.08 (MTP off on both sides). The prefill gap is now all in the attention;
+the decode gap is the bandwidth of 2.24 GB per token against Ornith's ~0.7, i.e. the loop reading the core layers
+three times.
+
+### Quality: the gates against the bf16 checkpoint
+
+`golden` on the 20 prompts of `golden/inkling2` (`scripts/golden.py --reasoning-effort none` on the bf16 checkpoint,
+the looped forward), greedy off:
+
+| metric | prefill (one forward) | decode (one token at a time, through the cache) |
+|---|---|---|
+| last-token top-1 against bf16 | **20/20** | **20/20** |
+| all-position argmax | 67.81 % (493/727) | 68.78 % (500/727) |
+| worst KL | 0.370 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.344 |
+
+`raw-continue` is the one prompt of the set that is not rendered through the chat template, and the only one whose
+KL is not in the 1e-5 range: it is where the file's 4 bits show. It is also the prompt the grouped prefill's int8
+activations move (the W4A8 GEMM against the per-pair GEMV's fp32), and the reason the prefill column reads 19/20
+while the decode path keeps 20/20: `MALLEUS_INKLING2_MOE_PAIRS=1` runs the old path, and the two differ by that one
+prompt.
+
+`eval` on the 8 documents of the eval set (four Gutenberg books, two source files, two chat continuations):
+
+| document | ppl (ref) | top-1 | KL |
+|---|---|---|---|
+| it-pg56775 | 13.040 (12.723) | 90.53 % | 0.0273 |
+| it-pg18456 | 9.093 (8.979) | 91.60 % | 0.0259 |
+| en-pg48320 | 7.302 (6.949) | 91.80 % | 0.0485 |
+| en-pg11 | 5.432 (5.257) | 91.99 % | 0.0266 |
+| code-utils | 1.983 (1.912) | 96.00 % | 0.0278 |
+| code-module | 2.242 (2.182) | 96.00 % | 0.0217 |
+| chat-it | 53.712 (29.000) | 78.52 % | 0.3485 |
+| chat-en | 45.852 (40.006) | 83.20 % | 0.1799 |
+| **total** | **9.209 (8.188, +12.47 %)** | **89.92 %** | **0.0884** |
+
+The two chat documents are the outliers (+90 % and +14 % perplexity against +1.7…+5.3 % for the six plain ones) and
+they are the only documents over 1 000 tokens whose tokens are *not* plain prose: they open with the reasoning-effort
+system line of the chat template. Open question, tracked in issue #70.
+
 
 ## How these numbers are produced
 
