@@ -706,6 +706,20 @@ pub struct Controller {
     pub mlp: Gate,
 }
 
+/// A small bf16 tensor read back as f32: the kernels that consume the clip scales and the relative-position
+/// table read them as `const float*`.
+fn bf16_as_f32(src: &dyn TensorSource, name: &str, n: usize) -> Result<DeviceBuffer> {
+    let raw = src.read_all(name).with_context(|| format!("missing tensor {name}"))?;
+    ensure!(raw.len() == n * 2, "{name}: expected {n} bf16 values");
+    let v: Vec<f32> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::bf16::from_le_bytes(*b).to_f32())
+        .collect();
+    Ok(DeviceBuffer::from_slice(&v)?)
+}
+
 impl Weights {
     pub fn load(src: &dyn TensorSource, c: &Config, progress: &dyn Fn(usize, usize)) -> Result<Self> {
         let i = c.inkling2.as_ref().context("no inkling2 config")?;
@@ -809,10 +823,10 @@ impl Weights {
                 wo: up.linear(src, &p("attn.wo_ud"), h, qd)?,
                 wr: up.linear(src, &p("attn.wr_du"), i.heads * i.d_rel, h)?,
                 gate: up.linear(src, &p("attn.gate_attn"), qd, h)?,
-                rel_logits: up.tensor(src, &p("attn.rel_logits_proj.proj"), &[i.d_rel, i.rel_extent])?,
+                rel_logits: bf16_as_f32(src, &p("attn.rel_logits_proj.proj"), i.d_rel * i.rel_extent)?,
                 sink: up.tensor(src, &p("attn.attn_sink_proj.weight"), &[i.heads, h])?,
-                q_clip: up.tensor(src, &p("attn.q_l2_clip.scale"), &[i.heads, i.head_dim])?,
-                rel_clip: up.tensor(src, &p("attn.rel_l2_clip.scale"), &[i.heads, i.d_rel])?,
+                q_clip: bf16_as_f32(src, &p("attn.q_l2_clip.scale"), i.heads * i.head_dim)?,
+                rel_clip: bf16_as_f32(src, &p("attn.rel_l2_clip.scale"), i.heads * i.d_rel)?,
                 sconv,
                 moe: Moe {
                     gate: up.tensor(src, &p("mlp.gate.weight"), &[i.experts, h])?,
@@ -949,6 +963,712 @@ pub fn mtp_map(c: &Config) -> Result<Vec<Expected>> {
         vec![3 * m.markov_rank, 5120],
     );
     push(format!("{mk}.rnn_proj.bias"), DType::BF16, vec![3 * m.markov_rank]);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The text forward. One pass over the 24 layers per call (the base graph: the loop's cross-pass messages are the
+// next increment), on the whole token sequence. `generate` re-runs it for every new token, which is O(n^2) but is
+// the correctness path: no KV cache, no session state.
+// ---------------------------------------------------------------------------------------------------------------
+
+use crate::engine::Model;
+use malleus_hip::{Arg, Stream};
+
+fn f32s(n: usize) -> Result<DeviceBuffer> {
+    Ok(DeviceBuffer::alloc(n * 4)?)
+}
+
+fn argmax(v: &[f32], n: usize) -> u32 {
+    let mut bi = 0u32;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().take(n).enumerate() {
+        if x > bv {
+            bv = x;
+            bi = i as u32;
+        }
+    }
+    bi
+}
+
+/// Runs `tokens` through the whole graph and returns the argmax of the last position's logits.
+fn step(model: &Model, tokens: &[u32]) -> Result<u32> {
+    let c = &model.cfg;
+    let i = c.inkling2.as_ref().context("no inkling2 config")?;
+    let w = model.inkling2.as_ref().context("no inkling2 weights")?;
+    let st = &model.stream;
+    let t = tokens.len();
+    let h = c.hidden;
+    let heads = i.heads;
+    let kv = i.kv_heads;
+    let hd = i.head_dim;
+    let d_rel = i.d_rel;
+    let qd = heads * hd;
+    let kvd = kv * hd;
+    let eps = c.eps;
+    let inter = i.moe_inter;
+    let experts = i.experts;
+    let topk = i.top_k;
+    let kmax = qd.max(h);
+    let rd = heads * d_rel;
+
+    let mut xr = f32s(t * kmax)?;
+    let mut xh = DeviceBuffer::alloc(t * kmax * 2)?;
+    let mut xsc = f32s(t * kmax.div_ceil(128))?;
+    let x = f32s(t * h)?;
+    let ids32: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
+    let idbuf = DeviceBuffer::from_slice(&ids32)?;
+    model.k.get("embed_bf16").launch(
+        (t as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&x).into(), (&w.embed).into(), (&idbuf).into(), h.into()],
+    )?;
+    rms(model, st, &x, &x, &w.embed_norm, t, h, eps)?;
+
+    // The buffers the layers share.
+    let normed = f32s(t * h)?;
+    let states = f32s(8 * t * h)?;
+    let mix_out = f32s(t * 3 * h)?;
+    let q = f32s(t * qd)?;
+    let k = f32s(t * kvd)?;
+    let v = f32s(t * kvd)?;
+    let r = f32s(t * rd)?;
+    let gate = f32s(t * qd)?;
+    let sink = f32s(t * heads)?;
+    let bias = f32s(heads * t * t)?;
+    let attn_out = f32s(t * qd)?;
+    let y = f32s(t * h)?;
+    let moe_out = f32s(t * h)?;
+    let logits = f32s(t * experts)?;
+    let route_ids = DeviceBuffer::zeroed(t * topk * 4)?;
+    let route_w = f32s(t * topk)?;
+    let gu = f32s(t * topk * 2 * inter)?;
+    let act = f32s(t * topk * inter)?;
+    let ones_k = DeviceBuffer::from_slice(&vec![1.0f32; kv * hd])?;
+    // The log-scaled positions: 1 below the floor, so 1 for any sequence shorter than it.
+    let mut tau: Vec<f32> = (0..t)
+        .map(|p| 1.0 + i.log_alpha * (((p + 1) as f32) / i.log_floor as f32).max(1.0).ln())
+        .collect();
+    if tau.iter().all(|x| *x == 1.0) {
+        tau.clear();
+    }
+    let taud = if tau.is_empty() {
+        None
+    } else {
+        Some(DeviceBuffer::from_slice(&tau)?)
+    };
+    // The short-convolution history of a full-sequence pass: three zero tokens.
+    let past = DeviceBuffer::zeroed(3 * h * 4)?;
+
+    let mut blocks: Vec<DeviceBuffer> = Vec::with_capacity(8);
+    // The attention inputs and the normalized forms, one buffer each: the projections read them by name.
+    let mut qin = f32s(t * h)?;
+    let mut kin = f32s(t * h)?;
+    let mut vin = f32s(t * h)?;
+    let qn = f32s(t * h)?;
+    let kn = f32s(t * h)?;
+    let vn = f32s(t * h)?;
+    let kt = f32s(t * kvd)?;
+    let vt = f32s(t * kvd)?;
+    let yt = f32s(t * h)?;
+
+    for l in 0..c.n_layers {
+        let layer = &w.layers[l];
+        let full = layer.full;
+        let block_residual = f32s(t * h)?;
+        block_residual.copy_from_shared(0, &x, 0, t * h * 4, st)?;
+
+        // 1. The attention input: the raw state for layer 0, the attention residual above it.
+        let nq = if full { 3 } else { 1 };
+        if l == 0 {
+            qin.copy_from_shared(0, &x, 0, t * h * 4, st)?;
+            kin.copy_from_shared(0, &x, 0, t * h * 4, st)?;
+            vin.copy_from_shared(0, &x, 0, t * h * 4, st)?;
+        } else {
+            mix(
+                model,
+                st,
+                &mix_out,
+                &states,
+                &blocks,
+                &x,
+                &w.attn_queries[l - 1],
+                nq,
+                t,
+                h,
+                eps,
+            )?;
+            copy_nq(&mix_out, &mut qin, 0, t, h, nq, st)?;
+            if full {
+                copy_nq(&mix_out, &mut kin, 1, t, h, 3, st)?;
+                copy_nq(&mix_out, &mut vin, 2, t, h, 3, st)?;
+            } else {
+                kin.copy_from_shared(0, &qin, 0, t * h * 4, st)?;
+                vin.copy_from_shared(0, &qin, 0, t * h * 4, st)?;
+            }
+        }
+        // 2. The input norms and the projections.
+        let (dyn_k, dyn_v) = if full {
+            let (q_norm, k_norm, v_norm) = match &layer.sconv {
+                Sconv::Dynamic {
+                    q_norm, k_norm, v_norm, ..
+                } => (q_norm, k_norm, v_norm),
+                _ => unreachable!(),
+            };
+            rms(model, st, &qn, &qin, q_norm, t, h, eps)?;
+            rms(model, st, &kn, &kin, k_norm, t, h, eps)?;
+            rms(model, st, &vn, &vin, v_norm, t, h, eps)?;
+            let (dk, dv) = (f32s(t * kv * i.sconv_k)?, f32s(t * kv * i.sconv_k)?);
+            let (k_proj, v_proj) = match &layer.sconv {
+                Sconv::Dynamic { k_proj, v_proj, .. } => (k_proj, v_proj),
+                _ => unreachable!(),
+            };
+            raw_gemm(model, st, &dk, &kn, k_proj, t, kv * i.sconv_k, h)?;
+            raw_gemm(model, st, &dv, &vn, v_proj, t, kv * i.sconv_k, h)?;
+            (Some(dk), Some(dv))
+        } else {
+            let an = layer.attn_norm.as_ref().context("sliding layer without attn_norm")?;
+            rms(model, st, &qn, &qin, an, t, h, eps)?;
+            kn.copy_from_shared(0, &qn, 0, t * h * 4, st)?;
+            vn.copy_from_shared(0, &qn, 0, t * h * 4, st)?;
+            (None, None)
+        };
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &q, &qn, &layer.wq, t)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &k, &kn, &layer.wk, t)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &v, &vn, &layer.wv, t)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &r, &qn, &layer.wr, t)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &gate, &qn, &layer.gate, t)?;
+        raw_gemm(model, st, &sink, &qn, &layer.sink, t, heads, h)?;
+        // 3. The short convolutions of the keys and the values, then the clips.
+        let (k_w, v_w) = match &layer.sconv {
+            Sconv::Local { k, v } => (k, v),
+            Sconv::Dynamic { k_static, v_static, .. } => (k_static, v_static),
+        };
+        let div = if full { 3.0 } else { (i.sconv_k as f32 + 1.0).sqrt() };
+        sconv2(
+            model,
+            st,
+            &kt,
+            &k,
+            &vt,
+            &v,
+            k_w,
+            v_w,
+            dyn_k.as_ref(),
+            dyn_v.as_ref(),
+            &past,
+            t,
+            kvd,
+            kv,
+            div,
+        )?;
+        k.copy_from_shared(0, &kt, 0, t * kvd * 4, st)?;
+        v.copy_from_shared(0, &vt, 0, t * kvd * 4, st)?;
+        let tau = if full { taud.as_ref() } else { None };
+        clip(model, st, &q, &layer.q_clip, tau, t, heads, hd, i.qk_clip)?;
+        clip(model, st, &k, &ones_k, None, t, kv, hd, i.qk_clip)?;
+        rms_unnorm(model, st, &v, t, kv, hd, eps)?;
+        clip(model, st, &r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
+        rel_bias(model, st, &bias, &r, &layer.rel_logits, t, heads, d_rel, i.rel_extent)?;
+        let window = if full { 0 } else { i.window };
+        attn(
+            model,
+            st,
+            &attn_out,
+            &q,
+            &k,
+            &v,
+            &bias,
+            &sink,
+            &gate,
+            t,
+            heads,
+            kv,
+            hd,
+            window,
+            1.0 / (hd as f32).sqrt(),
+        )?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &y, &attn_out, &layer.wo, t)?;
+        sconv_one(
+            model,
+            st,
+            &yt,
+            &y,
+            &layer.attn_sconv,
+            &past,
+            t,
+            h,
+            (i.sconv_k as f32 + 1.0).sqrt(),
+        )?;
+        y.copy_from_shared(0, &yt, 0, t * h * 4, st)?;
+
+        // 4. The block bookkeeping.
+        let boundary = l % i.attn_res_block == 0;
+        if boundary {
+            let pushed = f32s(t * h)?;
+            pushed.copy_from_shared(0, &block_residual, 0, t * h * 4, st)?;
+            blocks.push(pushed);
+            x.copy_from_shared(0, &y, 0, t * h * 4, st)?;
+        } else {
+            x.copy_from_shared(0, &block_residual, 0, t * h * 4, st)?;
+            add(model, st, &x, &y, t * h)?;
+        }
+        // 5. The MLP input: the attention residual over the block stack.
+        mix(
+            model,
+            st,
+            &mix_out,
+            &states,
+            &blocks,
+            &x,
+            &w.mlp_queries[l],
+            1,
+            t,
+            h,
+            eps,
+        )?;
+        // 6. The MoE.
+        rms(model, st, &normed, &mix_out, &layer.mlp_norm, t, h, eps)?;
+        raw_gemm(model, st, &logits, &normed, &layer.moe.gate, t, experts, h)?;
+        model.k.get("inkling2_moe_route").launch(
+            (t as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&route_ids).into(),
+                (&route_w).into(),
+                (&logits).into(),
+                (&layer.moe.bias).into(),
+                experts.into(),
+                topk.into(),
+                i.route_scale.into(),
+            ],
+        )?;
+        model.k.get("moe_gate_up").launch(
+            ((2 * inter).div_ceil(32) as u32, (t * topk) as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&gu).into(),
+                (&normed).into(),
+                (&layer.moe.gate_up.0).into(),
+                (&layer.moe.gate_up.1).into(),
+                (&route_ids).into(),
+                topk.into(),
+                (2 * inter).into(),
+                h.into(),
+                (&model.signs).into(),
+            ],
+        )?;
+        model.k.get("inkling2_moe_act").launch(
+            ((t * topk * inter / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[
+                (&act).into(),
+                (&gu).into(),
+                (&model.signs).into(),
+                inter.into(),
+                i.gate_softcap.into(),
+                i.up_softcap.into(),
+            ],
+        )?;
+        model.k.get("moe_down").launch(
+            (h.div_ceil(32) as u32, t as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&moe_out).into(),
+                (&act).into(),
+                (&layer.moe.down.0).into(),
+                (&layer.moe.down.1).into(),
+                (&route_ids).into(),
+                (&route_w).into(),
+                topk.into(),
+                h.into(),
+                inter.into(),
+                0i32.into(),
+            ],
+        )?;
+        sconv_one(
+            model,
+            st,
+            &yt,
+            &moe_out,
+            &layer.mlp_sconv,
+            &past,
+            t,
+            h,
+            (i.sconv_k as f32 + 1.0).sqrt(),
+        )?;
+        moe_out.copy_from_shared(0, &yt, 0, t * h * 4, st)?;
+        add(model, st, &x, &moe_out, t * h)?;
+    }
+
+    // The final attention residual, the norm and the head.
+    mix(model, st, &mix_out, &states, &blocks, &x, &w.output_query, 1, t, h, eps)?;
+    rms(model, st, &normed, &mix_out, &w.norm, t, h, eps)?;
+    // The last row only.
+    let last = f32s(h)?;
+    last.copy_from_shared(0, &normed, (t - 1) * h * 4, h * 4, st)?;
+    let logits_out = f32s(c.vocab)?;
+    lin(model, st, &mut xr, &mut xh, &mut xsc, &logits_out, &last, &w.unembed, 1)?;
+    softcap(model, st, &logits_out, c.vocab, i.logit_softcap)?;
+    let raw: Vec<f32> = logits_out.download(c.vocab)?;
+    Ok(argmax(&raw, i.unpadded_vocab))
+}
+
+fn rms(
+    model: &Model,
+    st: &Stream,
+    out: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &DeviceBuffer,
+    rows: usize,
+    n: usize,
+    eps: f32,
+) -> Result<()> {
+    model.k.get("rmsnorm").launch(
+        (rows as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[out.into(), x.into(), w.into(), n.into(), eps.into(), 0i32.into()],
+    )?;
+    Ok(())
+}
+
+fn add(model: &Model, st: &Stream, y: &DeviceBuffer, x: &DeviceBuffer, n: usize) -> Result<()> {
+    model.ew(st, "add_inplace", n, &[y.into(), x.into(), n.into()])?;
+    Ok(())
+}
+
+fn lin(
+    model: &Model,
+    st: &Stream,
+    xr: &mut DeviceBuffer,
+    xh: &mut DeviceBuffer,
+    xsc: &mut DeviceBuffer,
+    out: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &Linear,
+    t: usize,
+) -> Result<()> {
+    model.gemm(st, xr, xh, xsc, out, crate::engine::Act::X(x), w, t, false)?;
+    Ok(())
+}
+
+fn raw_gemm(
+    model: &Model,
+    st: &Stream,
+    out: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &DeviceBuffer,
+    t: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    model.k.get("gemm_bf16").launch(
+        (n.div_ceil(8) as u32, t.div_ceil(8) as u32, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            out.into(),
+            x.into(),
+            w.into(),
+            t.into(),
+            n.into(),
+            k.into(),
+            0i32.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mix(
+    model: &Model,
+    st: &Stream,
+    out: &DeviceBuffer,
+    states: &DeviceBuffer,
+    blocks: &[DeviceBuffer],
+    partial: &DeviceBuffer,
+    query: &DeviceBuffer,
+    nq: usize,
+    t: usize,
+    h: usize,
+    eps: f32,
+) -> Result<()> {
+    let n = blocks.len() + 1;
+    for (j, b) in blocks.iter().enumerate() {
+        states.copy_from_shared(j * t * h * 4, b, 0, t * h * 4, st)?;
+    }
+    states.copy_from_shared((n - 1) * t * h * 4, partial, 0, t * h * 4, st)?;
+    model.k.get("inkling2_attn_res").launch(
+        ((t * nq) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            out.into(),
+            query.into(),
+            states.into(),
+            t.into(),
+            n.into(),
+            h.into(),
+            nq.into(),
+            eps.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Copies the `qi`-th of `nq` outputs of a mix (`[t, nq, h]`) into a `[t, h]` buffer.
+fn copy_nq(
+    src: &DeviceBuffer,
+    dst: &mut DeviceBuffer,
+    qi: usize,
+    t: usize,
+    h: usize,
+    nq: usize,
+    st: &Stream,
+) -> Result<()> {
+    for p in 0..t {
+        dst.copy_from_shared(p * h * 4, src, (p * nq + qi) * h * 4, h * 4, st)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sconv2(
+    model: &Model,
+    st: &Stream,
+    yk: &DeviceBuffer,
+    xk: &DeviceBuffer,
+    yv: &DeviceBuffer,
+    xv: &DeviceBuffer,
+    k_w: &DeviceBuffer,
+    v_w: &DeviceBuffer,
+    dyn_k: Option<&DeviceBuffer>,
+    dyn_v: Option<&DeviceBuffer>,
+    past: &DeviceBuffer,
+    t: usize,
+    c: usize,
+    heads: usize,
+    div: f32,
+) -> Result<()> {
+    for (y, x, w, dyn_w) in [(yk, xk, k_w, dyn_k), (yv, xv, v_w, dyn_v)] {
+        let d: Arg = match dyn_w {
+            Some(x) => x.into(),
+            None => Arg::Ptr(0),
+        };
+        model.k.get("inkling2_sconv").launch(
+            ((t * c).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                y.into(),
+                x.into(),
+                w.into(),
+                d,
+                past.into(),
+                t.into(),
+                c.into(),
+                heads.into(),
+                div.into(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn sconv_one(
+    model: &Model,
+    st: &Stream,
+    y: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &DeviceBuffer,
+    past: &DeviceBuffer,
+    t: usize,
+    c: usize,
+    div: f32,
+) -> Result<()> {
+    model.k.get("inkling2_sconv").launch(
+        ((t * c).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            y.into(),
+            x.into(),
+            w.into(),
+            Arg::Ptr(0),
+            past.into(),
+            t.into(),
+            c.into(),
+            1usize.into(),
+            div.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn clip(
+    model: &Model,
+    st: &Stream,
+    y: &DeviceBuffer,
+    scale: &DeviceBuffer,
+    tau: Option<&DeviceBuffer>,
+    t: usize,
+    heads: usize,
+    dim: usize,
+    thr: f32,
+) -> Result<()> {
+    let ta: Arg = match tau {
+        Some(x) => x.into(),
+        None => Arg::Ptr(0),
+    };
+    model.k.get("inkling2_l2_clip").launch(
+        ((t * heads) as u32, 1, 1),
+        (128, 1, 1),
+        0,
+        st,
+        &[
+            y.into(),
+            y.into(),
+            scale.into(),
+            ta,
+            t.into(),
+            heads.into(),
+            dim.into(),
+            thr.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn rms_unnorm(
+    model: &Model,
+    st: &Stream,
+    y: &DeviceBuffer,
+    t: usize,
+    heads: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<()> {
+    model.k.get("inkling2_rms_unnorm").launch(
+        ((t * heads) as u32, 1, 1),
+        (128, 1, 1),
+        0,
+        st,
+        &[y.into(), y.into(), (t * heads).into(), dim.into(), eps.into()],
+    )?;
+    Ok(())
+}
+
+fn rel_bias(
+    model: &Model,
+    st: &Stream,
+    bias: &DeviceBuffer,
+    rel: &DeviceBuffer,
+    proj: &DeviceBuffer,
+    t: usize,
+    heads: usize,
+    d_rel: usize,
+    extent: usize,
+) -> Result<()> {
+    model.k.get("inkling2_rel_bias").launch(
+        (((heads * t * t) as f32 / 256.0).ceil() as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            bias.into(),
+            rel.into(),
+            proj.into(),
+            t.into(),
+            heads.into(),
+            d_rel.into(),
+            extent.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attn(
+    model: &Model,
+    st: &Stream,
+    out: &DeviceBuffer,
+    q: &DeviceBuffer,
+    k: &DeviceBuffer,
+    v: &DeviceBuffer,
+    bias: &DeviceBuffer,
+    sink: &DeviceBuffer,
+    gate: &DeviceBuffer,
+    t: usize,
+    heads: usize,
+    nkv: usize,
+    dim: usize,
+    window: usize,
+    scale: f32,
+) -> Result<()> {
+    model.k.get("inkling2_attn").launch(
+        ((t * heads) as u32, 1, 1),
+        (128, 1, 1),
+        0,
+        st,
+        &[
+            out.into(),
+            q.into(),
+            k.into(),
+            v.into(),
+            bias.into(),
+            sink.into(),
+            gate.into(),
+            t.into(),
+            heads.into(),
+            nkv.into(),
+            dim.into(),
+            window.into(),
+            scale.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn softcap(model: &Model, st: &Stream, y: &DeviceBuffer, n: usize, cap: f32) -> Result<()> {
+    model.k.get("inkling2_softcap").launch(
+        (n.div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[y.into(), y.into(), n.into(), cap.into()],
+    )?;
+    Ok(())
+}
+
+/// The graph has no KV cache: every new token re-runs the whole sequence.
+pub fn generate(model: &Model, tokens: &[u32], n: usize) -> Result<Vec<u32>> {
+    let c = &model.cfg;
+    let mut ids = tokens.to_vec();
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let next = step(model, &ids)?;
+        ids.push(next);
+        out.push(next);
+        if c.eos.contains(&next) {
+            break;
+        }
+    }
     Ok(out)
 }
 

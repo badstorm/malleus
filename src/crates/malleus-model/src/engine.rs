@@ -70,6 +70,9 @@ pub struct Model {
     pub(crate) hy4: Option<Box<crate::hy4::Weights>>,
     /// Hy4-flash's vision tower (`vit.*`), when the file carries one.
     pub(crate) hy4_vision: Option<Box<crate::hy4::Vision>>,
+    /// Inkling-2's weights: its own graph (`crate::inkling2`), read by a standalone forward until the
+    /// engine's session plumbing carries the loop.
+    pub(crate) inkling2: Option<Box<crate::inkling2::Weights>>,
 }
 
 pub struct LoadOptions {
@@ -128,23 +131,58 @@ impl Model {
         if c.family == Family::Hy4 {
             return Self::load_hy4(cfg, src, opts, kernels, progress);
         }
-        // Inkling-2 has the map of its text tensors but not the graph yet: check the file against the map and say
-        // so, instead of failing later with a missing tensor.
+        // Inkling-2 has its own graph (`crate::inkling2`): check the file against the map, load the weights, and
+        // hand the model to the standalone forward.
         if c.family == Family::Inkling2 {
             for line in crate::inkling2::check(src, c)? {
                 eprintln!("{line}");
             }
-            // The whole file on the device, to prove the footprint and that every tensor takes its buffer; the
-            // graph that reads them is the next increment.
             let t0 = std::time::Instant::now();
-            let loaded = crate::inkling2::Weights::load(src, c, progress)?;
-            let n = loaded.layers.len();
-            let gb = loaded.bytes as f64 / (1u64 << 30) as f64;
-            drop(loaded);
-            bail!(
-                "inkling2: {n} layers loaded, {gb:.1} GiB on the device in {:.0}s; the forward is the next increment of #62",
+            let weights = crate::inkling2::Weights::load(src, c, progress)?;
+            let n = weights.layers.len();
+            let gb = weights.bytes as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "inkling2: {n} layers loaded, {gb:.1} GiB on the device in {:.0}s",
                 t0.elapsed().as_secs_f64()
             );
+            let dummy = DeviceBuffer::zeroed(4)?;
+            return Ok(Model {
+                cfg,
+                k: kernels,
+                embed: dummy,
+                layers: Vec::new(),
+                norm: None,
+                hc_final: None,
+                ngram: None,
+                lm_head: Linear {
+                    w: crate::weights::Weights::Bf16(DeviceBuffer::zeroed(4)?),
+                    prefill: None,
+                    n: 1,
+                    k: 1,
+                },
+                mtp: None,
+                mtp_post_norm: false,
+                mtp_chain_post: false,
+                draft_head: None,
+                draft_map: None,
+                signs: DeviceBuffer::from_slice(&malleus_gguf::quant::hadamard_signs(opts.hadamard_seed))?,
+                rope_invf: None,
+                scratch_cache: std::sync::Mutex::new(None),
+                stream: Stream::new()?,
+                quant_mode: std::sync::atomic::AtomicU8::new(0),
+                prefill_a8: false,
+                w4_max_t: 0,
+                moe_w4a4: 0,
+                moe_y_half: false,
+                weight_bytes: weights.bytes,
+                expert_stage: None,
+                prefill_copies: false,
+                attn_mass: None,
+                vision: None,
+                hy4: None,
+                hy4_vision: None,
+                inkling2: Some(Box::new(weights)),
+            });
         }
         // Read before `kernels` moves into the model: the int4 default for the MoE prefill depends on the GPU.
         let arch = kernels.arch.clone();
@@ -424,6 +462,7 @@ impl Model {
             vision: None,
             hy4: None,
             hy4_vision: None,
+            inkling2: None,
         })
     }
 
@@ -479,6 +518,7 @@ impl Model {
             vision: None,
             hy4: Some(Box::new(weights)),
             hy4_vision: vision,
+            inkling2: None,
         })
     }
 
@@ -1377,6 +1417,12 @@ impl Model {
             .get(name)
             .launch((n.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0, s, args)?;
         Ok(())
+    }
+
+    /// Inkling-2's standalone generation: run the whole sequence for every new token (the correctness path,
+    /// O(n^2) without a KV cache). Returns the generated ids after `tokens`.
+    pub fn inkling2_generate(&self, tokens: &[u32], n: usize) -> Result<Vec<u32>> {
+        crate::inkling2::generate(self, tokens, n)
     }
 
     /// Runs `tokens` through the model, appending to the session. Text positions are assigned automatically

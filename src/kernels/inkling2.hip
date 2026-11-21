@@ -27,11 +27,13 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_sconv(float* y, const
     const int h = c / (C / heads);
     float acc = 0.f;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int p = t - 3 + j;
+    for (int lag = 0; lag < 4; ++lag) {
+        const int p = t - lag;
         const float v = p >= 0 ? x[(size_t)p * C + c] : past[(size_t)(p + 3) * C + c];
-        float wj = ik_bf2f(w[(size_t)c * 4 + j]);
-        if (dyn_w) wj += dyn_w[(size_t)t * heads * 4 + (size_t)h * 4 + j];
+        // The static variant's weight is [C, 4] with tap 0 oldest; the dynamic variant's static_w is [4, C] with
+        // tap 0 the current token (the reference's `static_weight.T`). The lag runs 0 = current .. 3 = three back.
+        float wj = dyn_w ? ik_bf2f(w[(size_t)lag * C + c]) : ik_bf2f(w[(size_t)c * 4 + (3 - lag)]);
+        if (dyn_w) wj += dyn_w[(size_t)t * heads * 4 + (size_t)h * 4 + lag];
         acc += wj * v;
     }
     y[idx] = (x[idx] + acc) / div;
@@ -161,7 +163,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_res(float* out, 
     for (int j = 0; j < n; ++j) {
         float s = 0.f;
         for (int i = r; i < hidden; i += 256) {
-            const float v = x[((size_t)t * n + j) * hidden + i];
+            const float v = x[((size_t)j * T + t) * hidden + i];
             s += v * v;
         }
         red[r] = s;
@@ -176,7 +178,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_res(float* out, 
     for (int j = 0; j < n; ++j) {
         float s = 0.f;
         for (int i = r; i < hidden; i += 256) {
-            s += q[qi * hidden + i] * x[((size_t)t * n + j) * hidden + i] * fac[j];
+            s += q[qi * hidden + i] * x[((size_t)j * T + t) * hidden + i] * fac[j];
         }
         red[r] = s;
         __syncthreads();
@@ -200,7 +202,7 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_res(float* out, 
     __syncthreads();
     for (int i = r; i < hidden; i += 256) {
         float acc = 0.f;
-        for (int j = 0; j < n; ++j) acc += sc[j] * x[((size_t)t * n + j) * hidden + i] * fac[j];
+        for (int j = 0; j < n; ++j) acc += sc[j] * x[((size_t)j * T + t) * hidden + i] * fac[j];
         out[((size_t)t * nq + qi) * hidden + i] = acc;
     }
 }
@@ -323,4 +325,17 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, c
         }
         out[(size_t)t * hidden + i] = cp[i] * (1.f - tanhf(f)) + tanhf(g) * mp[i];
     }
+}
+
+// The final logit softcap: y = tanh(x / cap) * cap. One thread per element.
+extern "C" __global__ void inkling2_softcap(float* y, const float* x, long long n, float cap) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = tanhf(x[i] / cap) * cap;
+}
+
+// MoE combine: y[t][i] += w[t] * x[t][i]. The route weight of one expert for every token, applied as the expert's
+// output is added into the layer's accumulator.
+extern "C" __global__ void inkling2_moe_acc(float* y, const float* x, const float* w, long long n, int h) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += w[i / h] * x[i];
 }

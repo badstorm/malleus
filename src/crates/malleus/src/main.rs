@@ -368,8 +368,8 @@ fn load_model(path: &Path) -> Result<Model> {
     let prefill_int8 = std::env::var("MALLEUS_PREFILL_WEIGHTS").map_or(true, |v| v != "none");
     let with_vision = std::env::var("MALLEUS_VISION").map(|v| v != "0").unwrap_or(true);
     let load_vision = |m: &mut Model, src: &dyn malleus_gguf::TensorSource, cfg_json: &str| -> Result<()> {
-        // Hy4-flash has a tower of its own (issue #40, loaded with the image path).
-        if m.cfg.family == Family::Hy4 {
+        // Hy4-flash and Inkling-2 have towers of their own, loaded with their own weights.
+        if matches!(m.cfg.family, Family::Hy4 | Family::Inkling2) {
             return Ok(());
         }
         if let Some(vc) = VisionConfig::from_json(cfg_json)?
@@ -1028,6 +1028,27 @@ fn run(
         .unwrap_or(malleus_sched::DEFAULT_DRAFT_PMIN);
     let chat = load_chat(model)?;
     let m = load_model(model)?;
+    // Inkling-2 has no KV cache yet: the graph re-runs the whole sequence for every token, so it takes the prompt
+    // here and generates on its own path.
+    if m.cfg.family == Family::Inkling2 {
+        let msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
+        let opts = malleus_chat::RenderOptions {
+            enable_thinking: Some(think),
+            ..Default::default()
+        };
+        let ids = chat.encode(&chat.render(&msgs, &opts)?)?;
+        eprintln!("inkling2: prompt {} tok", ids.len());
+        let t0 = Instant::now();
+        let out = m.inkling2_generate(&ids, max_tokens)?;
+        let dt = t0.elapsed().as_secs_f64();
+        let mut dec = malleus_chat::StreamDecoder::new();
+        for tok in &out {
+            print!("{}", dec.push(&chat, *tok)?);
+        }
+        println!();
+        eprintln!("{} tok in {dt:.2}s ({:.2} tok/s)", out.len(), out.len() as f64 / dt);
+        return Ok(());
+    }
     if let Some(path) = prompt_ids {
         let ids: Vec<u32> = std::fs::read_to_string(path)?
             .split_whitespace()
@@ -1860,14 +1881,14 @@ fn kernel_test() -> Result<()> {
         for tt in 0..t {
             for cc in 0..c {
                 let mut acc = 0f32;
-                for j in 0..4 {
-                    let pp = tt as isize - 3 + j as isize;
+                for lag in 0..4 {
+                    let pp = tt as isize - lag as isize;
                     let vv = if pp >= 0 {
                         x[pp as usize * c + cc]
                     } else {
                         past[(pp + 3) as usize * c + cc]
                     };
-                    acc += half::bf16::from_bits(w[cc * 4 + j]).to_f32() * vv;
+                    acc += half::bf16::from_bits(w[cc * 4 + (3 - lag)]).to_f32() * vv;
                 }
                 want[tt * c + cc] = (x[tt * c + cc] + acc) / 5.0f32.sqrt();
             }
@@ -2070,7 +2091,7 @@ fn kernel_test() -> Result<()> {
                 let mut sc = vec![0f32; nr];
                 let mut fac = vec![0f32; nr];
                 for j in 0..nr {
-                    let row = &xr[(tt * nr + j) * hd..(tt * nr + j + 1) * hd];
+                    let row = &xr[(j * tr + tt) * hd..(j * tr + tt + 1) * hd];
                     let ms = row.iter().map(|v| v * v).sum::<f32>() / hd as f32;
                     fac[j] = 1.0 / (ms + 1e-6).sqrt();
                     sc[j] = row
@@ -2085,7 +2106,7 @@ fn kernel_test() -> Result<()> {
                 for i in 0..hd {
                     let mut acc = 0f32;
                     for j in 0..nr {
-                        acc += (sc[j] - mx).exp() / sum * xr[(tt * nr + j) * hd + i] * fac[j];
+                        acc += (sc[j] - mx).exp() / sum * xr[(j * tr + tt) * hd + i] * fac[j];
                     }
                     want[(tt * nqr + qi) * hd + i] = acc;
                 }
