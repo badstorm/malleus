@@ -54,8 +54,34 @@ impl MemInfo {
         })
     }
 
+    /// What this host can still hand to the GPU. On an APU the weights live in GTT, not in the host's anonymous
+    /// pages: `/proc/meminfo` counts the other containers' memory and says nothing about the 96 GiB GTT window, so
+    /// the driver's own numbers win when they are there.
     pub fn read() -> Option<MemInfo> {
+        if let Some(gtt) = Self::read_gtt() {
+            return Some(gtt);
+        }
         Self::parse(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    }
+
+    /// `mem_info_gtt_total` / `mem_info_gtt_used` of the card with the widest window, in bytes.
+    fn read_gtt() -> Option<MemInfo> {
+        let mut best: Option<MemInfo> = None;
+        for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+            let dev = entry.path().join("device");
+            let read = |f: &str| -> Option<u64> { std::fs::read_to_string(dev.join(f)).ok()?.trim().parse().ok() };
+            let (Some(total), Some(used)) = (read("mem_info_gtt_total"), read("mem_info_gtt_used")) else {
+                continue;
+            };
+            // Another card's window is not ours to promise, so the largest total is the one the engine runs on.
+            if best.is_none_or(|b| total > b.total) {
+                best = Some(MemInfo {
+                    total,
+                    available: total.saturating_sub(used),
+                });
+            }
+        }
+        best
     }
 }
 
@@ -305,7 +331,7 @@ pub fn check(label: &str, ctx: usize, usage: &Usage, info: Option<MemInfo>) -> R
         ))
     );
     let Some(info) = info else {
-        eprintln!("memory: /proc/meminfo is not readable, skipping the check");
+        eprintln!("memory: neither the GTT window nor /proc/meminfo is readable, skipping the check");
         return Ok(());
     };
     if std::env::var("MALLEUS_MEM_IGNORE").is_ok_and(|v| v != "0" && v != "false") {
@@ -323,7 +349,7 @@ pub fn check(label: &str, ctx: usize, usage: &Usage, info: Option<MemInfo>) -> R
     bail!(
         "memory: `{label}` does not fit on this host.\n\
          Need {:.1} GiB (weights {:.1} + state {:.1} x {} sessions + working set {:.1} + page cache {:.1}), \
-         MemAvailable is {:.1}: {:.1} GiB missing.\n\
+         available is {:.1}: {:.1} GiB missing.\n\
          Each session at this context costs {:.1} GiB (~{} KiB per position, {:.1} GiB per 32k positions).\n\
          The working set follows the prefill chunk: lower MALLEUS_PREFILL_CHUNK first (it costs no prefill speed \
          down to 8192), then MALLEUS_CTX (or the session count, MALLEUS_SLOTS), or use a checkpoint with fewer \
