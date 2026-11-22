@@ -111,7 +111,7 @@ times prefill and decode at each depth: the measurement behind [MODELS.md](MODEL
 (a speculative verify must be bit-identical to the serial step, or it exits non-zero), `kernel-test`, `eval`,
 `golden`, `devices`, `draft-info`, `draft-vocab`, `health`, `slim` (rewrite a `.malleus` without its MLS8 prefill
 copies, without the bf16 source), `inspect` (check a safetensors checkpoint against its family's tensor map, name by
-name). `bench/needle.py` checks over HTTP — so on any engine — that a unique fact planted
+name; with `--image` it also runs that family's vision tower on a picture). `bench/needle.py` checks over HTTP — so on any engine — that a unique fact planted
 in the middle of a 110 000-token text is still recalled, and reports prefill and decode at that depth;
 `bench/api_bench.py` does prefill and decode over HTTP from the server's own timings. The standard `malleus golden`
 stops below the sparse-attention threshold; `bench/golden-long.sh` runs the 11 000-token QSA entry against its bf16

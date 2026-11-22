@@ -112,6 +112,10 @@ enum Cmd {
         /// The safetensors directory to read
         #[arg(long)]
         model: PathBuf,
+        /// Also run the vision tower on this image and print the grid, the token span and the feature statistics
+        /// (the tower reads its 1 GB of weights and runs on the host)
+        #[arg(long)]
+        image: Option<PathBuf>,
     },
     /// Dequantise a checkpoint whose routed experts are packed (NVFP4 / MXFP8) into a bf16 safetensors
     /// directory: the file `convert` and the layer-by-layer reference read
@@ -2882,7 +2886,7 @@ fn main() -> Result<()> {
             malleus_convert::convert(&model, &out, &opts, &|m| eprintln!("{m}"))?;
             eprintln!("converted in {:.0}s", t0.elapsed().as_secs_f64());
         }
-        Cmd::Inspect { model } => {
+        Cmd::Inspect { model, image } => {
             let c = Config::from_hf(&model)?;
             for line in malleus_model::deepseek::describe(&c)? {
                 println!("{line}");
@@ -2895,6 +2899,37 @@ fn main() -> Result<()> {
             }
             if bad {
                 bail!("the checkpoint does not match the tensor map");
+            }
+            if let Some(path) = image {
+                let t0 = Instant::now();
+                let w = malleus_model::deepseek_vision::VisionWeights::load(&src, &c, &|_, _| {})?;
+                println!("vision: {:.1} MB of weights on the host", w.bytes() as f64 / 1e6);
+                let (rgb, h, wd) = (std::fs::read(&path)?, 0, 0);
+                let _ = (h, wd);
+                let v = c
+                    .deepseek
+                    .as_ref()
+                    .and_then(|d| d.vision.as_ref())
+                    .context("no vision")?;
+                let (patches, gh, gw, nh, nw) = malleus_model::deepseek_vision::preprocess(v, &rgb, 4 << 20)?;
+                let span = malleus_model::deepseek_vision::num_image_tokens(nh, nw);
+                println!(
+                    "\n{}: {}x{} patches -> {}x{} tokens ({span} positions)",
+                    path.display(),
+                    gh,
+                    gw,
+                    nh,
+                    nw
+                );
+                let (_vit, merged) = malleus_model::deepseek_vision::forward(&w, &patches, gh, gw)?;
+                let mean = merged.iter().map(|x| x.abs()).sum::<f32>() / merged.len() as f32;
+                let rms = (merged.iter().map(|x| x * x).sum::<f32>() / merged.len() as f32).sqrt();
+                println!(
+                    "  merged [{} x {}]: mean |f| {mean:.3}, rms {rms:.3}, {:.1}s",
+                    nh * nw,
+                    c.hidden,
+                    t0.elapsed().as_secs_f64()
+                );
             }
         }
         Cmd::Dequant { model, out } => {

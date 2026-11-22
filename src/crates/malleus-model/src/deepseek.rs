@@ -346,12 +346,7 @@ pub(crate) fn validate(c: &Config) -> Result<()> {
 /// One line per fact `malleus inspect` reports about the geometry.
 pub fn describe(c: &Config) -> Result<Vec<String>> {
     let d = c.deepseek.as_ref().context("no deepseek config")?;
-    let mut out = vec![format!(
-        "{} layers, hidden {} ({})",
-        c.n_layers,
-        c.hidden,
-        if c.hidden == 5120 { "5120" } else { "see config" }
-    )];
+    let mut out = vec![format!("{} layers, hidden {}", c.n_layers, c.hidden)];
     out.push(format!(
         "  attention: {} heads x {} ({} nope + {} rope), q_lora {}, o_groups {} x {}",
         d.heads, d.head_dim, d.nope, d.rope, d.q_lora, d.o_groups, d.o_lora
