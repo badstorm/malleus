@@ -294,9 +294,16 @@ impl RouterStatus {
 /// The image placeholder the tokenizer knows: Qwen and the models carried so far spell it `<|image_pad|>`, Hy4
 /// spells it `<｜hy_image▁pad:opensource｜>` (the token its own chat template writes).
 fn image_pad_id(chat: &Chat) -> Option<u32> {
-    ["<|image_pad|>", "<\u{ff5c}hy_image\u{2581}pad:opensource\u{ff5c}>"]
-        .iter()
-        .find_map(|t| chat.token_id(t))
+    // The token each family's template leaves for the pixels: the carried Qwen/Hy4 models write one placeholder per
+    // merged patch, Inkling-2 writes one `<|unused_200054|>` that its processor expands into one token per 40x40 tile
+    // (the hub config does not name it, so the tokenizer is where it comes from).
+    [
+        "<|image_pad|>",
+        "<\u{ff5c}hy_image\u{2581}pad:opensource\u{ff5c}>",
+        "<|unused_200054|>",
+    ]
+    .iter()
+    .find_map(|t| chat.token_id(t))
 }
 
 /// One catalog entry in the router shape. It carries the OpenAI fields too, so a client can read either catalog the

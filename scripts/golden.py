@@ -197,6 +197,50 @@ def load_inkling2_on_gpu(model_dir: str):
     return model
 
 
+def load_vision_tower(model_dir: str):
+    """Inkling-2's vision tower alone, in float32.
+
+    The tower's fixtures are generated here and not from the loaded model, for two reasons: it is 0.64 GB instead of
+    the whole 40 GB the language model needs, and the released reference runs the tower in bf16, whose rounding is
+    ~4e-2 on `vit_out` for a 512x512 image — the same size as the port's own error would be. In f32 the fixture is
+    exact to the weight quantization, so the gate measures the port and not the reference's arithmetic.
+    """
+    from safetensors import safe_open
+    import transformers.models.inkling2.modeling_inkling2 as M
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_dir)
+    with torch.device("cuda"):
+        tower = M.Inkling2VisionModel(cfg.vision_config)
+    sd, shard = {}, None
+    for f in sorted(Path(model_dir).glob("*.safetensors")):
+        with safe_open(str(f), framework="pt") as st:
+            for k in st.keys():
+                if not k.startswith("model.visual."):
+                    continue
+                rest = k[len("model.visual.") :]
+                if rest == "proj_in.weight":
+                    sd["merger.linear_1.weight"] = st.get_tensor(k)
+                elif rest == "proj_out.weight":
+                    sd["merger.linear_2.weight"] = st.get_tensor(k)
+                else:
+                    rest = rest[len("backbone.") :]
+                    rest = rest.replace("embeddings.position_embedding", "embeddings.position_embedding.weight")
+                    rest = rest.replace("ln_pre.", "pre_layernorm.")
+                    rest = rest.replace(".ln_1.", ".layernorm_before.").replace(".ln_2.", ".layernorm_after.")
+                    rest = rest.replace(".ls_1.gamma", ".lambda_1").replace(".ls_2.gamma", ".lambda_2")
+                    rest = rest.replace(".mlp.c_fc.", ".mlp.fc1.").replace(".mlp.c_proj.", ".mlp.fc2.")
+                    sd[rest] = st.get_tensor(k)
+    missing = set(tower.state_dict()) - set(sd)
+    if missing:
+        raise KeyError(f"tower tensors not in the checkpoint: {sorted(missing)[:5]}")
+    tower.load_state_dict(sd)
+    tower = tower.float().eval()
+    tower.config.dtype = torch.float32
+    print(f"tower: {sum(p.numel() for p in tower.parameters()) / 2**20:.0f} M params, f32", flush=True)
+    return tower
+
+
 def inkling2_images(proc, out: Path, blob: Path, meta: dict, reasoning_effort: str | None):
     """The image fixtures Inkling-2's processor produces on its own: pixel_values, the grid and the expanded ids.
 
@@ -220,6 +264,49 @@ def inkling2_images(proc, out: Path, blob: Path, meta: dict, reasoning_effort: s
         print(f"{name:14} {grid[0].tolist()} {tuple(pv.shape)} tokens {ids.count(200054)}", flush=True)
 
 
+def inkling2_tower_fixtures(tower, proc, out: Path, blob: Path, meta: dict, reasoning_effort: str | None,
+                            model=None, greedy: int = 0):
+    """The tower's own fixtures (`vit_out`, `merger_out`), plus the prompt's last logits when the model is loaded.
+
+    The image rows the prompt carries are the merger's output, so `vit_out`/`merger_out` are what a port has to match
+    before anything downstream can be right; `logits_last` is the whole reference stack's answer to the same prompt.
+    """
+    by_id = {e["id"]: e for e in meta["images"]}
+    for name, im in make_images(out / "images").items():
+        msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": IMAGE_QUESTIONS[name]}]}]
+        prompt = proc.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False,
+                                          reasoning_effort=reasoning_effort, tokenize=False)
+        inp = proc(text=[prompt], images=[im], return_tensors="pt")
+        pv, grid = inp["pixel_values"], inp["image_grid_thw"]
+        with torch.no_grad():
+            vis = tower(pv.to("cuda"), image_grid_thw=grid)
+        d = blob / "images" / name
+        save_f32(d / "vit_out.f32", vis.last_hidden_state)
+        save_f32(d / "merger_out.f32", vis.pooler_output)
+        e = by_id.get(name, {"id": name, "size": list(im.size), "input_ids": inp["input_ids"][0].tolist(),
+                             "grid_thw": grid[0].tolist(), "pixel_shape": list(pv.shape),
+                             "image_tokens": inp["input_ids"][0].tolist().count(200054)})
+        e["vit_shape"], e["merger_shape"] = list(vis.last_hidden_state.shape), list(vis.pooler_output.shape)
+        e["image_tokens"] = e["input_ids"].count(200054)
+        if name not in by_id:
+            meta["images"].append(e)
+        print(f"{name:14} vit {list(vis.last_hidden_state.shape)} merger {list(vis.pooler_output.shape)}", flush=True)
+        if model is None:
+            continue
+        with torch.no_grad():
+            logits = model(**inp.to("cuda")).logits[0].float()
+        save_f32(d / "logits_last.f32", logits[-1])
+        e["argmax_last"] = int(logits[-1].argmax())
+        if greedy:
+            g = model.generate(**inp.to("cuda"), max_new_tokens=greedy, do_sample=False, temperature=None,
+                               top_p=None, top_k=None)
+            n_in = inp["input_ids"].shape[1]
+            e["greedy"] = g[0, n_in:].tolist()
+            e["greedy_text"] = proc.tokenizer.decode(g[0, n_in:])
+        print(f"{name:14} argmax_last {e['argmax_last']}", flush=True)
+    json.dump(meta, open(out / "golden.json", "w"), indent=1)
+
+
 def save_f32(path: Path, t: torch.Tensor):
     path.parent.mkdir(parents=True, exist_ok=True)
     t.detach().float().cpu().contiguous().numpy().tofile(path)
@@ -240,6 +327,10 @@ def main():
     ap.add_argument("--images-only", action="store_true",
                     help="only the image fixtures the processor alone produces (pixel_values, grid, ids): no model, "
                          "no GPU. This is the gate for a port's preprocessing, before its tower exists")
+    ap.add_argument("--tower-only", action="store_true",
+                    help="inkling2: only the tower's image fixtures (vit_out, merger_out), from the tower alone in "
+                         "float32 — 0.64 GB instead of the whole bf16 model. Keeps the other entries of an existing "
+                         "golden.json")
     args = ap.parse_args()
 
     from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -249,6 +340,21 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     blob.mkdir(parents=True, exist_ok=True)
     proc = AutoProcessor.from_pretrained(args.model)
+    if args.tower_only:
+        # The tower alone: sharp fixtures without the 40 GB the whole reference needs, and the text entries of an
+        # earlier run stay where they are.
+        if (out / "golden.json").exists():
+            meta = json.load(open(out / "golden.json"))
+        else:
+            meta = {"transformers": transformers.__version__, "torch": torch.__version__, "dtype": "float32",
+                    "text": [], "images": []}
+        # The tower's fixtures are f32 even when the rest of the manifest came from the bf16 model run.
+        meta["vision_dtype"] = "float32"
+        meta.setdefault("images", [])
+        inkling2_tower_fixtures(load_vision_tower(args.model), proc, out, blob, meta, args.reasoning_effort)
+        json.dump(meta, open(out / "golden.json", "w"), indent=1)
+        print("done", flush=True)
+        return
     if args.images_only:
         # No model: only what the processor produces, which is what a port's preprocessing has to reproduce.
         meta = {"transformers": transformers.__version__, "torch": torch.__version__, "dtype": "bfloat16",
@@ -262,6 +368,7 @@ def main():
     if args.loop_passes is not None and hasattr(model.config, "text_config"):
         model.config.text_config.loop_num_passes = args.loop_passes
         model.model.language_model.config.loop_num_passes = args.loop_passes
+    inkling2 = model.config.model_type.startswith("inkling2")
     print(f"loaded in {time.time() - t0:.0f}s", flush=True)
 
     meta = {"transformers": transformers.__version__, "torch": torch.__version__, "dtype": "bfloat16", "text": [], "images": []}
@@ -292,7 +399,13 @@ def main():
             print(pid, ids.shape[1], proc.tokenizer.decode(entry["argmax"][-1:]), flush=True)
             json.dump(meta, open(out / "golden.json", "w"), indent=1)
 
-        if not args.skip_images:
+        if not args.skip_images and inkling2:
+            # The tower's fixtures stay f32 (see `load_vision_tower`); the prompt's logits and the greedy run are the
+            # whole bf16 model's, and they are what the port's generation is compared against.
+            inkling2_tower_fixtures(load_vision_tower(args.model), proc, out, blob, meta, args.reasoning_effort,
+                                    model=model, greedy=0 if args.skip_greedy else args.greedy_tokens)
+            json.dump(meta, open(out / "golden.json", "w"), indent=1)
+        elif not args.skip_images:
             imgs = make_images(out / "images")
             for name, im in imgs.items():
                 msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": IMAGE_QUESTIONS[name]}]}]

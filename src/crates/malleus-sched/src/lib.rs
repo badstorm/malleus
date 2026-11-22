@@ -21,7 +21,7 @@ pub use catalog::{Catalog, ModelSpec};
 
 use anyhow::{Context, Result};
 use malleus_hip::DeviceBuffer;
-use malleus_model::image_pre::{PreConfig, decode, preprocess_rgb};
+use malleus_model::image_pre::{PreConfig, decode, preprocess_inkling2, preprocess_rgb};
 use malleus_model::mrope;
 use malleus_model::{GEMV_MAX_T, Model, Session, Snapshot};
 use std::sync::Arc;
@@ -787,11 +787,15 @@ impl Worker {
         if image_req {
             let token = req.image_token.context("images without an <|image_pad|> token id")?;
             // Hy4 owns its tower in `hy4_vision` and its own preprocessing/positions; the carried Qwen models use
-            // the generic `vision`. The two differ in the merge grid (Hy4 has a newline column per merged row) and
-            // in the image token count, so the expansion below is family-specific.
+            // the generic `vision`; Inkling-2 has its own graph again (`inkling2_vision`), with no resize at all and
+            // one image token per 40x40 tile. The three differ in the merge grid and in the token count, so the
+            // expansion below is family-specific.
             let hy4_merge = self.model.hy4_vision_merge();
+            let inkling2 = self.model.inkling2_vision().is_some();
             let (merge, patch) = match hy4_merge {
                 Some(m) => (m, 16),
+                // Inside the tower: the placeholder expands one token per tile, and the 2x2 merge is patches.
+                None if inkling2 => (1, 40),
                 None => {
                     let v = self.model.vision.as_ref().context("model has no vision tower")?;
                     (v.cfg.merge, v.cfg.patch)
@@ -814,6 +818,28 @@ impl Worker {
                 // instead of the 16.7 Mpx the processor would accept (~65 000 patches, hours of GPU).
                 let max_patches = env_or("MALLEUS_VISION_MAX_PATCHES", DEFAULT_VISION_MAX_PATCHES).max(1);
                 let start = expanded.len();
+                if let Some(vis) = self.model.inkling2_vision() {
+                    // The processor pads to a multiple of 40 rather than resizing, so the budget is expressed in
+                    // 20x20 patches — what the tower's quadratic attention actually costs — and bounds the padded
+                    // image here.
+                    let pre = preprocess_inkling2(
+                        &rgb,
+                        h,
+                        w,
+                        &PreConfig {
+                            patch,
+                            merge,
+                            temporal: 1,
+                            max_pixels: max_patches * 20 * 20,
+                            ..Default::default()
+                        },
+                    )?;
+                    let rows = pre.grid_h * pre.grid_w;
+                    expanded.extend(std::iter::repeat_n(token, rows));
+                    starts.push(start);
+                    merged.push(vis.encode(&self.model, &pre)?.1);
+                    continue;
+                }
                 if hy4_merge.is_some() {
                     let (feat, gh, gw) = self.model.hy4_image_features(&rgb, h, w, max_patches)?;
                     anyhow::ensure!(
@@ -874,15 +900,20 @@ impl Worker {
             }
             anyhow::ensure!(images.next().is_none(), "more images than image placeholders");
             req.prompt = expanded;
-            let pos = match hy4_merge {
-                Some(_) => self.model.hy4_image_positions(&req.prompt, token, &hgrids)?,
-                None => mrope::positions(&req.prompt, token, &grids, 0)?.0,
+            // Inkling-2 has no RoPE on the text (its positions are relative), so there is nothing to derive from the
+            // grid: the graph reads the rows it is given.
+            let pos = if inkling2 {
+                None
+            } else {
+                Some(match hy4_merge {
+                    Some(_) => self.model.hy4_image_positions(&req.prompt, token, &hgrids)?,
+                    None => mrope::positions(&req.prompt, token, &grids, 0)?.0,
+                })
             };
-            image_pos = Some(pos);
+            image_pos = pos;
             image_inserts = starts.into_iter().zip(merged).collect();
         }
         let max_snaps = self.max_snaps;
-        let quantum = self.quantum;
         let model = &self.model;
         let Slot {
             sess,
@@ -951,8 +982,14 @@ impl Worker {
         let t0 = Instant::now();
         // Prefill pieces: at most `quantum` tokens each, and never cut across an image block. An image prompt is
         // chunked like a text one: its `positions` and its embedding inserts are per token, so they are sliced per
-        // piece; what cannot be sliced is an insert, because `forward_mm` copies it whole.
+        // piece; what cannot be sliced is an insert, because `forward_mm` copies it whole. Inkling-2's looped graph
+        // reads the prompt in one forward (chunked prefill is issue #74's third item), so it gets one piece.
         let total = req.prompt.len();
+        let quantum = if self.model.is_inkling2() {
+            total.max(1)
+        } else {
+            self.quantum
+        };
         let pieces: Vec<(usize, usize)> = if image_req {
             let blocks = image_blocks(&image_inserts, self.model.cfg.hidden);
             image_pieces(total - cached_tokens, &blocks, quantum)

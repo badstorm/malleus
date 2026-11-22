@@ -34,7 +34,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
-| Inkling-2-Mini (text) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. Session state is 393 KiB per token (48 KV slots). **Text only in the engine**: the vision tower's weights are in the file and loaded, but no forward reads them, and the MTP head is not wired either. |
+| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. Session state is 393 KiB per token (48 KV slots). The vision tower runs (issue #74); the MTP head is not wired yet. |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
@@ -197,7 +197,7 @@ the KV cache (48 slots, one per layer and pass).
 
 | | value |
 |---|---|
-| weights on the device | 14.41 GB text + 0.64 GB vision + 0.27 GB (MTP, loaded, not used yet) |
+| weights on the device | 14.41 GB text + 0.64 GB vision (used, issue #74) + 0.27 GB (MTP, loaded, not used yet) |
 | session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
 | prefill `pp512` / `pp4096` / `pp8192` / `pp32768` | **305** / — / **179** / **105** tok/s |
 | decode `tg16` at ctx 512 / 2048 / 8192 / 32768 | **16.6** / **15.5** / **14.1** / ~9 tok/s |
@@ -331,6 +331,32 @@ prompt.
 The two chat documents are the outliers (+90 % and +14 % perplexity against +1.7…+5.3 % for the six plain ones) and
 they are the only documents over 1 000 tokens whose tokens are *not* plain prose: they open with the reasoning-effort
 system line of the chat template. Open question, tracked in issue #70.
+
+### Quality: the vision tower (issue #74)
+
+The tower is its own graph: no resize (the image is padded to a multiple of 40 with `-1.0` on the 0..255 scale), one
+40x40 tile per image token, 23 pre-norm blocks at 1024 wide with 16 heads of 64, an axial RoPE whose positions are
+one-based and in tile-major order, a per-channel layer scale, then the 2x2 merger 4096 -> 2304. The prompt carries one
+`<|unused_200054|>` per tile and the forward replaces their embedding rows with the merger's output, after the
+embedding's own norm — which is where the reference splices them.
+
+`golden` over the 10 image fixtures of `golden/inkling2/images`, against the tower alone in float32:
+
+| image | grid (tiles) | `vit_out` rel | `merger_out` rel | encode |
+|---|---|---|---|---|
+| 96x96 | 3x3 | **1.3e-6** | 2.7e-6 | 0.07 s |
+| 480x480 | 12x12 | 5.8e-6 | 5.5e-6 | 1.1 s |
+| 512x512 | 13x13 | 9.1e-6 | 8.2e-6 | 1.4 s |
+| 1024x256 | 7x26 | 1.3e-5 | 1.3e-5 | 1.5 s |
+| 900x600 | 15x23 | 7.7e-6 | 7.2e-6 | 4.3 s |
+| 1280x720 | 18x32 | 3.0e-5 | 2.8e-5 | 9.4 s |
+
+Last-token top-1 on the prompt that carries each image: **10/10**. The fixtures are the tower alone in float32 and
+not the whole bf16 model, because the reference itself rounds to bf16: 4e-2 of `vit_out` on a 512x512 image is bf16
+noise, the same size as the error a port would have, and a gate at that level would hide a wrong patch order — as it
+did, before the positions and the interpolation were sampled in the tile-major order the patches are in. The
+`logits_last` of the same fixtures are the whole bf16 model's (the tower alone cannot say what the text does with the
+image rows); `golden.json` says which is which with `vision_dtype`.
 
 
 ## How these numbers are produced

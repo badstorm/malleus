@@ -90,7 +90,19 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "moe_w2a8_m32_yh",
         ],
     ),
-    ("vision", &["layernorm", "bias_act", "vision_rope", "vision_attention"]),
+    (
+        "vision",
+        &[
+            "layernorm",
+            "bias_act",
+            "vision_rope",
+            "vision_attention",
+            "inkling2_vision_split",
+            "inkling2_vision_rope",
+            "inkling2_vision_attn",
+            "inkling2_vision_scale_add",
+        ],
+    ),
     (
         "qwen4",
         &[
