@@ -1353,9 +1353,14 @@ fn argmax(v: &[f32], n: usize) -> u32 {
 /// two extra passes over the core (`n_layers + (passes - 1) * core`). Keys and values are fp32 like the rest of the
 /// graph; at 24 heads x 8 KV heads x 128 that is 8 KiB per token per slot (393 KiB per token over the 48 slots).
 pub struct Slot {
-    /// [`max`, kv_heads * head_dim] fp32, the keys after the convolution, the clip and the L2 norm.
+    /// [`rows`, kv_heads * head_dim] fp32, the keys after the convolution, the clip and the L2 norm.
     k: DeviceBuffer,
     v: DeviceBuffer,
+    /// Rows of `k`/`v`, and the ring they are indexed with: a sliding layer only ever reads the last `window` keys,
+    /// so its cache is a ring of `window + DRAFT_ROWS + 1` rows and position `p` lives at `p % ring`. A full-attention
+    /// layer has no ring (0) and position `p` is row `p`, with `rows == max`.
+    rows: usize,
+    ring: usize,
     /// [3, kv_heads * head_dim] the convolution input of the last three positions, oldest first.
     past_k: DeviceBuffer,
     past_v: DeviceBuffer,
@@ -1390,11 +1395,29 @@ impl Cache {
         let core = i.loop_end - i.loop_start;
         let slots = c.n_layers + (i.loop_passes.max(1) - 1) * core;
         let kvd = i.kv_heads * i.head_dim;
+        // The physical layer of a slot says whether it slides: the loop's passes rerun the same layers.
+        let w = model.inkling2.as_ref().context("no inkling2 weights")?;
+        let full: Vec<bool> = (0..slots)
+            .map(|s| {
+                // The inverse of `slot_of`: the extra slots are the core layers of the loop's later passes.
+                let l = if s < c.n_layers {
+                    s
+                } else {
+                    i.loop_start + (s - c.n_layers) % core
+                };
+                w.layers[l].full
+            })
+            .collect();
         let mut out = Vec::with_capacity(slots);
-        for _ in 0..slots {
+        for &is_full in full.iter() {
+            // A sliding layer reads at most its window back, so the rest of the cache would never be read again.
+            let ring = if is_full { 0 } else { i.window + DRAFT_ROWS + 1 };
+            let rows = if ring > 0 { ring.min(max_ctx) } else { max_ctx };
             out.push(Slot {
-                k: f32s(max_ctx * kvd)?,
-                v: f32s(max_ctx * kvd)?,
+                k: f32s(rows * kvd)?,
+                v: f32s(rows * kvd)?,
+                rows,
+                ring: if rows == max_ctx { 0 } else { rows },
                 // Zeroed: the taps before the first token are the reference's left padding.
                 past_k: DeviceBuffer::zeroed(3 * kvd * 4)?,
                 past_v: DeviceBuffer::zeroed(3 * kvd * 4)?,
@@ -1459,6 +1482,31 @@ struct Place<'a> {
 
 /// Keeps the last three rows of a convolution's input in `past` ([3, C], oldest first), so the next call convolves
 /// across the boundary. `pos` is the position of the first row of `x`; rows before the sequence stay zero.
+/// Writes `t` rows of a layer's keys (or values) at logical position `pos`, into the slot's ring when it has one:
+/// only the last `ring` rows survive a chunk longer than the ring, and the copy that crosses the end is split in two.
+fn kv_write(
+    dst: &DeviceBuffer,
+    capacity: usize,
+    ring: usize,
+    pos: usize,
+    t: usize,
+    src: &DeviceBuffer,
+    c: usize,
+    st: &Stream,
+) -> Result<()> {
+    // A ring keeps the last `capacity` rows of a chunk; without one every row of it fits (`capacity` is the context).
+    let rows = t.min(capacity);
+    let first = pos + t - rows;
+    let start = if ring > 0 { first % ring } else { first };
+    let upto = if ring > 0 { ring } else { capacity };
+    let n = (upto - start).min(rows);
+    dst.copy_from_shared(start * c * 4, src, (first - pos) * c * 4, n * c * 4, st)?;
+    if n < rows {
+        dst.copy_from_shared(0, src, (first - pos + n) * c * 4, (rows - n) * c * 4, st)?;
+    }
+    Ok(())
+}
+
 fn keep_last3(st: &Stream, past: &DeviceBuffer, x: &DeviceBuffer, pos: usize, t: usize, c: usize) -> Result<()> {
     for i in 0..3 {
         // The row of the new history is global position pos + t - 3 + i: from `x` when the call has it, from the old
@@ -1960,12 +2008,8 @@ impl Graph {
         clip(model, st, &self.r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
         // The keys and values of this layer, as attention reads them, across every position the session holds.
         if let Some(p) = place.as_mut() {
-            p.slot
-                .k
-                .copy_from_shared(p.pos * kvd * 4, &self.k, 0, t * kvd * 4, st)?;
-            p.slot
-                .v
-                .copy_from_shared(p.pos * kvd * 4, &self.v, 0, t * kvd * 4, st)?;
+            kv_write(&p.slot.k, p.slot.rows, p.slot.ring, p.pos, t, &self.k, kvd, st)?;
+            kv_write(&p.slot.v, p.slot.rows, p.slot.ring, p.pos, t, &self.v, kvd, st)?;
         }
         let window = if full { 0 } else { i.window };
         let scale = 1.0 / (hd as f32).sqrt();
@@ -2007,6 +2051,10 @@ impl Graph {
                         i.rel_extent.into(),
                     ],
                 )?;
+                // A sliding layer's cache is a ring: the first key of the window sits at `k0 % ring` and wraps
+                // around once, so the kernel is handed the wrapped start and the ring length.
+                let ring = p.slot.ring;
+                let k0r = if ring > 0 { k0 % ring } else { k0 };
                 model.k.get("inkling2_attn_dec").launch(
                     (heads as u32, 1, 1),
                     (128, 1, 1),
@@ -2020,11 +2068,12 @@ impl Graph {
                         p.bias.into(),
                         Arg::U64(self.sink.addr() + (j * heads * 4) as u64),
                         Arg::U64(self.gate.addr() + qd),
-                        k0.into(),
+                        k0r.into(),
                         nk.into(),
                         heads.into(),
                         kv.into(),
                         hd.into(),
+                        ring.into(),
                         scale.into(),
                     ],
                 )?;
