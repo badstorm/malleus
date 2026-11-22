@@ -161,7 +161,9 @@ impl Family {
     }
 
     /// Whether an MLS8 prefill copy of an MLS4 tensor fits the memory budget. qwen4_exp (123 B expert parameters)
-    /// keeps it only outside the experts; Ling-3.0-flash (124 GB more) has none and prefills on W4A8.
+    /// keeps it only outside the experts; Ling-3.0-flash (124 GB more) has none and prefills on W4A8. Hy4-flash is
+    /// the same shape as qwen4_exp: the routed experts alone are ~75 GB, so only the dense linears get the copy
+    /// and the experts never do.
     fn prefill_copy(self, expert: bool) -> bool {
         match self {
             Family::Qwen35 => true,
@@ -169,8 +171,7 @@ impl Family {
             Family::Ling3 => false,
             // 738 MB of draft: it never runs on more than a block of positions, so a prefill copy is dead weight.
             Family::Dflash => false,
-            // The routed experts alone are ~75 GB: a second copy is 75 GB more on a machine that holds 122 GB.
-            Family::Hy4 => false,
+            Family::Hy4 => !expert,
             // Inkling-2 has no measurement of what an MLS8 prefill would buy: single copy until one exists.
             Family::Inkling2 => false,
         }
@@ -1363,7 +1364,7 @@ mod tests {
         assert_eq!(f("bailing_hybrid"), Family::Ling3);
         assert_eq!(f("hy_v4_flash"), Family::Hy4);
         assert_eq!(Family::Hy4.arch(), "hy4");
-        assert!(!Family::Hy4.prefill_copy(true) && !Family::Hy4.prefill_copy(false));
+        assert!(!Family::Hy4.prefill_copy(true) && Family::Hy4.prefill_copy(false));
         assert_eq!(Family::Ling3.arch(), "ling3");
         assert_eq!(Family::Qwen4Exp.arch(), "qwen4exp");
         assert!(Family::Qwen35.prefill_copy(true) && !Family::Ling3.prefill_copy(true));
