@@ -1477,6 +1477,11 @@ impl Model {
         Ok(())
     }
 
+    /// Whether the file is the looped Inkling-2 graph, whose prefill goes through in one forward.
+    pub fn is_inkling2(&self) -> bool {
+        self.inkling2.is_some()
+    }
+
     /// Inkling-2's vision tower, when the file carries one: its own graph (`crate::inkling2::Vision`), not the
     /// `vision` field of the carried families.
     pub fn inkling2_vision(&self) -> Option<&crate::inkling2::Vision> {
@@ -1498,15 +1503,6 @@ impl Model {
         positions: Option<&[[i32; 3]]>,
         n_logits: usize,
     ) -> Result<Vec<f32>> {
-        // Inkling-2's release graph is the looped forward in `crate::inkling2`, not the generic stack: the
-        // generic path's layer/state bookkeeping does not describe its 48 KV slots.
-        if self.inkling2.is_some() {
-            let cache = sess.inkling2.as_deref_mut().context("inkling2 session")?;
-            let all = crate::inkling2::logits(self, Some(cache), tokens, n_logits)?;
-            let vocab = self.cfg.vocab;
-            let start = all.len().saturating_sub(n_logits * vocab);
-            return Ok(all[start..].to_vec());
-        }
         self.forward_mm(sess, tokens, positions, n_logits, &[])
     }
 
@@ -1519,6 +1515,15 @@ impl Model {
         n_logits: usize,
         inserts: &[(usize, &DeviceBuffer)],
     ) -> Result<Vec<f32>> {
+        // Inkling-2's release graph is the looped forward in `crate::inkling2`, not the generic stack: the
+        // generic path's layer/state bookkeeping does not describe its 48 KV slots.
+        if self.inkling2.is_some() {
+            let cache = sess.inkling2.as_deref_mut().context("inkling2 session")?;
+            let all = crate::inkling2::logits_mm(self, Some(cache), tokens, n_logits, inserts)?;
+            let vocab = self.cfg.vocab;
+            let start = all.len().saturating_sub(n_logits * vocab);
+            return Ok(all[start..].to_vec());
+        }
         self.forward_impl(sess, tokens, positions, n_logits, inserts, false, false)
     }
 

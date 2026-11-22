@@ -158,7 +158,7 @@ extern "C" __global__ void inkling2_vision_attn(float* out, const float* q, cons
     out[((size_t)p * H + h) * D + d] = o / L;
 }
 
-// x[i] += lambda[i % n] * y[i]:// x[i] += lambda[i % n] * y[i]: the tower's per-channel layer scale before the residual add.
+// x[i] += lambda[i % n] * y[i]: the tower's per-channel layer scale before the residual add.
 extern "C" __global__ void inkling2_vision_scale_add(float* x, const float* y, const bf16_t* lambda, long long total,
                                                      int n) {
     const long long i = (long long)blockIdx.x * 256 + threadIdx.x;

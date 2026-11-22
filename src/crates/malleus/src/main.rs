@@ -978,23 +978,76 @@ fn golden_image(m: &Model, e: &serde_json::Value, img_dir: &Path, blob: &Path, c
             pre.grid_w,
             if px_ok { "" } else { "  (grid: MISMATCH)" }
         );
-        // The tower, against the two tensors the reference produced: the sequence before the projector and the
-        // merged rows that replace the image tokens (issue #74).
+        // The tower against the two tensors the reference produced, then the whole prompt: the image rows replace
+        // the placeholders the processor expanded, and the next token must be the reference's (issue #74).
         let vis = m.inkling2_vision().context("inkling2 has no vision tower")?;
         let t0 = Instant::now();
         let (vit, merged) = vis.encode(m, &pre)?;
         let dt = t0.elapsed().as_secs_f64();
-        let vit = vit.download::<f32>(vit.len() / 4)?;
-        let mg = merged.download::<f32>(merged.len() / 4)?;
+        let vit_a = vit.download::<f32>(vit.len() / 4)?;
+        let mg_a = merged.download::<f32>(merged.len() / 4)?;
         let (rv, rm) = (
             read_f32(&blob.join("vit_out.f32"))?,
             read_f32(&blob.join("merger_out.f32"))?,
         );
         print!(
             "  tower {dt:5.2}s vit rel {:.2e} merger rel {:.2e}",
-            rel_err(&vit, &rv),
-            rel_err(&mg, &rm)
+            rel_err(&vit_a, &rv),
+            rel_err(&mg_a, &rm)
         );
+        let i = m.cfg.inkling2.as_ref().context("inkling2 config")?;
+        let image_token = vis.image_token;
+        let ids: Vec<u32> = e["input_ids"]
+            .as_array()
+            .context("ids")?
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let rows = merged.len() / (4 * m.cfg.hidden);
+        let start = ids.iter().position(|&t| t == image_token).context("no image token")?;
+        ensure!(
+            ids.iter().filter(|&&t| t == image_token).count() == rows,
+            "{id}: the prompt carries {} image tokens for {rows} rows",
+            ids.iter().filter(|&&t| t == image_token).count()
+        );
+        let mut sess = m.new_session(ctx)?;
+        let logits = m.forward_mm(&mut sess, &ids, None, 1, &[(start, &merged)])?;
+        let rl = read_f32(&blob.join("logits_last.f32"))?;
+        // The reference's head covers the real vocabulary, not the padded one: compare the rows that exist.
+        let ours = &logits[..i.unpadded_vocab.min(logits.len())];
+        let (lp_ref, lp_our) = (log_softmax(&rl), log_softmax(ours));
+        let kl: f64 = lp_ref.iter().zip(&lp_our).map(|(r, o)| r.exp() * (r - o)).sum();
+        print!(
+            "  prompt {} tok: top1 {} KL {kl:.5}",
+            ids.len(),
+            if argmax(ours) == argmax(&rl) { "ok" } else { "MISMATCH" }
+        );
+        // The last token is nearly deterministic here, so the KL says little: the greedy continuation over the same
+        // prompt is what tells whether the image rows landed where the reference put them.
+        if greedy && let Some(refg) = e["greedy"].as_array() {
+            let mut refg: Vec<u32> = refg.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+            if let Some(i) = refg.iter().position(|t| m.cfg.eos.contains(t)) {
+                refg.truncate(i + 1);
+            }
+            let mut next = argmax(ours) as u32;
+            let mut out = Vec::new();
+            let t0 = Instant::now();
+            for _ in 0..refg.len() {
+                out.push(next);
+                if m.cfg.eos.contains(&next) {
+                    break;
+                }
+                let l = m.forward(&mut sess, &[next], None, 1)?;
+                next = argmax(&l[..i.unpadded_vocab.min(l.len())]) as u32;
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            let same = out.iter().zip(&refg).take_while(|(a, b)| a == b).count();
+            print!(
+                "  greedy {same}/{} identical, decode {:.2} tok/s",
+                refg.len(),
+                out.len() as f64 / dt
+            );
+        }
         println!();
         return Ok(());
     }
@@ -2632,6 +2685,60 @@ fn kernel_test() -> Result<()> {
                 }
             }
             println!("inkling2_vis_rope rel err {:.2e}", rel_err(&want, &got));
+            // The attention: out = softmax(q k^T / sqrt(D)) v, one image, no mask.
+            let (q0, k0, v0): (Vec<f32>, Vec<f32>, Vec<f32>) = (
+                (0..p * hh * d).map(|_| rnd()).collect(),
+                (0..p * hh * d).map(|_| rnd()).collect(),
+                (0..p * hh * d).map(|_| rnd()).collect(),
+            );
+            let (qd, kd, vd, ad) = (
+                DeviceBuffer::from_slice(&q0)?,
+                DeviceBuffer::from_slice(&k0)?,
+                DeviceBuffer::from_slice(&v0)?,
+                DeviceBuffer::zeroed(p * hh * d * 4)?,
+            );
+            let scale = 1.0 / (d as f32).sqrt();
+            k.get("inkling2_vision_attn").launch(
+                (p as u32, hh as u32, 1),
+                (256, 1, 1),
+                0,
+                &s,
+                &[
+                    (&ad).into(),
+                    (&qd).into(),
+                    (&kd).into(),
+                    (&vd).into(),
+                    p.into(),
+                    hh.into(),
+                    d.into(),
+                    scale.into(),
+                ],
+            )?;
+            s.synchronize()?;
+            let got = ad.download::<f32>(p * hh * d)?;
+            let mut want = vec![0f32; p * hh * d];
+            for r in 0..p {
+                for h in 0..hh {
+                    fn row(x: &[f32], j: usize, h: usize, d: usize, hh: usize) -> &[f32] {
+                        &x[(j * hh + h) * d..(j * hh + h) * d + d]
+                    }
+                    let mut sc = vec![0f32; p];
+                    for (j, s_j) in sc.iter_mut().enumerate() {
+                        *s_j = row(&q0, r, h, d, hh)
+                            .iter()
+                            .zip(row(&k0, j, h, d, hh))
+                            .map(|(a, b)| a * b)
+                            .sum::<f32>()
+                            * scale;
+                    }
+                    let m = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let e: Vec<f32> = sc.iter().map(|x| (x - m).exp()).collect();
+                    let l: f32 = e.iter().sum();
+                    for c in 0..d {
+                        want[(r * hh + h) * d + c] = (0..p).map(|j| e[j] * row(&v0, j, h, d, hh)[c]).sum::<f32>() / l;
+                    }
+                }
+            }
             println!("inkling2_vis_attn rel err {:.2e}", rel_err(&want, &got));
             // The layer scale: x += lambda[i % n] * y.
             let (rows, n) = (5usize, 6usize);

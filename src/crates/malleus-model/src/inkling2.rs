@@ -463,6 +463,9 @@ pub struct Vision {
     pub temporal: usize,
     pub merge: usize,
     pub grid: usize,
+    /// Token id of an image placeholder in the prompt: the processor expands the one the template writes into
+    /// `rows * columns` copies, and the forward replaces their rows with the merger's features.
+    pub image_token: u32,
 }
 
 pub struct VisLayer {
@@ -571,6 +574,7 @@ impl Vision {
             temporal: v.temporal,
             merge: v.merge,
             grid: v.grid,
+            image_token: v.image_token,
         }))
     }
 }
@@ -618,8 +622,11 @@ impl Vision {
         )?;
         let x = f(np * h)?;
         gemm_bf16(k, st, &x, &patches, &self.patch, np, h, dim)?;
+        vdump("split", &patches, np * dim)?;
+        vdump("patch_emb", &x, np * h)?;
         // 2. The learned position table, resampled to this patch grid, then one class token in front.
         let pos = DeviceBuffer::from_slice(&self.pos_embed(ph, pw, h))?;
+        vdump("pos", &pos, np * h)?;
         k.get("add_inplace").launch(
             ((np * h).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
@@ -632,12 +639,19 @@ impl Vision {
         bias_act(k, st, &seq, &self.class_embedding, 1, h, 0)?;
         bias_act(k, st, &seq, &self.cls_position, 1, h, 0)?;
         seq.copy_from_shared(h * 4, &x, 0, np * h * 4, st)?;
-        // 3. The RoPE positions: the class token sits at (0, 0), the patches at one-based (row, col).
+        vdump("emb", &seq, rows * h)?;
+        // 3. The RoPE positions: the class token sits at (0, 0), the patches at one-based (row, col). The patches are
+        // in tile-major order (`merge x merge` per tile), so their positions are too: row-major here would rotate
+        // every patch of a tile with the position of its neighbour.
         let mut hw = Vec::with_capacity(rows * 2);
         hw.extend_from_slice(&[0i32, 0]);
-        for r in 0..ph {
-            for c in 0..pw {
-                hw.extend_from_slice(&[r as i32 + 1, c as i32 + 1]);
+        for tr in 0..gh {
+            for tc in 0..gw {
+                for sy in 0..m {
+                    for sx in 0..m {
+                        hw.extend_from_slice(&[(tr * m + sy) as i32 + 1, (tc * m + sx) as i32 + 1]);
+                    }
+                }
             }
         }
         let hw = DeviceBuffer::from_slice(&hw)?;
@@ -646,11 +660,15 @@ impl Vision {
         // The tower replaces the sequence with its pre-layernormed form: that is what the blocks carry as the
         // residual, not the embedding.
         seq.copy_from_shared(0, &normed, 0, rows * h * 4, st)?;
+        vdump("lnpre", &seq, rows * h)?;
         let (q, kk, vv) = (f(rows * h)?, f(rows * h)?, f(rows * h)?);
         let (att, mlp) = (f(rows * h)?, f(rows * inter)?);
         let scale = 1.0 / (hd as f32).sqrt();
-        for b in &self.layers {
+        for (bi, b) in self.layers.iter().enumerate() {
             layernorm(k, st, &normed, &seq, &b.ln_1, rows, h, v.eps)?;
+            if bi == 0 {
+                vdump("lnb", &normed, rows * h)?;
+            }
             for (out, w) in [(&q, &b.q), (&kk, &b.k), (&vv, &b.v)] {
                 gemm_bf16(k, st, out, &normed, &w.0, rows, h, h)?;
                 bias_act(k, st, out, &w.1, rows, h, 0)?;
@@ -671,6 +689,10 @@ impl Vision {
                     ],
                 )?;
             }
+            if bi == 0 {
+                vdump("qrope", &q, rows * h)?;
+                vdump("krope", &kk, rows * h)?;
+            }
             k.get("inkling2_vision_attn").launch(
                 (rows as u32, heads as u32, 1),
                 (256, 1, 1),
@@ -689,6 +711,10 @@ impl Vision {
             )?;
             gemm_bf16(k, st, &normed, &att, &b.out.0, rows, h, h)?;
             bias_act(k, st, &normed, &b.out.1, rows, h, 0)?;
+            if bi == 0 {
+                vdump("attn_out", &normed, rows * h)?;
+                vdump("v", &vv, rows * h)?;
+            }
             k.get("inkling2_vision_scale_add").launch(
                 ((rows * h).div_ceil(256) as u32, 1, 1),
                 (256, 1, 1),
@@ -703,10 +729,17 @@ impl Vision {
                 ],
             )?;
             layernorm(k, st, &normed, &seq, &b.ln_2, rows, h, v.eps)?;
+            if bi == 0 {
+                vdump("lna", &normed, rows * h)?;
+            }
             gemm_bf16(k, st, &mlp, &normed, &b.fc.0, rows, inter, h)?;
-            bias_act(k, st, &mlp, &b.fc.1, rows, inter, 1)?;
+            bias_act(k, st, &mlp, &b.fc.1, rows, inter, 2)?;
             gemm_bf16(k, st, &normed, &mlp, &b.proj.0, rows, h, inter)?;
             bias_act(k, st, &normed, &b.proj.1, rows, h, 0)?;
+            if bi == 0 {
+                vdump("mlp_out", &normed, rows * h)?;
+                vdump("fc1", &mlp, rows * inter)?;
+            }
             k.get("inkling2_vision_scale_add").launch(
                 ((rows * h).div_ceil(256) as u32, 1, 1),
                 (256, 1, 1),
@@ -720,6 +753,7 @@ impl Vision {
                     h.into(),
                 ],
             )?;
+            vdump(&format!("l{bi}"), &seq, rows * h)?;
         }
         // 4. The projector: the patch rows only (the class token is dropped), `m * m` of them per output row.
         let nm = np / (m * m);
@@ -746,39 +780,50 @@ impl Vision {
         bias_act(k, st, &mid, &zero, nm, v.proj_hidden, 2)?;
         let out = f(nm * model.cfg.hidden)?;
         gemm_bf16(k, st, &out, &mid, &self.proj_out, nm, model.cfg.hidden, v.proj_hidden)?;
+        vdump("vit", &seq, rows * h)?;
+        vdump("merger", &out, nm * model.cfg.hidden)?;
         Ok((seq, out))
     }
 
     /// The learned `grid x grid` position table resampled to a `ph x pw` patch grid, `bilinear`, `align_corners=False`,
-    /// border padding — the tower's grid is sampled per patch, and the patches are already in tile-major order.
+    /// border padding — the tower's grid is sampled per patch, and the patches are already in tile-major order, so the
+    /// table's rows are walked in that order too.
     fn pos_embed(&self, ph: usize, pw: usize, h: usize) -> Vec<f32> {
-        let side = self.grid;
+        let (side, m) = (self.grid, self.merge);
         let taps = |i: usize, n: usize| -> [(usize, f32); 2] {
             let src = if n > 1 {
                 (i as f32 + 0.5) * (side as f32) / (n as f32) - 0.5
             } else {
                 0.0
             };
+            // The two taps are `floor` and `floor + 1` clamped to the table, weights `1 - frac` and `frac`: when the
+            // grid is wider than the table (`n > side`) `floor` goes negative and both taps land on row 0, which is
+            // what the reference does too — clamping the first tap before stepping to the second would not.
             let f = src.floor();
-            let lo = (f.max(0.0) as usize).min(side - 1);
             let fr = (src - f).clamp(0.0, 1.0);
-            [(lo, 1.0 - fr), ((lo + 1).min(side - 1), fr)]
+            let tap = |k: f32| (k.max(0.0) as usize).min(side - 1);
+            [(tap(f), 1.0 - fr), (tap(f + 1.0), fr)]
         };
         let table = &self.pos_f32;
         let mut out = Vec::with_capacity(ph * pw * h);
         let mut acc = vec![0f32; h];
-        for r in 0..ph {
-            for c in 0..pw {
-                acc.iter_mut().for_each(|v| *v = 0.0);
-                for (ty, wy) in taps(r, ph) {
-                    for (tx, wx) in taps(c, pw) {
-                        let wgt = wy * wx;
-                        for (i, v) in acc.iter_mut().enumerate() {
-                            *v += wgt * table[(ty * side + tx) * h + i];
+        for tr in 0..ph / m {
+            for tc in 0..pw / m {
+                for sy in 0..m {
+                    for sx in 0..m {
+                        let (r, c) = (tr * m + sy, tc * m + sx);
+                        acc.iter_mut().for_each(|v| *v = 0.0);
+                        for (ty, wy) in taps(r, ph) {
+                            for (tx, wx) in taps(c, pw) {
+                                let wgt = wy * wx;
+                                for (i, v) in acc.iter_mut().enumerate() {
+                                    *v += wgt * table[(ty * side + tx) * h + i];
+                                }
+                            }
                         }
+                        out.extend_from_slice(&acc);
                     }
                 }
-                out.extend_from_slice(&acc);
             }
         }
         out
@@ -2371,6 +2416,18 @@ impl Graph {
 /// With a `cache` the keys, the values and the convolution histories land in the session, and a single token runs
 /// the one-token kernels against them instead of the whole prompt again.
 fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>, n_logits: usize) -> Result<Vec<f32>> {
+    run_mm(model, tokens, cache, n_logits, &[])
+}
+
+/// [`run`], with rows `[start, start + n)` of the input embeddings replaced by `buf` ([n, hidden], f32): the image
+/// rows an Inkling-2 prompt carries in place of its `<|unused_…|>` placeholders.
+fn run_mm(
+    model: &Model,
+    tokens: &[u32],
+    cache: Option<&mut Cache>,
+    n_logits: usize,
+    inserts: &[(usize, &DeviceBuffer)],
+) -> Result<Vec<f32>> {
     let c = &model.cfg;
     let i = c.inkling2.as_ref().context("no inkling2 config")?;
     let w = model.inkling2.as_ref().context("no inkling2 weights")?;
@@ -2414,6 +2471,13 @@ fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>, n_logits: usize
         &[(&g.x).into(), (&w.embed).into(), (&idbuf).into(), h.into()],
     )?;
     rms(model, st, &g.x, &g.x, &w.embed_norm, t, h, c.eps)?;
+    // The image features replace the placeholder's embedding rows after the embedding's own norm, which is where the
+    // reference splices them (`masked_scatter` on `embed_tokens(input_ids)`).
+    for (start, buf) in inserts {
+        let rows = buf.len() / (h * 4);
+        ensure!(*start + rows <= t, "inkling2: image rows out of range");
+        g.x.copy_from(start * h * 4, buf, 0, rows * h * 4, st)?;
+    }
 
     // The cross-pass queries, [core, 4, hidden]: the checkpoint stores two rows per core layer in each table, and
     // the message attention reads [query, key, value, mlp] as [q[2i], kv[2i], kv[2i+1], q[2i+1]].
@@ -2502,6 +2566,17 @@ fn run(model: &Model, tokens: &[u32], cache: Option<&mut Cache>, n_logits: usize
 /// The logits of the last `n_logits` positions of `tokens`, appending to the session's cache when there is one.
 pub fn logits(model: &Model, cache: Option<&mut Cache>, tokens: &[u32], n_logits: usize) -> Result<Vec<f32>> {
     run(model, tokens, cache, n_logits)
+}
+
+/// [`logits`], with image rows spliced into the input embeddings (see [`run_mm`]).
+pub fn logits_mm(
+    model: &Model,
+    cache: Option<&mut Cache>,
+    tokens: &[u32],
+    n_logits: usize,
+    inserts: &[(usize, &DeviceBuffer)],
+) -> Result<Vec<f32>> {
+    run_mm(model, tokens, cache, n_logits, inserts)
 }
 
 /// `Place` for one layer of the session's cache, or `None` without a cache.
