@@ -935,11 +935,52 @@ fn rel_err(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn golden_image(m: &Model, e: &serde_json::Value, img_dir: &Path, blob: &Path, ctx: usize, greedy: bool) -> Result<()> {
-    use malleus_model::image_pre::{PreConfig, decode, preprocess_rgb};
+    use malleus_model::image_pre::{PreConfig, decode, preprocess_inkling2, preprocess_rgb};
     let id = e["id"].as_str().unwrap_or("?");
-    let v = m.vision.as_ref().context("model has no vision tower")?;
     let bytes = std::fs::read(img_dir.join(format!("{id}.png")))?;
     let (rgb, h, w) = decode(&bytes, &PreConfig::default())?;
+    // Inkling-2 (issue #74): its tower is not wired yet, so this checks the preprocessing alone — the padding rule,
+    // the patch grid and the channel-last patch layout — against the `pixel_values` the reference processor wrote.
+    if m.cfg.family == Family::Inkling2 {
+        let pc = PreConfig {
+            patch: 40,
+            merge: 1,
+            temporal: 1,
+            max_pixels: 4 << 20,
+            ..Default::default()
+        };
+        let pre = preprocess_inkling2(&rgb, h, w, &pc)?;
+        let grid: Vec<usize> = e["grid_thw"]
+            .as_array()
+            .context("grid")?
+            .iter()
+            .map(|x| x.as_u64().unwrap() as usize)
+            .collect();
+        let ref_px = read_f32(&blob.join("pixel_values.f32"))?;
+        let px_ok = grid.len() == 3 && [pre.grid_t, pre.grid_h, pre.grid_w] == grid[..];
+        let (n, max) = if px_ok && ref_px.len() == pre.pixels.len() {
+            (
+                pre.pixels.len(),
+                pre.pixels
+                    .iter()
+                    .zip(&ref_px)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max),
+            )
+        } else {
+            (pre.pixels.len(), f32::NAN)
+        };
+        println!(
+            "img {id:14} {:3}x{h:<4} grid [{},{},{}] values {n} max|d| {max:.3e}{}",
+            w,
+            pre.grid_t,
+            pre.grid_h,
+            pre.grid_w,
+            if px_ok { "" } else { "  (grid vs reference: MISMATCH)" }
+        );
+        return Ok(());
+    }
+    let v = m.vision.as_ref().context("model has no vision tower")?;
     let pc = PreConfig {
         max_pixels: 16777216,
         ..Default::default()

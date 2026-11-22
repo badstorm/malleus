@@ -197,6 +197,29 @@ def load_inkling2_on_gpu(model_dir: str):
     return model
 
 
+def inkling2_images(proc, out: Path, blob: Path, meta: dict, reasoning_effort: str | None):
+    """The image fixtures Inkling-2's processor produces on its own: pixel_values, the grid and the expanded ids.
+
+    Inkling-2 does not resize: it pads to a multiple of 40 with -1.0 on the 0..255 scale, normalizes by 0.5/0.5 and
+    cuts the image into one 40x40 patch per vision token, and the *processor* expands the single `<|content_image|>`
+    token the template renders into `rows * columns` copies of `<|unused_200054|>`. Those two facts are the whole
+    preprocessing contract, so they are what a port is checked against first.
+    """
+    d_all = blob / "images"
+    for name, im in make_images(out / "images").items():
+        msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": IMAGE_QUESTIONS[name]}]}]
+        prompt = proc.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False,
+                                          reasoning_effort=reasoning_effort, tokenize=False)
+        inp = proc(text=[prompt], images=[im], return_tensors="pt")
+        pv, grid = inp["pixel_values"], inp["image_grid_thw"]
+        save_f32(d_all / name / "pixel_values.f32", pv)
+        ids = inp["input_ids"][0].tolist()
+        meta["images"].append({"id": name, "size": list(im.size), "input_ids": ids,
+                               "grid_thw": grid[0].tolist(), "pixel_shape": list(pv.shape),
+                               "image_tokens": ids.count(200054)})
+        print(f"{name:14} {grid[0].tolist()} {tuple(pv.shape)} tokens {ids.count(200054)}", flush=True)
+
+
 def save_f32(path: Path, t: torch.Tensor):
     path.parent.mkdir(parents=True, exist_ok=True)
     t.detach().float().cpu().contiguous().numpy().tofile(path)
@@ -214,6 +237,9 @@ def main():
                     help="template reasoning effort for models that use it (inkling2: none|low|...)")
     ap.add_argument("--loop-passes", type=int, default=None,
                     help="inkling2: override loop_num_passes (1 = the base graph, for debugging)")
+    ap.add_argument("--images-only", action="store_true",
+                    help="only the image fixtures the processor alone produces (pixel_values, grid, ids): no model, "
+                         "no GPU. This is the gate for a port's preprocessing, before its tower exists")
     args = ap.parse_args()
 
     from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -223,6 +249,14 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     blob.mkdir(parents=True, exist_ok=True)
     proc = AutoProcessor.from_pretrained(args.model)
+    if args.images_only:
+        # No model: only what the processor produces, which is what a port's preprocessing has to reproduce.
+        meta = {"transformers": transformers.__version__, "torch": torch.__version__, "dtype": "bfloat16",
+                "text": [], "images": []}
+        inkling2_images(proc, out, blob, meta, args.reasoning_effort)
+        json.dump(meta, open(out / "golden.json", "w"), indent=1)
+        print("done", flush=True)
+        return
     t0 = time.time()
     model = load_on_gpu(args.model)
     if args.loop_passes is not None and hasattr(model.config, "text_config"):
