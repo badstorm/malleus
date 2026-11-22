@@ -2596,7 +2596,7 @@ fn kernel_test() -> Result<()> {
             let hwd = DeviceBuffer::from_slice(&hw)?;
             k.get("inkling2_vision_rope").launch(
                 (p as u32, hh as u32, 1),
-                (32, 1, 1),
+                (d.next_power_of_two().clamp(32, 128) as u32, 1, 1),
                 0,
                 &s,
                 &[
