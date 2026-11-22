@@ -271,6 +271,53 @@ pub fn image_token_types(n_llm_h: usize, n_llm_w: usize) -> Vec<u8> {
     t
 }
 
+/// The three learned embeddings that frame an image span.
+pub struct ImageTokens {
+    start: Vec<f32>,
+    end: Vec<f32>,
+    newline: Vec<f32>,
+}
+
+impl ImageTokens {
+    pub fn load(src: &dyn TensorSource, c: &Config) -> Result<Self> {
+        Ok(ImageTokens {
+            start: bf16_tensor(src, "image_start", &[c.hidden])?,
+            end: bf16_tensor(src, "image_end", &[c.hidden])?,
+            newline: bf16_tensor(src, "image_newline", &[c.hidden])?,
+        })
+    }
+}
+
+/// The embeddings that replace one image span in the prompt, in the order `image_token_types` lays the span out:
+/// the start delimiter, then every aligner row followed by a newline, then the end delimiter. `merged` is the
+/// tower's output, `n_llm_h * n_llm_w` rows of `dim`.
+pub fn span_embeddings(
+    t: &ImageTokens,
+    merged: &[f32],
+    n_llm_h: usize,
+    n_llm_w: usize,
+    dim: usize,
+) -> Result<Vec<f32>> {
+    ensure!(
+        merged.len() == n_llm_h * n_llm_w * dim,
+        "the aligner gave {} rows, the grid wants {}",
+        merged.len() / dim,
+        n_llm_h * n_llm_w
+    );
+    let span = num_image_tokens(n_llm_h, n_llm_w);
+    let mut out = Vec::with_capacity(span * dim);
+    out.extend_from_slice(&t.start);
+    for row in 0..n_llm_h {
+        for col in 0..n_llm_w {
+            let at = (row * n_llm_w + col) * dim;
+            out.extend_from_slice(&merged[at..at + dim]);
+        }
+        out.extend_from_slice(&t.newline);
+    }
+    out.extend_from_slice(&t.end);
+    Ok(out)
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // Host math: a few seconds of f32 for one image, which is what the tower costs until it moves to the device.
 // ------------------------------------------------------------------------------------------------------------------
@@ -595,6 +642,22 @@ mod tests {
         let t = image_token_types(2, 3);
         assert_eq!(t, vec![0, 1, 1, 1, 2, 1, 1, 1, 2, 3]);
         assert_eq!(t.len(), num_image_tokens(2, 3));
+    }
+
+    #[test]
+    fn the_span_puts_the_delimiters_around_the_rows() {
+        let dim = 2;
+        let t = ImageTokens {
+            start: vec![10.0, 10.0],
+            end: vec![30.0, 30.0],
+            newline: vec![20.0, 20.0],
+        };
+        let merged: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let span = span_embeddings(&t, &merged, 2, 3, dim).unwrap();
+        assert_eq!(span.len(), num_image_tokens(2, 3) * dim);
+        let rows: Vec<f32> = span.chunks(dim).map(|c| c[0]).collect();
+        assert_eq!(rows, vec![10.0, 0.0, 2.0, 4.0, 20.0, 6.0, 8.0, 10.0, 20.0, 30.0]);
+        assert!(span_embeddings(&t, &merged, 3, 3, dim).is_err());
     }
 
     #[test]
