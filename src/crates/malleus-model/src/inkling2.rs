@@ -1626,10 +1626,7 @@ impl Graph {
             act: f32s(t * i.top_k * i.moe_inter)?,
             ones_k: DeviceBuffer::from_slice(&vec![1.0f32; kvd])?,
             past: DeviceBuffer::zeroed(3 * h * 4)?,
-            moe: match t >= crate::weights::WMMA_MIN_TOKENS {
-                true => Some(MoeGrouped::new(t, h, i.moe_inter, i.experts, i.top_k)?),
-                false => None,
-            },
+            moe: Some(MoeGrouped::new(t, h, i.moe_inter, i.experts, i.top_k)?),
             qin: f32s(t * h)?,
             kin: f32s(t * h)?,
             vin: f32s(t * h)?,
@@ -1669,7 +1666,6 @@ impl Graph {
         let hd = i.head_dim;
         let d_rel = i.d_rel;
         let kvd = kv * hd;
-        let inter = i.moe_inter;
         let experts = i.experts;
         let topk = i.top_k;
 
@@ -2140,61 +2136,20 @@ impl Graph {
                 i.route_scale.into(),
             ],
         )?;
-        if self.moe.is_some() && std::env::var_os("MALLEUS_INKLING2_MOE_PAIRS").is_none() {
+        if t >= crate::weights::WMMA_MIN_TOKENS && std::env::var_os("MALLEUS_INKLING2_MOE_PAIRS").is_none() {
             // A chunk: every expert's weights cross the bus once for all the tokens that picked it, not once per
-            // (token, slot) pair. `moe_gate_up`/`moe_down` below are the one-token path, and what
-            // `MALLEUS_INKLING2_MOE_PAIRS=1` keeps for an A/B (fp32 activations, no grouping).
+            // (token, slot) pair, and the activations are int8 (the W4A8 GEMMs). The rows of a *verify* cannot take
+            // this path: the int8 activations do not round like the fp32 of a one-token step, so the committed token
+            // would depend on how many rows were checked.
             self.moe_grouped(model, st, i, w, l)?;
+        } else if std::env::var_os("MALLEUS_INKLING2_MOE_PAIRS").is_some() {
+            // The old per-pair path, kept for an A/B: `moe_gate_up` reads an expert once per (token, slot) pair.
+            self.moe_pairs(model, st, i, w, l)?;
         } else {
-            model.k.get("moe_gate_up").launch(
-                ((2 * inter).div_ceil(32) as u32, (t * topk) as u32, 1),
-                (256, 1, 1),
-                0,
-                st,
-                &[
-                    (&self.gu).into(),
-                    (&self.normed).into(),
-                    (&layer.moe.gate_up.0).into(),
-                    (&layer.moe.gate_up.1).into(),
-                    (&self.route_ids).into(),
-                    topk.into(),
-                    (2 * inter).into(),
-                    h.into(),
-                    (&model.signs).into(),
-                ],
-            )?;
-            model.k.get("inkling2_moe_act").launch(
-                ((t * topk * inter / 128) as u32, 1, 1),
-                (128, 1, 1),
-                0,
-                st,
-                &[
-                    (&self.act).into(),
-                    (&self.gu).into(),
-                    (&model.signs).into(),
-                    inter.into(),
-                    i.gate_softcap.into(),
-                    i.up_softcap.into(),
-                ],
-            )?;
-            model.k.get("moe_down").launch(
-                (h.div_ceil(32) as u32, t as u32, 1),
-                (256, 1, 1),
-                0,
-                st,
-                &[
-                    (&self.moe_out).into(),
-                    (&self.act).into(),
-                    (&layer.moe.down.0).into(),
-                    (&layer.moe.down.1).into(),
-                    (&self.route_ids).into(),
-                    (&self.route_w).into(),
-                    topk.into(),
-                    h.into(),
-                    inter.into(),
-                    0i32.into(),
-                ],
-            )?;
+            // A decode step or a verify: the pairs sorted by expert, every expert's rows in one GEMV. The per-row sum
+            // does not depend on how many rows the launch has, so a verify row is the serial step bit for bit, and an
+            // expert's weights cross the bus once however many tokens picked it.
+            self.moe_grp(model, st, i, w, l)?;
         }
         {
             let past = match place.as_ref() {
@@ -2221,6 +2176,170 @@ impl Graph {
         }
         self.moe_out.copy_from_shared(0, &self.yt, 0, t * h * 4, st)?;
         add(model, st, &self.x, &self.moe_out, t * h)?;
+        Ok(())
+    }
+
+    /// The routed experts, one launch per (token, slot) pair: `moe_gate_up` reads the expert's weights once for every
+    /// token that picked it, so the traffic of a verify grows with its width. Kept for the A/B
+    /// (`MALLEUS_INKLING2_MOE_PAIRS=1`); `moe_grp` is the same arithmetic with the pairs sorted by expert.
+    fn moe_pairs(&mut self, model: &Model, st: &Stream, i: &Inkling2Config, w: &Weights, l: usize) -> Result<()> {
+        let (t, h) = (self.t, self.h);
+        let (inter, topk) = (i.moe_inter, i.top_k);
+        let p = t * topk;
+        let layer = &w.layers[l];
+        model.k.get("moe_gate_up").launch(
+            ((2 * inter).div_ceil(32) as u32, p as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&self.gu).into(),
+                (&self.normed).into(),
+                (&layer.moe.gate_up.0).into(),
+                (&layer.moe.gate_up.1).into(),
+                (&self.route_ids).into(),
+                topk.into(),
+                (2 * inter).into(),
+                h.into(),
+                (&model.signs).into(),
+            ],
+        )?;
+        model.k.get("inkling2_moe_act").launch(
+            ((p * inter / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[
+                (&self.act).into(),
+                (&self.gu).into(),
+                (&model.signs).into(),
+                inter.into(),
+                i.gate_softcap.into(),
+                i.up_softcap.into(),
+            ],
+        )?;
+        model.k.get("moe_down").launch(
+            (h.div_ceil(32) as u32, t as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&self.moe_out).into(),
+                (&self.act).into(),
+                (&layer.moe.down.0).into(),
+                (&layer.moe.down.1).into(),
+                (&self.route_ids).into(),
+                (&self.route_w).into(),
+                topk.into(),
+                h.into(),
+                inter.into(),
+                0i32.into(),
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// The routed experts of a decode step or a verify: `moe_sort` orders the (token, slot) pairs by expert, so each
+    /// used expert's rows go through one GEMV and its weights cross the bus once however many tokens picked it. The
+    /// per-row sum does not depend on the row count, which is what lets a verify row be the serial step bit for bit.
+    fn moe_grp(&mut self, model: &Model, st: &Stream, i: &Inkling2Config, w: &Weights, l: usize) -> Result<()> {
+        let (t, h) = (self.t, self.h);
+        let (inter, experts, topk) = (i.moe_inter, i.experts, i.top_k);
+        let p = t * topk;
+        let layer = &w.layers[l];
+        let g = self.moe.as_ref().context("no grouped MoE scratch")?;
+        model.k.get("moe_sort").launch(
+            (1, 1, 1),
+            (1024, 1, 1),
+            0,
+            st,
+            &[
+                (&g.offs).into(),
+                (&g.perm).into(),
+                (&g.pos).into(),
+                (&g.tiles).into(),
+                (&g.ntiles).into(),
+                (&self.route_ids).into(),
+                p.into(),
+                (experts + 1).into(),
+                8i32.into(),
+                0i32.into(),
+                0i32.into(),
+            ],
+        )?;
+        // The two kernels of a decode step have no tile loop to run (one row per expert), so they are their own
+        // instantiation; a verify takes the one that fits up to six rows.
+        let one = if t == 1 { "1" } else { "" };
+        model.k.get(&format!("moe_gate_up_grp{one}")).launch(
+            ((2 * inter).div_ceil(32) as u32, p as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&self.gu).into(),
+                (&self.normed).into(),
+                (&layer.moe.gate_up.0).into(),
+                (&layer.moe.gate_up.1).into(),
+                (&g.offs).into(),
+                (&g.perm).into(),
+                (&g.tiles).into(),
+                (&g.ntiles).into(),
+                topk.into(),
+                (2 * inter).into(),
+                h.into(),
+                Arg::U64(0),
+            ],
+        )?;
+        model.k.get("inkling2_moe_act").launch(
+            ((p * inter / 128) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[
+                (&self.act).into(),
+                (&self.gu).into(),
+                (&model.signs).into(),
+                inter.into(),
+                i.gate_softcap.into(),
+                i.up_softcap.into(),
+            ],
+        )?;
+        // The down projection writes one row per pair (expert-sorted); `moe_combine` then sums the slots of a token in
+        // the order the one-pair kernel weighted them, so the two agree bit for bit.
+        model.k.get(&format!("moe_down_grp{one}")).launch(
+            (h.div_ceil(32) as u32, p as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&g.y).into(),
+                (&self.act).into(),
+                (&layer.moe.down.0).into(),
+                (&layer.moe.down.1).into(),
+                (&g.offs).into(),
+                (&g.perm).into(),
+                (&g.tiles).into(),
+                (&g.ntiles).into(),
+                h.into(),
+                inter.into(),
+            ],
+        )?;
+        model.k.get("moe_combine").launch(
+            (t as u32, h.div_ceil(1024) as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&self.moe_out).into(),
+                (&g.y).into(),
+                (&self.route_w).into(),
+                (&g.pos).into(),
+                topk.into(),
+                h.into(),
+                0i32.into(),
+            ],
+        )?;
         Ok(())
     }
 

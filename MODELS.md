@@ -366,16 +366,23 @@ and `long-context`, and 3 rows at **8 250** tokens, past the floor where the log
 chunk writes its keys into the cache and runs each row through the one-token kernels, so a verify row is computed by
 the same code as a serial step; the tiled attention stays where it belongs, on a prefill that starts at position 0.
 
-| verify | ms/step | ms/token | serial |
-|---|---|---|---|
-| 4 rows | 147 | 37 | 59 |
-| 6 rows | 255 | 43 | 60 |
+The routed experts of a step are sorted by expert (`moe_sort`) and each used expert's rows go through one GEMV, so its
+weights cross the bus once however many tokens picked it — and the per-row sum does not depend on the row count, which
+is what keeps the rows exact. That was worth 28 % of the verify and cost 1.6 % of the serial decode (two more launches
+a layer):
 
-That is the shape a draft head needs: a six-token block is 1.4x cheaper than the same tokens one at a time, so the
-drafts have to be accepted well above half to pay. The draft head of this checkpoint (three layers, a marker at the
-four decoder visits, the Markov correction over a rank-256 state) is still not wired, and the scheduler keeps feeding
-one piece per prompt: chunked prefill is the same machinery, but it wants the tiled kernel reading the prefix instead
-of the per-row one, or a long prompt gets *slower* in pieces.
+| | before | now |
+|---|---|---|
+| verify 4 rows | 147.2 ms (36.8 ms/token) | **106.8 ms** (26.7 ms/token) |
+| verify 6 rows | 255.4 ms (42.6 ms/token) | **183.5 ms** (30.6 ms/token) |
+| decode `tg128` | 16.50 tok/s | 16.23 tok/s |
+
+A six-token verify is now 2.0x cheaper per row than the serial step (it was 1.41x), which is the margin a draft head
+needs: a round that checks six rows costs 183 ms, and it pays as soon as it commits three tokens (`3 x 60.5`), i.e. at
+about half of the five drafts a six-row step can carry. The draft head of this
+checkpoint (three layers, a marker at the four decoder visits, the Markov correction over a rank-256 state) is still
+not wired, and the scheduler keeps feeding one piece per prompt: chunked prefill is the same machinery, but it wants
+the tiled kernel reading the prefix instead of the per-row one, or a long prompt gets *slower* in pieces.
 
 
 ## How these numbers are produced
