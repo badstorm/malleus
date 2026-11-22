@@ -106,6 +106,13 @@ enum Cmd {
         #[arg(long)]
         hc_mls4: bool,
     },
+    /// Validate a safetensors checkpoint against the tensor map of its family, name by name: prints the geometry,
+    /// the byte inventory and every tensor that is missing, extra or has the wrong shape or dtype (issue #83)
+    Inspect {
+        /// The safetensors directory to read
+        #[arg(long)]
+        model: PathBuf,
+    },
     /// Dequantise a checkpoint whose routed experts are packed (NVFP4 / MXFP8) into a bf16 safetensors
     /// directory: the file `convert` and the layer-by-layer reference read
     Dequant {
@@ -2895,6 +2902,21 @@ fn main() -> Result<()> {
             let t0 = Instant::now();
             malleus_convert::convert(&model, &out, &opts, &|m| eprintln!("{m}"))?;
             eprintln!("converted in {:.0}s", t0.elapsed().as_secs_f64());
+        }
+        Cmd::Inspect { model } => {
+            let c = Config::from_hf(&model)?;
+            for line in malleus_model::deepseek::describe(&c)? {
+                println!("{line}");
+            }
+            let src = SafeTensors::open_dir(&model)?;
+            let mut bad = false;
+            for line in malleus_model::deepseek::check(&src, &c)? {
+                bad |= line.starts_with('!');
+                println!("{line}");
+            }
+            if bad {
+                bail!("the checkpoint does not match the tensor map");
+            }
         }
         Cmd::Dequant { model, out } => {
             let t0 = Instant::now();

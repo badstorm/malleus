@@ -202,6 +202,7 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         swiglu: None,
         hy4: None,
         inkling2: Some(inkling2),
+        deepseek: None,
     };
     c.validate()?;
     Ok(c)

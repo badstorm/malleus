@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod deepseek;
 pub mod dflash;
 pub mod engine;
 pub mod expert_cache;

@@ -131,6 +131,13 @@ impl Model {
         if c.family == Family::Hy4 {
             return Self::load_hy4(cfg, src, opts, kernels, progress);
         }
+        // DeepSeek-V4.1 has its config and its tensor map (issue #83); the loader and the forward are the next
+        // increments, so a load says so instead of falling through to the Qwen/Ling shape.
+        if c.family == Family::Deepseek41 {
+            bail!(
+                "deepseek_v41: the tensor map is checked by `malleus inspect`; the forward is not wired yet (issue #83)"
+            );
+        }
         // Inkling-2 has its own graph (`crate::inkling2`): check the file against the map, load the weights, and
         // hand the model to the standalone forward.
         if c.family == Family::Inkling2 {

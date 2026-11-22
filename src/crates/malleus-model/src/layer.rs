@@ -382,6 +382,7 @@ pub(crate) fn load_layer(
             bail!("hy4 layers are loaded by crate::hy4, not by the shared loader")
         }
         MixerKind::AttnFull => bail!("inkling2 layers are loaded by crate::inkling2, not by the shared loader"),
+        MixerKind::Deepseek => bail!("deepseek_v41 layers get their own loader (issue #83)"),
         MixerKind::Attn => {
             let qd = c.n_heads * c.head_dim;
             let kvd = c.n_kv * c.head_dim;
