@@ -1568,7 +1568,7 @@ struct Graph {
 }
 
 impl Graph {
-    fn new(model: &Model, t: usize) -> Result<Self> {
+    fn new(model: &Model, t: usize, pos: usize) -> Result<Self> {
         let c = &model.cfg;
         let i = c.inkling2.as_ref().context("no inkling2 config")?;
         let h = c.hidden;
@@ -1578,9 +1578,10 @@ impl Graph {
         let qd = heads * hd;
         let kvd = kv * hd;
         let kmax = qd.max(h);
-        // The log-scaled positions: 1 below the floor, so 1 for any sequence shorter than it.
+        // The log-scaled positions, for the global positions this chunk covers: 1 below the floor, so 1 for any
+        // sequence shorter than it.
         let mut tau: Vec<f32> = (0..t)
-            .map(|p| 1.0 + i.log_alpha * (((p + 1) as f32) / i.log_floor as f32).max(1.0).ln())
+            .map(|p| 1.0 + i.log_alpha * (((pos + p + 1) as f32) / i.log_floor as f32).max(1.0).ln())
             .collect();
         if tau.iter().all(|x| *x == 1.0) {
             tau.clear();
@@ -1962,15 +1963,27 @@ impl Graph {
         }
         let window = if full { 0 } else { i.window };
         let scale = 1.0 / (hd as f32).sqrt();
-        match &place {
-            Some(p) if p.one => {
-                // One query: the bias of this row over the keys the window leaves visible, then the cache.
+        // Rows whose keys are in the session's cache: one for a decode step, the whole chunk when the cache already
+        // holds a prefix (a verify, or a chunk of a prompt). A chunk that starts at 0 is the fresh prefill and keeps
+        // the tiled kernel, which is four times faster than the per-row one.
+        let cached = match &place {
+            Some(p) if p.one => 1,
+            Some(p) if p.pos > 0 => t,
+            _ => 0,
+        };
+        if cached > 0 {
+            // Row by row through the one-token kernels: the row of a verify is then computed by the same code that
+            // computes it one step at a time, which is what makes the verify bit-identical.
+            let p = place.as_ref().context("cache row without a slot")?;
+            for j in 0..cached {
+                let pos_j = p.pos + j;
                 let k0 = if window > 0 {
-                    (p.pos + 1).saturating_sub(window)
+                    (pos_j + 1).saturating_sub(window)
                 } else {
                     0
                 };
-                let nk = p.pos + 1 - k0;
+                let nk = pos_j + 1 - k0;
+                let qd = (j * heads * hd * 4) as u64;
                 model.k.get("inkling2_rel_bias_dec").launch(
                     ((heads * nk).div_ceil(256) as u32, 1, 1),
                     (256, 1, 1),
@@ -1978,9 +1991,9 @@ impl Graph {
                     st,
                     &[
                         p.bias.into(),
-                        (&self.r).into(),
+                        Arg::U64(self.r.addr() + (j * heads * d_rel * 4) as u64),
                         (&layer.rel_logits).into(),
-                        p.pos.into(),
+                        pos_j.into(),
                         k0.into(),
                         nk.into(),
                         heads.into(),
@@ -1994,13 +2007,13 @@ impl Graph {
                     0,
                     st,
                     &[
-                        (&self.attn_out).into(),
-                        (&self.q).into(),
+                        Arg::U64(self.attn_out.addr() + qd),
+                        Arg::U64(self.q.addr() + qd),
                         (&p.slot.k).into(),
                         (&p.slot.v).into(),
                         p.bias.into(),
-                        (&self.sink).into(),
-                        (&self.gate).into(),
+                        Arg::U64(self.sink.addr() + (j * heads * 4) as u64),
+                        Arg::U64(self.gate.addr() + qd),
                         k0.into(),
                         nk.into(),
                         heads.into(),
@@ -2010,28 +2023,27 @@ impl Graph {
                     ],
                 )?;
             }
-            _ => {
-                attn(
-                    model,
-                    st,
-                    &self.attn_out,
-                    &self.q,
-                    &self.k,
-                    &self.v,
-                    &self.r,
-                    &layer.rel_logits,
-                    &self.sink,
-                    &self.gate,
-                    t,
-                    heads,
-                    kv,
-                    hd,
-                    d_rel,
-                    i.rel_extent,
-                    window,
-                    scale,
-                )?;
-            }
+        } else {
+            attn(
+                model,
+                st,
+                &self.attn_out,
+                &self.q,
+                &self.k,
+                &self.v,
+                &self.r,
+                &layer.rel_logits,
+                &self.sink,
+                &self.gate,
+                t,
+                heads,
+                kv,
+                hd,
+                d_rel,
+                i.rel_extent,
+                window,
+                scale,
+            )?;
         }
         lin(
             model,
@@ -2444,10 +2456,8 @@ fn run_mm(
                 k.len() + t,
                 k.max
             );
-            ensure!(
-                k.is_empty() || t == 1,
-                "inkling2: the prefill is not chunked yet, feed the prompt in one forward"
-            );
+            // A chunk that continues a cache (a speculative verify, or the pieces of a prompt) reads the keys before
+            // it from the cache; only a chunk that *starts* a prompt takes the tiled attention.
             (k.len(), t == 1)
         }
         None => (0, false),
@@ -2459,7 +2469,7 @@ fn run_mm(
         let tau = 1.0 + i.log_alpha * (((pos + 1) as f32) / i.log_floor as f32).max(1.0).ln();
         k.tau.upload(&[tau])?;
     }
-    let mut g = Graph::new(model, t)?;
+    let mut g = Graph::new(model, t, pos)?;
 
     let ids32: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
     let idbuf = DeviceBuffer::from_slice(&ids32)?;

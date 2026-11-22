@@ -1661,9 +1661,16 @@ impl Model {
         ensure!(
             // A block drafter may propose nothing (its drafts were not paying): then the verify is one step.
             ((2..=GEMV_MAX_T).contains(&tokens.len()) || (tokens.len() == 1 && self.has_block_draft()))
-                && self.has_mtp(),
+                && self.can_verify(),
             "bad verify step"
         );
+        // The looped graph verifies in one chunk that continues the session's cache: the rows read the keys before
+        // them exactly as they would one step at a time, which is what `spec-exact` checks.
+        if self.inkling2.is_some() {
+            let cache = sess.inkling2.as_deref_mut().context("inkling2 session")?;
+            let all = crate::inkling2::logits(self, Some(cache), tokens, tokens.len())?;
+            return Ok(all);
+        }
         self.forward_impl(sess, tokens, None, tokens.len(), &[], true, false)
     }
 
@@ -1730,6 +1737,12 @@ impl Model {
     /// Whether the model drafts and verifies: an MTP head, or Hy4's DFly2 block drafter.
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some() || self.has_block_draft()
+    }
+
+    /// Whether the model can check several tokens in one pass. Not every model that can has a draft head: the
+    /// looped graph verifies a chunk because that is the same code path as chunked prefill.
+    pub fn can_verify(&self) -> bool {
+        self.has_mtp() || self.inkling2.is_some()
     }
 
     /// Hy4's DFly2: the drafts of a block come in one call (`block_draft`), not one MTP step at a time.
