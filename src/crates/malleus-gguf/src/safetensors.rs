@@ -19,6 +19,8 @@ fn parse_dtype(s: &str) -> Result<DType> {
         "I8" => DType::I8,
         "U8" => DType::U8,
         "F8_E4M3" => DType::F8E4M3,
+        "F8_E8M0" => DType::F8E8M0,
+        "F4_E2M1" => DType::F4E2M1,
         "I32" => DType::I32,
         "I64" => DType::I64,
         _ => bail!("unsupported safetensors dtype {s}"),

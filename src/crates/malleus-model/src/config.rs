@@ -59,6 +59,128 @@ pub struct Config {
     /// Inkling-2 geometry: attention residuals, short convolutions, the relative-position bias, the loop, the
     /// vision tower and the MTP head.
     pub inkling2: Option<Inkling2Config>,
+    /// DeepSeek-V4.1 geometry: window + compressed KV, the two-level indexer, hyper-connections, Engram
+    /// memories, 384 experts, the DSpark draft stages and the ViT tower. Issue #83.
+    pub deepseek: Option<DeepseekConfig>,
+}
+
+/// DeepSeek-V4.1 (`deepseek_v41`, issue #83): every layer attends over a sliding window of raw KV and, when
+/// `compress_ratios[layer] > 0`, over the `index_topk` compressed positions the indexer picked for that query.
+#[derive(Clone, Debug)]
+pub struct DeepseekConfig {
+    /// Query heads, their width, the rotated tail, and the low-rank input projection.
+    pub heads: usize,
+    pub head_dim: usize,
+    pub nope: usize,
+    pub rope: usize,
+    pub q_lora: usize,
+    /// The output projection is block-diagonal over `o_groups`, each group `o_lora` wide.
+    pub o_groups: usize,
+    pub o_lora: usize,
+    /// Raw keys a query always sees.
+    pub window: usize,
+    /// Per layer: 0 = sliding window only, `r` = one compressed latent per `r` tokens.
+    pub compress_ratios: Vec<u8>,
+    /// Layers that own the compressed KV the layers sharing their ratio read, and the ones that own an indexer.
+    pub kv_source_layers: Vec<usize>,
+    pub index_source_layers: Vec<usize>,
+    pub index: DeepseekIndex,
+    /// The first level of the two-level top-k, held by one layer.
+    pub candidate: Option<DeepseekCandidate>,
+    /// Routed experts, the ones a token takes, their width, the SwiGLU clamp and the router scaling.
+    pub experts: usize,
+    pub top_k: usize,
+    pub moe_inter: usize,
+    pub swiglu_limit: f32,
+    pub route_scale: f32,
+    /// The router score is `sqrt(softplus(x))` when true, `sigmoid(x)` otherwise; the bias steers the selection.
+    pub sqrt_softplus: bool,
+    pub norm_topk_prob: bool,
+    /// Hyper-connections: parallel residual streams, Sinkhorn iterations and epsilon.
+    pub hc_mult: usize,
+    pub hc_iters: usize,
+    pub hc_eps: f32,
+    pub rope_params: DeepseekRope,
+    pub engram: Option<DeepseekEngram>,
+    pub vision: Option<DeepseekVision>,
+    pub dspark: Option<DeepseekDspark>,
+    /// Token id filling every position of an image span (0 without vision).
+    pub image_token: u32,
+    pub eps: f32,
+}
+
+/// The indexer: scoring heads of `head_dim` against one shared key per compressed position.
+#[derive(Clone, Debug)]
+pub struct DeepseekIndex {
+    pub heads: usize,
+    pub dim: usize,
+    pub topk: usize,
+}
+
+/// Level one: keep the best `topk_blocks` blocks of `block_size` compressed positions, so level two only has to
+/// score inside them.
+#[derive(Clone, Debug)]
+pub struct DeepseekCandidate {
+    pub source_layer: usize,
+    pub topk_blocks: usize,
+    pub block_size: usize,
+}
+
+/// RoPE: the base of the window layers, the base of the compressed latent, and the YaRN blend that carries the
+/// 65 536 training window out to 1M.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeepseekRope {
+    pub theta: f32,
+    pub compress_theta: f32,
+    pub original_seq: usize,
+    pub factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+}
+
+/// Engram: an n-gram hash table per listed layer, `max_ngram - 1` orders of `heads` rows added into the streams.
+#[derive(Clone, Debug)]
+pub struct DeepseekEngram {
+    /// 0-based layer indices carrying a table, in the order of `engram_num_embeddings`.
+    pub layers: Vec<usize>,
+    /// Rows of each layer's table.
+    pub num_embeddings: Vec<usize>,
+    pub max_ngram: usize,
+    /// Bucket size each (n-gram order, head) starts searching primes from, and the compressed vocabulary the hash
+    /// multipliers derive from.
+    pub vocab: usize,
+    pub compressed_vocab: usize,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub pad: u32,
+}
+
+/// The ViT: `downsample_ratio` squared patches merged into one text position by the aligner.
+#[derive(Clone, Debug)]
+pub struct DeepseekVision {
+    pub layers: usize,
+    pub hidden: usize,
+    pub inter: usize,
+    pub heads: usize,
+    pub patch: usize,
+    pub downsample: usize,
+    pub rope_theta: f32,
+    pub max_tokens: usize,
+    pub min_pixels: usize,
+}
+
+/// DSpark: `stages` draft blocks of `block` positions, each with its own 128-expert MoE, plus the markov and
+/// confidence heads of the last stage.
+#[derive(Clone, Debug)]
+pub struct DeepseekDspark {
+    pub stages: usize,
+    pub block: usize,
+    pub noise_token: u32,
+    /// Backbone layers whose attention input feeds the drafter.
+    pub target_layers: Vec<usize>,
+    pub markov_rank: usize,
+    pub experts: usize,
+    pub top_k: usize,
 }
 
 /// Inkling-2 (`inkling2_loop`, issue #62): 24 layers of which the middle 12 run `passes` times, one attention
@@ -255,6 +377,9 @@ pub enum Family {
     /// Inkling-2 (`inkling2_loop`): attention residuals, short convolutions, a relative-position bias, a 12-layer
     /// loop with cross-pass messages, 128 experts, a vision tower and an MTP head. Issue #62.
     Inkling2,
+    /// DeepSeek-V4.1 (`deepseek_v41`): window + compressed KV, a two-level indexer, hyper-connections, Engram
+    /// memories, 384 experts, DSpark draft stages and a ViT tower. Issue #83.
+    Deepseek41,
 }
 
 impl Family {
@@ -265,6 +390,7 @@ impl Family {
             "bailing_hybrid" => Family::Ling3,
             "hy_v4_flash" => Family::Hy4,
             "inkling2" | "inkling2_loop" | "inkling2_text" | "inkling2_loop_text" => Family::Inkling2,
+            "deepseek_v41" => Family::Deepseek41,
             _ => return None,
         })
     }
@@ -288,6 +414,9 @@ pub enum MixerKind {
     /// Inkling-2's global layer: full attention with a relative-position bias, a learned sink and an output gate,
     /// instead of the sliding window of its other layers.
     AttnFull,
+    /// DeepSeek-V4.1: the sliding window plus, on a layer whose `compress_ratios` entry is non-zero, the compressed
+    /// positions its indexer selected.
+    Deepseek,
 }
 
 /// MLA geometry, from `kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim` and `v_head_dim`.
@@ -392,6 +521,9 @@ impl Config {
         }
         if family == Family::Inkling2 {
             return crate::inkling2::config(&cfg, generation_config);
+        }
+        if family == Family::Deepseek41 {
+            return crate::deepseek::config(&cfg, generation_config);
         }
         let ling = family == Family::Ling3;
         let t = if ling { &cfg } else { &cfg["text_config"] };
@@ -517,6 +649,7 @@ impl Config {
             swiglu,
             hy4: None,
             inkling2: None,
+            deepseek: None,
         };
         c.validate()?;
         Ok(c)
@@ -532,6 +665,9 @@ impl Config {
         }
         if self.family == Family::Inkling2 {
             return crate::inkling2::validate(self);
+        }
+        if self.family == Family::Deepseek41 {
+            return crate::deepseek::validate(self);
         }
         ensure!(self.conv_k == 4, "reference kernels require conv kernel 4");
         ensure!(

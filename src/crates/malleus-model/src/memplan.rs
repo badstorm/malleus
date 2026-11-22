@@ -229,6 +229,10 @@ pub fn session_bytes(cfg: &Config, ctx: usize, mtp: bool) -> u64 {
         // The latent and the 64 rotated dims per layer, plus a split buffer for the indexed layers' decode.
         return crate::hy4::session_bytes(cfg, ctx);
     }
+    if cfg.family == crate::config::Family::Deepseek41 {
+        // The window rings, the compressed latent and the indexer keys: `crate::deepseek` sizes them.
+        return crate::deepseek::session_bytes(cfg, ctx);
+    }
     let kv = (kv_ctx(ctx) * cfg.n_kv * cfg.head_dim * 2 + 64) as u64;
     // With the indexer the V buffer also holds V row-major after V^T.
     let v = if cfg.indexer.is_some() { 2 * kv } else { kv };

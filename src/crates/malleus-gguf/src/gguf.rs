@@ -35,6 +35,10 @@ pub const GGML_ROW_I4: u32 = 0x4D4C_0014;
 /// never carries them; the ids exist so the dtype round-trips.
 pub const GGML_U8: u32 = 0x4D4C_0015;
 pub const GGML_F8_E4M3: u32 = 0x4D4C_0016;
+/// The scale and packed-expert dtypes of a DeepSeek-V4.1 checkpoint: read on the way in, never written to a
+/// `.malleus` file.
+pub const GGML_F8_E8M0: u32 = 0x4D4C_0017;
+pub const GGML_F4_E2M1: u32 = 0x4D4C_0018;
 
 fn dtype_to_ggml(d: DType) -> u32 {
     match d {
@@ -51,6 +55,8 @@ fn dtype_to_ggml(d: DType) -> u32 {
         DType::RowI4 => GGML_ROW_I4,
         DType::U8 => GGML_U8,
         DType::F8E4M3 => GGML_F8_E4M3,
+        DType::F8E8M0 => GGML_F8_E8M0,
+        DType::F4E2M1 => GGML_F4_E2M1,
     }
 }
 
@@ -69,6 +75,8 @@ fn ggml_to_dtype(t: u32) -> Result<DType> {
         GGML_ROW_I4 => DType::RowI4,
         GGML_U8 => DType::U8,
         GGML_F8_E4M3 => DType::F8E4M3,
+        GGML_F8_E8M0 => DType::F8E8M0,
+        GGML_F4_E2M1 => DType::F4E2M1,
         _ => bail!("unsupported ggml type {t}"),
     })
 }

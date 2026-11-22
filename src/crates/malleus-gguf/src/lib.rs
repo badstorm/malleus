@@ -15,6 +15,11 @@ pub enum DType {
     U8,
     /// e4m3 bytes: MXFP8 weights.
     F8E4M3,
+    /// e8m0: the block scale of a DeepSeek-V4.1 fp8 weight (one per 32x32 block) and of its fp4 experts.
+    F8E8M0,
+    /// e2m1 pairs packed in a byte, as a safetensors checkpoint stores them: the shape already counts pairs, so
+    /// the tensor is one byte per stored element.
+    F4E2M1,
     I32,
     I64,
     Mls2,
@@ -31,7 +36,7 @@ impl DType {
             DType::F32 | DType::I32 => n * 4,
             DType::I64 => n * 8,
             DType::F16 | DType::BF16 => n * 2,
-            DType::I8 | DType::U8 | DType::F8E4M3 => n,
+            DType::I8 | DType::U8 | DType::F8E4M3 | DType::F8E8M0 | DType::F4E2M1 => n,
             // MLS2 packs 4 codes per byte, MLS3 8 codes per 3 bytes; quantized tensors always have a K that is a
             // multiple of 128.
             DType::Mls2 => n / 4,
