@@ -1477,6 +1477,12 @@ impl Model {
         Ok(())
     }
 
+    /// Inkling-2's vision tower, when the file carries one: its own graph (`crate::inkling2::Vision`), not the
+    /// `vision` field of the carried families.
+    pub fn inkling2_vision(&self) -> Option<&crate::inkling2::Vision> {
+        self.inkling2.as_ref().and_then(|i| i.vision.as_ref())
+    }
+
     /// Inkling-2's standalone generation: the prompt in one forward, then a token at a time against a cache of its
     /// own. Returns the generated ids after `tokens`.
     pub fn inkling2_generate(&self, tokens: &[u32], n: usize) -> Result<Vec<u32>> {

@@ -454,6 +454,8 @@ pub struct Vision {
     pub cls_position: DeviceBuffer,
     pub patch: DeviceBuffer,
     pub position: DeviceBuffer,
+    /// The same table on the host: `grid^2 x hidden` f32, resampled to the patch grid of every image.
+    pub pos_f32: Vec<f32>,
     pub layers: Vec<VisLayer>,
     /// Patch side (the patch embedding covers one frame), temporal patch, merge side and the side of the learned
     /// position grid.
@@ -491,7 +493,21 @@ impl Vision {
             layers.push(VisLayer {
                 ln_1: (bb(up, "ln_1.weight", &[v.hidden])?, bb(up, "ln_1.bias", &[v.hidden])?),
                 ln_2: (bb(up, "ln_2.weight", &[v.hidden])?, bb(up, "ln_2.bias", &[v.hidden])?),
-                ls_1: bb(up, "ls_1.gamma", &[v.hidden])?,
+                ls_1: {
+                    let b = bb(up, "ls_1.gamma", &[v.hidden])?;
+                    if l == 0 && std::env::var_os("MALLEUS_INKLING2_VISION_DUMP").is_some() {
+                        let raw = src.read_all(&p(&q("ls_1.gamma")))?;
+                        let v: Vec<f32> = raw
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .take(4)
+                            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
+                            .collect();
+                        eprintln!("ls_1[0..4] = {v:?} ({} bytes)", raw.len());
+                    }
+                    b
+                },
                 ls_2: bb(up, "ls_2.gamma", &[v.hidden])?,
                 fc: (
                     bb(up, "mlp.c_fc.weight", &[v.inter, v.hidden])?,
@@ -533,6 +549,18 @@ impl Vision {
                 "backbone.embeddings.patch_embedding.weight",
                 &[v.hidden, 3 * v.patch * v.patch],
             )?,
+            pos_f32: {
+                let raw = src
+                    .read_all(&p("backbone.embeddings.position_embedding"))
+                    .context("vision position table")?;
+                let n = v.grid * v.grid * v.hidden;
+                ensure!(raw.len() == n * 2, "position table: expected {n} bf16 values");
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| half::bf16::from_le_bytes(*b).to_f32())
+                    .collect()
+            },
             position: b(
                 up,
                 "backbone.embeddings.position_embedding",
@@ -545,6 +573,281 @@ impl Vision {
             grid: v.grid,
         }))
     }
+}
+
+impl Vision {
+    /// The tower's forward (issue #74): the patch embedding, the bilinear position table, one class token in front of
+    /// the patches, 23 pre-norm blocks with a per-channel layer scale, then the two-layer projector.
+    ///
+    /// Returns the sequence the tower produced (the class token included, which is what `vit_out` of the reference is)
+    /// and the merged features, one row per image token, in the order the prompt's image tokens are in.
+    pub fn encode(&self, model: &Model, pre: &crate::image_pre::Preprocessed) -> Result<(DeviceBuffer, DeviceBuffer)> {
+        let st = &model.stream;
+        let k = &model.k;
+        let cs = model.cfg.inkling2.as_ref().context("no inkling2 config")?;
+        let v = cs.vision.as_ref().context("no vision config")?;
+        let (h, heads, inter, m, ps) = (v.hidden, v.heads, v.inter, self.merge, self.patch_side);
+        let hd = h / heads;
+        ensure!(pre.grid_t == 1, "video input is not supported");
+        let (gh, gw) = (pre.grid_h, pre.grid_w);
+        let (ph, pw) = (gh * m, gw * m);
+        let (np, rows) = (ph * pw, ph * pw + 1);
+        let dim = ps * ps * 3;
+        ensure!(
+            pre.pixels.len() == gh * gw * m * m * dim,
+            "pixel buffer {} does not match a {gh}x{gw} grid of {m}x{m} patches of {ps}",
+            pre.pixels.len()
+        );
+        let f = |n: usize| f32s(n);
+        // 1. Tiles to native patches, then the patch embedding (the checkpoint's has no bias).
+        let tiles = DeviceBuffer::from_slice(&pre.pixels)?;
+        let patches = f(np * dim)?;
+        k.get("inkling2_vision_split").launch(
+            ((np * dim).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&patches).into(),
+                (&tiles).into(),
+                np.into(),
+                (ps * m).into(),
+                ps.into(),
+                m.into(),
+            ],
+        )?;
+        let x = f(np * h)?;
+        gemm_bf16(k, st, &x, &patches, &self.patch, np, h, dim)?;
+        // 2. The learned position table, resampled to this patch grid, then one class token in front.
+        let pos = DeviceBuffer::from_slice(&self.pos_embed(ph, pw, h))?;
+        k.get("add_inplace").launch(
+            ((np * h).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&x).into(), (&pos).into(), (np * h).into()],
+        )?;
+        let seq = f(rows * h)?;
+        seq.memset(0, st)?;
+        bias_act(k, st, &seq, &self.class_embedding, 1, h, 0)?;
+        bias_act(k, st, &seq, &self.cls_position, 1, h, 0)?;
+        seq.copy_from_shared(h * 4, &x, 0, np * h * 4, st)?;
+        // 3. The RoPE positions: the class token sits at (0, 0), the patches at one-based (row, col).
+        let mut hw = Vec::with_capacity(rows * 2);
+        hw.extend_from_slice(&[0i32, 0]);
+        for r in 0..ph {
+            for c in 0..pw {
+                hw.extend_from_slice(&[r as i32 + 1, c as i32 + 1]);
+            }
+        }
+        let hw = DeviceBuffer::from_slice(&hw)?;
+        let normed = f(rows * h)?;
+        layernorm(k, st, &normed, &seq, &self.ln_pre, rows, h, v.eps)?;
+        // The tower replaces the sequence with its pre-layernormed form: that is what the blocks carry as the
+        // residual, not the embedding.
+        seq.copy_from_shared(0, &normed, 0, rows * h * 4, st)?;
+        let (q, kk, vv) = (f(rows * h)?, f(rows * h)?, f(rows * h)?);
+        let (att, mlp) = (f(rows * h)?, f(rows * inter)?);
+        let scale = 1.0 / (hd as f32).sqrt();
+        for b in &self.layers {
+            layernorm(k, st, &normed, &seq, &b.ln_1, rows, h, v.eps)?;
+            for (out, w) in [(&q, &b.q), (&kk, &b.k), (&vv, &b.v)] {
+                gemm_bf16(k, st, out, &normed, &w.0, rows, h, h)?;
+                bias_act(k, st, out, &w.1, rows, h, 0)?;
+            }
+            for t in [&q, &kk] {
+                k.get("inkling2_vision_rope").launch(
+                    (rows as u32, heads as u32, 1),
+                    ((hd as u32).next_power_of_two().clamp(32, 128), 1, 1),
+                    0,
+                    st,
+                    &[
+                        t.into(),
+                        (&hw).into(),
+                        rows.into(),
+                        heads.into(),
+                        hd.into(),
+                        10000f32.into(),
+                    ],
+                )?;
+            }
+            k.get("inkling2_vision_attn").launch(
+                (rows as u32, heads as u32, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&att).into(),
+                    (&q).into(),
+                    (&kk).into(),
+                    (&vv).into(),
+                    rows.into(),
+                    heads.into(),
+                    hd.into(),
+                    scale.into(),
+                ],
+            )?;
+            gemm_bf16(k, st, &normed, &att, &b.out.0, rows, h, h)?;
+            bias_act(k, st, &normed, &b.out.1, rows, h, 0)?;
+            k.get("inkling2_vision_scale_add").launch(
+                ((rows * h).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&seq).into(),
+                    (&normed).into(),
+                    (&b.ls_1).into(),
+                    (rows * h).into(),
+                    h.into(),
+                ],
+            )?;
+            layernorm(k, st, &normed, &seq, &b.ln_2, rows, h, v.eps)?;
+            gemm_bf16(k, st, &mlp, &normed, &b.fc.0, rows, inter, h)?;
+            bias_act(k, st, &mlp, &b.fc.1, rows, inter, 1)?;
+            gemm_bf16(k, st, &normed, &mlp, &b.proj.0, rows, h, inter)?;
+            bias_act(k, st, &normed, &b.proj.1, rows, h, 0)?;
+            k.get("inkling2_vision_scale_add").launch(
+                ((rows * h).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    (&seq).into(),
+                    (&normed).into(),
+                    (&b.ls_2).into(),
+                    (rows * h).into(),
+                    h.into(),
+                ],
+            )?;
+        }
+        // 4. The projector: the patch rows only (the class token is dropped), `m * m` of them per output row.
+        let nm = np / (m * m);
+        let mid = f(nm * v.proj_hidden)?;
+        let patch_rows = Arg::U64(seq.addr() + (h * 4) as u64);
+        k.get("gemm_bf16").launch(
+            (v.proj_hidden.div_ceil(8) as u32, nm.div_ceil(8) as u32, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&mid).into(),
+                patch_rows,
+                (&self.proj_in).into(),
+                nm.into(),
+                v.proj_hidden.into(),
+                (m * m * h).into(),
+                0i32.into(),
+            ],
+        )?;
+        // The projector's activation sits between its two layers (the checkpoint ships no biases here, so the gelu
+        // rides in through a zero one).
+        let zero = DeviceBuffer::zeroed(v.proj_hidden * 2)?;
+        bias_act(k, st, &mid, &zero, nm, v.proj_hidden, 2)?;
+        let out = f(nm * model.cfg.hidden)?;
+        gemm_bf16(k, st, &out, &mid, &self.proj_out, nm, model.cfg.hidden, v.proj_hidden)?;
+        Ok((seq, out))
+    }
+
+    /// The learned `grid x grid` position table resampled to a `ph x pw` patch grid, `bilinear`, `align_corners=False`,
+    /// border padding — the tower's grid is sampled per patch, and the patches are already in tile-major order.
+    fn pos_embed(&self, ph: usize, pw: usize, h: usize) -> Vec<f32> {
+        let side = self.grid;
+        let taps = |i: usize, n: usize| -> [(usize, f32); 2] {
+            let src = if n > 1 {
+                (i as f32 + 0.5) * (side as f32) / (n as f32) - 0.5
+            } else {
+                0.0
+            };
+            let f = src.floor();
+            let lo = (f.max(0.0) as usize).min(side - 1);
+            let fr = (src - f).clamp(0.0, 1.0);
+            [(lo, 1.0 - fr), ((lo + 1).min(side - 1), fr)]
+        };
+        let table = &self.pos_f32;
+        let mut out = Vec::with_capacity(ph * pw * h);
+        let mut acc = vec![0f32; h];
+        for r in 0..ph {
+            for c in 0..pw {
+                acc.iter_mut().for_each(|v| *v = 0.0);
+                for (ty, wy) in taps(r, ph) {
+                    for (tx, wx) in taps(c, pw) {
+                        let wgt = wy * wx;
+                        for (i, v) in acc.iter_mut().enumerate() {
+                            *v += wgt * table[(ty * side + tx) * h + i];
+                        }
+                    }
+                }
+                out.extend_from_slice(&acc);
+            }
+        }
+        out
+    }
+}
+
+/// `MALLEUS_INKLING2_VISION_DUMP=<dir>`: write the tower's stage outputs there, for a comparison against the
+/// reference's hooks. Debug only: it synchronizes the stream and copies to the host.
+fn vdump(name: &str, buf: &DeviceBuffer, n: usize) -> Result<()> {
+    let Ok(dir) = std::env::var("MALLEUS_INKLING2_VISION_DUMP") else {
+        return Ok(());
+    };
+    let v = buf.download::<f32>(n)?;
+    let bytes: Vec<u8> = v.iter().flat_map(|x: &f32| x.to_le_bytes()).collect();
+    std::fs::write(format!("{dir}/eng_{name}.f32"), bytes)?;
+    Ok(())
+}
+
+/// `y = x @ w^T` with a bf16 weight ([n, k]) and no bias: the tower's own GEMM, which the `gemm_bf16` kernel does.
+fn gemm_bf16(
+    k: &Kernels,
+    st: &Stream,
+    y: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &DeviceBuffer,
+    t: usize,
+    n: usize,
+    kk: usize,
+) -> Result<()> {
+    k.get("gemm_bf16").launch(
+        (n.div_ceil(8) as u32, t.div_ceil(8) as u32, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[y.into(), x.into(), w.into(), t.into(), n.into(), kk.into(), 0i32.into()],
+    )?;
+    Ok(())
+}
+
+/// `y = x + bias` (bf16, broadcast per row) and optionally an activation: 0 none, 2 the exact `gelu`.
+fn bias_act(k: &Kernels, st: &Stream, y: &DeviceBuffer, b: &DeviceBuffer, t: usize, n: usize, act: i32) -> Result<()> {
+    k.get("bias_act").launch(
+        ((t * n).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[y.into(), b.into(), t.into(), n.into(), act.into()],
+    )?;
+    Ok(())
+}
+
+fn layernorm(
+    k: &Kernels,
+    st: &Stream,
+    y: &DeviceBuffer,
+    x: &DeviceBuffer,
+    w: &(DeviceBuffer, DeviceBuffer),
+    rows: usize,
+    n: usize,
+    eps: f32,
+) -> Result<()> {
+    k.get("layernorm").launch(
+        (rows as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[y.into(), x.into(), (&w.0).into(), (&w.1).into(), n.into(), eps.into()],
+    )?;
+    Ok(())
 }
 
 /// The MTP head: three draft layers at the text width, the fuse of the four target hidden states, and the Markov
@@ -979,6 +1282,7 @@ pub fn mtp_map(c: &Config) -> Result<Vec<Expected>> {
 // ---------------------------------------------------------------------------------------------------------------
 
 use crate::engine::Model;
+use crate::kernels::Kernels;
 use malleus_hip::{Arg, Stream};
 
 fn f32s(n: usize) -> Result<DeviceBuffer> {
