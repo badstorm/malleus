@@ -33,6 +33,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
 | Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
+| Hy4-flash (text + images) | `hy4-flash-mls4-mls8-dense.malleus` | 121.9 GB | **dense only** (406 tensors) | The 1M-window model. 90.5 GB on the device; golden 18/21, 89.95 % all-position, worst KL 1.247. The routed experts have no MLS8 copy: they do not fit. `MALLEUS_PREFILL_WEIGHTS=none` leaves the copies on the host. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
 | Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. Session state is 393 KiB per token (48 KV slots). The vision tower runs (issue #74); the MTP head is not wired yet. |
 
@@ -358,6 +359,46 @@ did, before the positions and the interpolation were sampled in the tile-major o
 `logits_last` of the same fixtures are the whole bf16 model's (the tower alone cannot say what the text does with the
 image rows); `golden.json` says which is which with `vision_dtype`.
 
+
+## Hy4-flash — the 1M window, and the dense MLS8 prefill copy (2026-11-22)
+
+A 220 B / 12 B-active sparse model: 42 gated-MLA layers (12 indexed, 30 sliding with 64 heads), a latent MoE
+(512 experts, 16 active, latent 512), four hashed Engram memories whose 32 GB table is read by row from the file,
+and a DFly2 draft. Text and images, native window 1 048 576. The MLS4 file carries GPTQ on **542/611** tensors; the
+Engram projections and the DFly2 draft stay round-to-nearest, because a GPTQ pass on either measured worse (issue
+#76).
+
+`malleus convert --prefill-int8 --no-prefill-int8-experts` adds an **MLS8 copy of the dense linears** (the
+attention projections and the dense FFN): the prefill then reads 8-bit weights (W8A8) while decode stays on the
+4-bit GEMVs. Neither the routed nor the shared experts get a copy: the routed ones are 75 GB more than the machine
+holds, and the family policy leaves every `expert` tensor out.
+
+| gfx1151, `--ctx 8192` | single MLS4 | dense MLS8 prefill copy |
+|---|---|---|
+| file / live on the device | 115.5 GB / 84.6 GB | 121.9 GB / **90.5 GB** |
+| last-token top-1 (21 prompts) | 17/21 | **18/21** |
+| all-position argmax | 87.40 % | **89.95 %** |
+| worst KL | 1.787 | **1.247** |
+| `pp512` / `pp2048` / `tg64` | 423 / 384 / 20.1 tok/s | 384-422 / 383 / 20.1 tok/s |
+
+The weight read of a chunk is what the copy doubles, and at 512 tokens it is already amortised: `pp2048` is the same
+number, the 512 point moves inside the run-to-run spread. `spec-exact` is green (every verify row and every
+committed token bit-identical to the serial step).
+
+At 1M the copies cost 5.9 GiB: the pre-flight asks 114.2 GiB of 122.8, and the session is **104.6 GiB live after the
+warm-up** (18.2 GiB of slack). With `MALLEUS_PREFILL_WEIGHTS=none` the copies stay on the host and the same file runs
+the old 99.2 GiB / W4A8 configuration. The 1M needle on the single-copy file is 1 037 046 tokens (issue #76); this
+file's state and working set are the same.
+
+```sh
+# the file (reads the bf16 checkpoint and the calibrated tensors in place)
+scripts/dev.sh /target/release/malleus convert --model /models/hy4-flash \
+  --out /golden/hy4-flash-mls4-mls8-dense.malleus --mls4-from /golden/calib/hy4-flash \
+  --prefill-int8 --no-prefill-int8-experts
+# the gate
+scripts/dev.sh /target/release/malleus golden --model /models/hy4-flash-mls4-mls8-dense.malleus \
+  --golden /golden/hy4-flash-21/golden.json --blobs /golden/hy4-flash-21 --ctx 8192
+```
 
 ## How these numbers are produced
 

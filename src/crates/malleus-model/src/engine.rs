@@ -477,7 +477,11 @@ impl Model {
     ) -> Result<Self> {
         let c = &cfg;
         let mut up = Uploader::new()?;
-        up.use_prefill = false;
+        // A file converted with `--prefill-int8` carries the MLS8 copies of the dense linears (the routed experts
+        // never do: they are ~75 GB, see `convert`). `MALLEUS_PREFILL_WEIGHTS=none` leaves them on the host and
+        // gives the 5.9 GiB back to a 1M session that would rather spend it on state.
+        up.use_prefill = opts.prefill_int8;
+        up.prefill_families = opts.prefill_families.clone();
         let embed = up.tensor(src, "model.embed_tokens.weight", &[c.vocab, c.hidden])?;
         let lm_head = up.linear(src, "lm_head", c.vocab, c.hidden)?;
         let weights = crate::hy4::Weights::load(src, c, &mut up, opts.hadamard_seed, progress)?;
@@ -492,7 +496,7 @@ impl Model {
             weight_bytes: up.bytes,
             expert_stage: None,
             attn_mass: None,
-            prefill_copies: false,
+            prefill_copies: up.prefill_loaded,
             cfg,
             k: kernels,
             embed,
