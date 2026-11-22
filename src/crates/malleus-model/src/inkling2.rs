@@ -1373,7 +1373,15 @@ pub struct Cache {
     /// [heads, max_ctx] the relative-bias row of the decode query (the prefill computes it inside the attention).
     bias: DeviceBuffer,
     tau: DeviceBuffer,
+    /// The target states the MTP head reads (`mtp_config.target_layer_ids`): the state entering those visits and the
+    /// final normalized one, for the last rows of the step. `[4, DRAFT_ROWS, hidden]`, see `feat_rows`.
+    feats: DeviceBuffer,
+    /// How many of the `DRAFT_ROWS` rows of `feats` this step filled (the last rows of the step).
+    feat_rows: usize,
 }
+
+/// Rows of target state the MTP head keeps: a verify is at most `GEMV_MAX_T` tokens, plus the bonus one.
+pub const DRAFT_ROWS: usize = crate::weights::GEMV_MAX_T + 1;
 
 impl Cache {
     pub fn new(model: &Model, max_ctx: usize) -> Result<Self> {
@@ -1400,6 +1408,8 @@ impl Cache {
             slots: out,
             bias: f32s(i.heads * max_ctx)?,
             tau: f32s(1)?,
+            feats: f32s(4 * DRAFT_ROWS * c.hidden)?,
+            feat_rows: 0,
         })
     }
 
@@ -2622,14 +2632,47 @@ fn run_mm(
             .copy_from_shared((ci * 4 + 3) * h * 4, &w.cross_pass_q, (2 * ci + 1) * h * 4, h * 4, st)?;
     }
 
+    // The target states the MTP head reads: the state entering three of the visits the loop makes, and the final
+    // normalized one. `target_layers` holds the visit indices (`5, 23, 41, 48` for this checkpoint) and a visit
+    // index counts every application of a layer, the loop's repeats included.
+    let core_len = i.loop_end - i.loop_start;
+    let visit_of = |l: usize, pass: usize| -> usize {
+        if l < i.loop_start {
+            l
+        } else if l < i.loop_end {
+            i.loop_start + pass * core_len + (l - i.loop_start)
+        } else {
+            i.loop_start + i.loop_passes * core_len + (l - i.loop_end)
+        }
+    };
+    let draft_visit = |l: usize, pass: usize| -> Option<usize> {
+        let v = visit_of(l, pass);
+        i.mtp.as_ref()?.target_layers.iter().position(|&x| x == v)
+    };
+    let nr = t.min(DRAFT_ROWS);
+    let feat = |cache: &mut Option<&mut Cache>, gx: &DeviceBuffer, j: usize| -> Result<()> {
+        let Some(k) = cache.as_deref_mut() else { return Ok(()) };
+        // The last `nr` rows of the step, at the head of the slot block: the draft reads the rows it will draft from.
+        k.feats
+            .copy_from_shared(j * DRAFT_ROWS * h * 4, gx, (t - nr) * h * 4, nr * h * 4, st)?;
+        k.feat_rows = nr;
+        Ok(())
+    };
+
     // The prelude, then the first pass over the core layers.
     for l in 0..i.loop_start {
+        if let Some(j) = draft_visit(l, 0) {
+            feat(&mut cache, &g.x, j)?;
+        }
         let place = place_of(cache.as_deref_mut(), slot_of(i, c.n_layers, 0, l), pos, one);
         g.layer(model, st, i, w, l, None, place)?;
     }
     g.pre_loop_hidden.copy_from_shared(0, &g.x, 0, t * h * 4, st)?;
     let num_pre_blocks = (0..i.loop_start).filter(|l| l.is_multiple_of(i.attn_res_block)).count();
     for l in i.loop_start..i.loop_end {
+        if let Some(j) = draft_visit(l, 0) {
+            feat(&mut cache, &g.x, j)?;
+        }
         let place = place_of(cache.as_deref_mut(), slot_of(i, c.n_layers, 0, l), pos, one);
         g.layer(model, st, i, w, l, None, place)?;
     }
@@ -2643,6 +2686,9 @@ fn run_mm(
         g.x.copy_from_shared(0, &g.pre_loop_hidden, 0, t * h * 4, st)?;
         g.blocks.truncate(num_pre_blocks);
         for l in i.loop_start..i.loop_end {
+            if let Some(j) = draft_visit(l, pass) {
+                feat(&mut cache, &g.x, j)?;
+            }
             let place = place_of(cache.as_deref_mut(), slot_of(i, c.n_layers, pass, l), pos, one);
             g.layer(model, st, i, w, l, Some((&prev_blocks, &prev_hidden)), place)?;
         }
@@ -2650,6 +2696,9 @@ fn run_mm(
 
     // The tail.
     for l in i.loop_end..c.n_layers {
+        if let Some(j) = draft_visit(l, 0) {
+            feat(&mut cache, &g.x, j)?;
+        }
         let place = place_of(cache.as_deref_mut(), slot_of(i, c.n_layers, 0, l), pos, one);
         g.layer(model, st, i, w, l, None, place)?;
     }
@@ -2676,6 +2725,19 @@ fn run_mm(
         row0,
     )?;
     rms(model, st, &g.normed, &g.mix_out, &w.norm, out_rows, h, c.eps)?;
+    if let Some(j) = i.mtp.as_ref().and_then(|m| m.target_layers.len().checked_sub(1)) {
+        // The last feature is the final normalized state, which only the rows the head runs on have.
+        let nr = nr.min(out_rows);
+        if let Some(k) = cache.as_deref_mut() {
+            k.feats.copy_from_shared(
+                j * DRAFT_ROWS * h * 4,
+                &g.normed,
+                (out_rows - nr) * h * 4,
+                nr * h * 4,
+                st,
+            )?;
+        }
+    }
     let logits_out = f32s(out_rows * c.vocab)?;
     lin(
         model,
@@ -2689,6 +2751,18 @@ fn run_mm(
         out_rows,
     )?;
     softcap(model, st, &logits_out, out_rows * c.vocab, i.logit_softcap)?;
+    // Debug: the target states this step kept, one file per step. The invariant they have to satisfy is that a verify
+    // row and a serial step at the same position carry the same bytes (`MALLEUS_INKLING2_MTP_DUMP`).
+    if let (Ok(dir), Some(k)) = (std::env::var("MALLEUS_INKLING2_MTP_DUMP"), cache.as_ref()) {
+        st.synchronize()?;
+        let v = k.feats.download::<f32>(4 * DRAFT_ROWS * h)?;
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(format!("{dir}/mtp_feats_{pos}_{t}.f32"), bytes)?;
+        eprintln!(
+            "mtp features: pos {pos}, {t} rows, {} of {DRAFT_ROWS} kept",
+            k.feat_rows
+        );
+    }
     Ok(logits_out.download(out_rows * c.vocab)?)
 }
 
