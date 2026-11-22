@@ -358,6 +358,25 @@ did, before the positions and the interpolation were sampled in the tile-major o
 `logits_last` of the same fixtures are the whole bf16 model's (the tower alone cannot say what the text does with the
 image rows); `golden.json` says which is which with `vision_dtype`.
 
+### What a verify costs (issue #74)
+
+A chunk of `w` tokens fed to a session that already holds a prefix gives every row the logits it gets one token at a
+time, bit for bit (`malleus spec-exact`, which exits non-zero otherwise): widths 2..6 at prefixes 8..170 on `en-fact`
+and `long-context`, and 3 rows at **8 250** tokens, past the floor where the log-scaled positions stop being 1. The
+chunk writes its keys into the cache and runs each row through the one-token kernels, so a verify row is computed by
+the same code as a serial step; the tiled attention stays where it belongs, on a prefill that starts at position 0.
+
+| verify | ms/step | ms/token | serial |
+|---|---|---|---|
+| 4 rows | 147 | 37 | 59 |
+| 6 rows | 255 | 43 | 60 |
+
+That is the shape a draft head needs: a six-token block is 1.4x cheaper than the same tokens one at a time, so the
+drafts have to be accepted well above half to pay. The draft head of this checkpoint (three layers, a marker at the
+four decoder visits, the Markov correction over a rank-256 state) is still not wired, and the scheduler keeps feeding
+one piece per prompt: chunked prefill is the same machinery, but it wants the tiled kernel reading the prefix instead
+of the per-row one, or a long prompt gets *slower* in pieces.
+
 
 ## How these numbers are produced
 

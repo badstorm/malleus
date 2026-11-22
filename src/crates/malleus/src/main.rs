@@ -207,6 +207,10 @@ enum Cmd {
         /// verify, rollback), comparing every committed row (0: skip)
         #[arg(long, default_value_t = 96)]
         replay: usize,
+        /// Repeat the prompt cyclically up to at least this many tokens: the depths where the log-scaled positions
+        /// of the looped graph stop being 1 need a prompt longer than any fixture
+        #[arg(long)]
+        pad: Option<usize>,
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
     },
@@ -561,6 +565,7 @@ fn spec_exact(
     prefixes: &[usize],
     width: Option<usize>,
     replay: usize,
+    pad: Option<usize>,
     ctx: usize,
 ) -> Result<()> {
     let g: serde_json::Value = serde_json::from_reader(std::fs::File::open(golden)?)?;
@@ -570,12 +575,25 @@ fn spec_exact(
         .iter()
         .find(|e| e["id"].as_str() == Some(only))
         .with_context(|| format!("no prompt `{only}` in the golden file"))?;
-    let ids: Vec<u32> = entry["input_ids"]
+    let mut ids: Vec<u32> = entry["input_ids"]
         .as_array()
         .context("ids")?
         .iter()
         .map(|v| v.as_u64().unwrap() as u32)
         .collect();
+    if let Some(n) = pad {
+        ensure!(
+            n > ids.len(),
+            "--pad must be longer than the prompt, which is {} tokens",
+            ids.len()
+        );
+        let base = ids.clone();
+        while ids.len() < n {
+            let take = (n - ids.len()).min(base.len());
+            ids.extend_from_slice(&base[..take]);
+        }
+    }
+    ensure!(ctx > ids.len(), "the prompt is longer than the context");
     let widths: Vec<usize> = match width {
         Some(w) => vec![w],
         None => (2..=GEMV_MAX_T).collect(),
@@ -586,7 +604,10 @@ fn spec_exact(
     );
     let maxw = widths.iter().copied().max().unwrap_or(2);
     let m = load_model(model)?;
-    ensure!(m.has_mtp(), "the model has no MTP head: it never verifies");
+    ensure!(
+        m.can_verify(),
+        "this model cannot verify: it never checks more than one token"
+    );
     let vocab = m.cfg.vocab;
     // Debug, for the state a verify leaves behind: MALLEUS_SPEC_STATE=serial|verify with MALLEUS_DUMP_DIR feeds
     // the prefix, then `width` tokens one at a time or in one verify, then one more token alone, whose per-layer
@@ -656,7 +677,7 @@ fn spec_exact(
     }
     ensure!(bad == 0, "{bad} verify rows differ from the serial step");
     println!("every verify row is identical to the serial step");
-    if replay > 0 && std::env::var_os("MALLEUS_DUMP_DIR").is_none() {
+    if replay > 0 && m.has_mtp() && std::env::var_os("MALLEUS_DUMP_DIR").is_none() {
         spec_replay(&m, &ids[..prefixes[0]], replay, ctx)?;
     }
     Ok(())
@@ -2984,8 +3005,9 @@ fn main() -> Result<()> {
             prefix,
             width,
             replay,
+            pad,
             ctx,
-        } => spec_exact(&model, &g, &only, &prefix, width, replay, ctx)?,
+        } => spec_exact(&model, &g, &only, &prefix, width, replay, pad, ctx)?,
         Cmd::BatchExact {
             model,
             golden: g,
