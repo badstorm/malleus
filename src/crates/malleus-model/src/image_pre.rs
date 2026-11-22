@@ -201,6 +201,53 @@ pub fn preprocess_rgb(rgb: &[u8], h: usize, w: usize, cfg: &PreConfig) -> Result
     })
 }
 
+/// Inkling-2's processor (issue #74): **no resize**. The image is padded on the right and the bottom to a multiple
+/// of the patch side (40) with `-1.0` *on the 0..255 scale* — which after the normalisation is not a neutral grey but
+/// -1.0078 — normalised by mean/std 0.5, and cut into one patch per vision token, row-major over the padded grid of
+/// `ceil(h / 40) x ceil(w / 40)`.
+///
+/// The layout of a patch is the checkpoint's, channel last (`[y][x][c]`), not the Qwen tower's `[c][y][x]`: the
+/// reference hands the tower `(patches, 40, 40, 3)` straight from the processor's reshape.
+pub fn preprocess_inkling2(rgb: &[u8], h: usize, w: usize, cfg: &PreConfig) -> Result<Preprocessed> {
+    ensure!(h > 0 && w > 0, "empty image");
+    let p = cfg.patch;
+    ensure!(p > 0, "patch side");
+    let (rows, cols) = (h.div_ceil(p), w.div_ceil(p));
+    // `max_pixels` bounds the padded image the way the other family bounds the resized one.
+    ensure!(
+        rows * p * cols * p <= cfg.max_pixels,
+        "image {w}x{h} would be {} patches of {p}x{p}, over max_pixels={}",
+        rows * cols,
+        cfg.max_pixels
+    );
+    let pad: [f32; 3] = [0, 1, 2].map(|c| ((-1.0f32 / 255.0) - cfg.mean[c]) / cfg.std[c]);
+    let mut pixels = Vec::with_capacity(rows * cols * p * p * 3);
+    for r in 0..rows {
+        for c in 0..cols {
+            for y in 0..p {
+                let sy = r * p + y;
+                for x in 0..p {
+                    let sx = c * p + x;
+                    for ch in 0..3 {
+                        pixels.push(if sy < h && sx < w {
+                            let v = rgb[(sy * w + sx) * 3 + ch] as f32 / 255.0;
+                            (v - cfg.mean[ch]) / cfg.std[ch]
+                        } else {
+                            pad[ch]
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(Preprocessed {
+        pixels,
+        grid_t: 1,
+        grid_h: rows,
+        grid_w: cols,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
