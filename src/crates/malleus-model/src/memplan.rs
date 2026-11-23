@@ -245,7 +245,8 @@ pub fn session_bytes(cfg: &Config, ctx: usize, mtp: bool) -> u64 {
             } else {
                 ring
             };
-            t += rows * kvd * 2 * 4 + hist;
+            // Keys and values are fp16 in the cache; the histories are fp32.
+            t += rows * kvd * 2 * 2 + hist;
         }
         t += (i.heads * ctx * 4) as u64;
         t += (4 * crate::inkling2::DRAFT_ROWS * cfg.hidden * 4) as u64;

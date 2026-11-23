@@ -476,8 +476,8 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_sconv_dec(float* y, c
 // only, and the output gate is applied after the merge.
 // A key sits at row `k0 + i`, wrapped when `ring` is not 0: a sliding layer only keeps its window, so its cache is a
 // ring and the first key of the window may be anywhere in it.
-extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, const float* q, const float* k,
-                                                                  const float* v, const float* bias, const float* sink,
+extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, const float* q, const __half* k,
+                                                                  const __half* v, const float* bias, const float* sink,
                                                                   const float* gate, int k0, int nk, int heads,
                                                                   int nkv, int dim, int ring, float scale) {
     __shared__ float sm[4], sl[4], sa[4][128];
@@ -492,17 +492,19 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, 
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int i = i0; i < i1; ++i) {
         const int row = ring > 0 ? (k0 + i >= ring ? k0 + i - ring : k0 + i) : k0 + i;
-        const float4 kv = *(const float4*)(k + ((size_t)row * nkv + kh) * dim + 4 * lane);
-        float d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+        const __half* kp = k + ((size_t)row * nkv + kh) * dim + 4 * lane;
+        const float2 k0v = __half22float2(*(const __half2*)kp), k1v = __half22float2(*(const __half2*)(kp + 2));
+        float d = qv.x * k0v.x + qv.y * k0v.y + qv.z * k1v.x + qv.w * k1v.y;
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
         const float sc = d * scale + bias[(size_t)h * nk + i];
         const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
-        const float4 vv = *(const float4*)(v + ((size_t)row * nkv + kh) * dim + 4 * lane);
-        acc.x = acc.x * corr + p * vv.x;
-        acc.y = acc.y * corr + p * vv.y;
-        acc.z = acc.z * corr + p * vv.z;
-        acc.w = acc.w * corr + p * vv.w;
+        const __half* vp = v + ((size_t)row * nkv + kh) * dim + 4 * lane;
+        const float2 v0 = __half22float2(*(const __half2*)vp), v1 = __half22float2(*(const __half2*)(vp + 2));
+        acc.x = acc.x * corr + p * v0.x;
+        acc.y = acc.y * corr + p * v0.y;
+        acc.z = acc.z * corr + p * v1.x;
+        acc.w = acc.w * corr + p * v1.y;
         l = l * corr + p;
         m = mn;
     }
@@ -541,4 +543,17 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, 
 extern "C" __global__ void inkling2_moe_acc(float* y, const float* x, const float* w, long long n, int h) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += w[i / h] * x[i];
+}
+
+// Stores a step's keys (or values) as fp16 at logical position `pos`, wrapping in the slot's ring: half the bytes of
+// the fp32 the cache used to hold, and the same rounding the reference uses for its own cache.
+extern "C" __global__ void __launch_bounds__(256) inkling2_kv_store(__half* dst, const float* src, int pos, int t,
+                                                                  int capacity, int ring, int c) {
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (long long)t * c) return;
+    const int row = pos + (int)(i / c);
+    const int keep = pos + t - min(t, capacity);
+    if (row < keep) return;
+    const int at = ring > 0 ? row % ring : row;
+    dst[(size_t)at * c + (int)(i % c)] = __float2half(src[i]);
 }
