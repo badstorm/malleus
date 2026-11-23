@@ -480,6 +480,15 @@ fn distribution(logits: &[f32], s: &Sampling) -> (Vec<u32>, Vec<f32>) {
     (idx, p)
 }
 
+/// Rows past the real vocabulary are not tokens (the unembedding can be padded, see `Config::real_vocab`): they are
+/// set to -inf before anything samples or normalizes a row, so a padded id can never be generated. A no-op for the
+/// families whose head has no padding.
+fn mask_pad(row: &mut [f32], real: usize) {
+    if real < row.len() {
+        row[real..].fill(f32::NEG_INFINITY);
+    }
+}
+
 fn pick(idx: &[u32], p: &[f32], mut r: f32) -> u32 {
     for (i, &v) in p.iter().enumerate() {
         r -= v;
@@ -1055,8 +1064,9 @@ impl Worker {
             return Ok(Progress::Done);
         }
         let (start, len) = act.pieces[act.piece];
+        let real = model.cfg.real_vocab();
         let tp = Instant::now();
-        let logits = {
+        let mut logits = {
             let Slot { sess, cached, .. } = &mut self.slots[act.slot];
             let logits = if act.image_req {
                 let pos = act.image_pos.as_ref().map(|p| &p[start..start + len]);
@@ -1075,6 +1085,7 @@ impl Worker {
             cached.extend_from_slice(&act.req.prompt[start..start + len]);
             logits
         };
+        mask_pad(&mut logits, real);
         if std::env::var_os("MALLEUS_DEBUG_SNAPS").is_some() {
             eprintln!("piece {} tok: {:.1} ms", len, tp.elapsed().as_secs_f64() * 1e3);
         }
@@ -1128,7 +1139,8 @@ impl Worker {
             return Ok(());
         }
         let mut order: Vec<usize> = Vec::with_capacity(idxs.len());
-        let logits = {
+        let real = self.model.cfg.real_vocab();
+        let mut logits = {
             // One run per session, in slot order: the projections are row independent, so the run order only has to
             // be the same as `order`.
             let wanted: Vec<(usize, usize, u32)> = idxs.iter().map(|&i| (i, active[i].slot, active[i].tok)).collect();
@@ -1153,6 +1165,7 @@ impl Worker {
                 act.phase = Phase::Finished;
                 continue;
             }
+            mask_pad(&mut logits[pos], real);
             let Slot { cached, .. } = &mut self.slots[slot];
             let pen = penalized(&logits[pos], &act.req.sampling, cached, &[]);
             cached.push(tok);
@@ -1175,6 +1188,7 @@ impl Worker {
         let model = &self.model;
         let Slot { sess, cached, .. } = &mut self.slots[act.slot];
         let vocab = model.cfg.vocab;
+        let real = model.cfg.real_vocab();
         if act.n >= act.max_tokens || sess.len + 1 > act.ctx {
             return Ok(Progress::Done);
         }
@@ -1186,7 +1200,8 @@ impl Worker {
             && sess.len + 2 <= act.ctx
             && (model.has_block_draft() || model.mtp_pending(sess) == act.pend.len());
         if !spec {
-            let logits = model.forward(sess, &[tok], None, 1)?;
+            let mut logits = model.forward(sess, &[tok], None, 1)?;
+            mask_pad(&mut logits, real);
             cached.push(tok);
             let pen = penalized(&logits, &act.req.sampling, cached, &[]);
             let row = pen.as_deref().unwrap_or(&logits);
@@ -1213,7 +1228,10 @@ impl Worker {
         cached.pop();
         let nd = ds.len();
         let toks: Vec<u32> = std::iter::once(tok).chain(ds.iter().copied()).collect();
-        let l = model.forward_verify(sess, &toks)?;
+        let mut l = model.forward_verify(sess, &toks)?;
+        for row in l.chunks_mut(vocab) {
+            mask_pad(row, real);
+        }
         cached.push(tok);
         let mut acc = 0;
         let mut y = 0;
@@ -1767,6 +1785,29 @@ mod tests {
         assert_eq!(image_pieces(40, &[(4, 34)], 16), vec![(0, 4), (4, 34), (34, 40)]);
         // A block that already fits inside a piece does not cut it.
         assert_eq!(image_pieces(10, &[(2, 4)], 16), vec![(0, 10)]);
+    }
+
+    #[test]
+    fn a_padded_row_is_never_sampled() {
+        // The head of this checkpoint has 201 024 rows and 200 058 tokens: the padded tail can win an argmax and a
+        // softmax alike, and the id it returns has no tokenizer entry.
+        let (real, vocab) = (6usize, 8usize);
+        let mut row = vec![0.0f32; vocab];
+        row[real + 1] = 9.0;
+        mask_pad(&mut row, real);
+        assert!(row[real..].iter().all(|v| *v == f32::NEG_INFINITY));
+        let s = Sampling {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        for r in [0.0, 0.5, 0.999] {
+            assert!(sample(&row, &s, &mut || r) < real as u32, "sampled a padded id");
+        }
+        assert!(sample(&row, &Sampling::default(), &mut || 0.5) < real as u32);
+        // And a mask wider than the row (a family whose head is not padded) is a no-op.
+        let mut wide = vec![1.0f32; 4];
+        mask_pad(&mut wide, 4);
+        assert_eq!(wide, vec![1.0f32; 4]);
     }
 
     #[test]
