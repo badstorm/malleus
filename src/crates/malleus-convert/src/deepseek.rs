@@ -245,3 +245,427 @@ mod tests {
         assert!(fp8_rows(&[0; 32], &[127], 1, 32, &mut out).is_ok());
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The converter: a DeepSeek-V4.1 checkpoint to a `.malleus` file.
+// ---------------------------------------------------------------------------------------------------------------
+
+use std::path::Path;
+
+use malleus_gguf::deepseek_alloc::{Allocation, Pick, allocation_key};
+use malleus_gguf::gguf::{ARCH_PREFIX, GgufWriter, Value};
+use malleus_gguf::safetensors::SafeTensors;
+use malleus_gguf::{DType, TensorSource};
+
+use crate::{bf16_rows, quantize_mls2, quantize_mls4, quantize_mls8, quantize_rows_i4};
+
+/// A tensor the file will carry, and how to produce it.
+enum Out {
+    /// Copied byte for byte: norms, hyper-connection coefficients, the router, the vision tower, DSpark.
+    Raw {
+        name: String,
+        dtype: DType,
+        shape: Vec<usize>,
+    },
+    /// A quantized weight and the scales that go with it.
+    Quant {
+        name: String,
+        pick: Pick,
+        shape: Vec<usize>,
+        /// The source tensor and its companion scale tensor, when the source is blocked.
+        src: String,
+        scale: Option<String>,
+    },
+}
+
+/// The layer order of a name, so the file reads layer by layer: embed and head first, then the layers, then the
+/// vision tower and DSpark at the end.
+fn order(name: &str) -> (u8, usize, String) {
+    if name.starts_with("layers.") {
+        let i = name.split('.').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        return (1, i, name.to_string());
+    }
+    if name.starts_with("vision.") || name.starts_with("aligner.") {
+        return (2, 0, name.to_string());
+    }
+    if name.starts_with("mtp.") {
+        return (3, 0, name.to_string());
+    }
+    (0, 0, name.to_string())
+}
+
+/// Converts a DeepSeek-V4.1 checkpoint. The precision of every tensor comes from `alloc`; a tensor the map does
+/// not mention is copied as it is.
+pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&str)) -> anyhow::Result<()> {
+    let st = SafeTensors::open_dir(model_dir)?;
+    let read = |f: &str| std::fs::read_to_string(model_dir.join(f)).ok();
+    let config = read("config.json").ok_or_else(|| anyhow::anyhow!("config.json is missing"))?;
+
+    // A slice of the layers, for a smoke test: `MALLEUS_DEEPSEEK_LAYERS=0,1` keeps only those.
+    let only: Option<Vec<usize>> = std::env::var("MALLEUS_DEEPSEEK_LAYERS").ok().map(|s| {
+        s.split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect::<Vec<usize>>()
+    });
+    let keep = |name: &str| match &only {
+        None => true,
+        Some(layers) => match name.strip_prefix("layers.").and_then(|r| r.split('.').next()) {
+            Some(i) => i.parse().map(|i| layers.contains(&i)).unwrap_or(true),
+            None => !name.starts_with("mtp."),
+        },
+    };
+
+    // The source names, in file order. A `.scale` companion is written with its weight, never on its own.
+    let mut names: Vec<String> = st.names().into_iter().map(String::from).collect();
+    names.retain(|n| keep(n));
+    names.sort_by_key(|n| order(n));
+
+    let mut plan: Vec<Out> = Vec::new();
+    for name in &names {
+        if name.ends_with(".scale") {
+            continue;
+        }
+        let info = st
+            .info(name)
+            .ok_or_else(|| anyhow::anyhow!("{name}: not in the checkpoint"))?;
+        let pick = alloc.pick(&allocation_key(name));
+        let companion = format!("{}.scale", name.trim_end_matches(".weight"));
+        let scale = st.info(&companion).map(|_| companion.clone());
+        if pick == Pick::Keep || scale.is_none() {
+            plan.push(Out::Raw {
+                name: name.clone(),
+                dtype: info.dtype,
+                shape: info.shape.clone(),
+            });
+            // A blocked source whose weight stays as it is keeps its scales beside it.
+            if let Some(s) = scale {
+                let si = st.info(&s).unwrap();
+                plan.push(Out::Raw {
+                    name: s,
+                    dtype: si.dtype,
+                    shape: si.shape.clone(),
+                });
+            }
+            continue;
+        }
+        plan.push(Out::Quant {
+            name: name.clone(),
+            pick,
+            shape: info.shape.clone(),
+            src: name.clone(),
+            scale,
+        });
+    }
+
+    let mut w = GgufWriter::new();
+    w.meta("general.architecture", Value::Str(format!("{ARCH_PREFIX}deepseek_v41")));
+    w.meta(
+        "general.name",
+        Value::Str(
+            model_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("deepseek")
+                .into(),
+        ),
+    );
+    w.meta(
+        "openmalleus.layout_version",
+        Value::U32(malleus_gguf::quant::LAYOUT_VERSION),
+    );
+    w.meta(
+        "openmalleus.hadamard_seed",
+        Value::U64(malleus_gguf::quant::HADAMARD_SEED),
+    );
+    w.meta("openmalleus.hf_config", Value::Str(config));
+    if let Some(g) = read("generation_config.json") {
+        w.meta("openmalleus.generation_config", Value::Str(g));
+    }
+    if let Some(p) = read("preprocessor_config.json") {
+        w.meta("openmalleus.preprocessor_config", Value::Str(p));
+    }
+    if let Some(t) = read("tokenizer.json") {
+        w.meta("tokenizer.huggingface.json", Value::Str(t));
+    }
+    if let Some(c) = read("chat_template.jinja") {
+        w.meta("tokenizer.chat_template", Value::Str(c));
+    }
+
+    let mut bytes = 0usize;
+    for o in &plan {
+        match o {
+            Out::Raw { name, dtype, shape } => {
+                bytes += dtype.size_of_elems(shape.iter().product());
+                w.add_tensor(name, *dtype, shape);
+            }
+            Out::Quant { name, pick, shape, .. } => {
+                let lead = &shape[..shape.len() - 1];
+                let k = shape[shape.len() - 1];
+                let dims = |last: &[usize]| [lead, last].concat();
+                match pick {
+                    Pick::Mls2 | Pick::Mls3 | Pick::Mls4 => {
+                        let dt = match pick {
+                            Pick::Mls2 => DType::Mls2,
+                            Pick::Mls3 => DType::Mls3,
+                            _ => DType::Mls4,
+                        };
+                        w.add_tensor(name, dt, shape);
+                        let s = format!("{name}.scales");
+                        w.add_tensor(&s, DType::F16, &dims(&[k / 128]));
+                        bytes += tensor_size(dt, shape) + dims(&[k / 128]).iter().product::<usize>() * 2;
+                    }
+                    Pick::Mls8 => {
+                        w.add_tensor(name, DType::Mls8, shape);
+                        let s = format!("{name}.scales");
+                        w.add_tensor(&s, DType::F32, lead);
+                        bytes += tensor_size(DType::Mls8, shape) + lead.iter().product::<usize>() * 4;
+                    }
+                    Pick::RowI4 => {
+                        w.add_tensor(name, DType::RowI4, shape);
+                        let s = format!("{name}.scales");
+                        w.add_tensor(&s, DType::F16, lead);
+                        bytes += tensor_size(DType::RowI4, shape) + lead.iter().product::<usize>() * 2;
+                    }
+                    Pick::Keep => unreachable!("Keep is planned as Raw"),
+                }
+            }
+        }
+    }
+    log(&format!("{} output tensors, {:.2} GB", plan.len(), bytes as f64 / 1e9));
+
+    let mut sink = w.begin(out)?;
+    let t0 = std::time::Instant::now();
+    let mut done = 0usize;
+    for o in &plan {
+        match o {
+            Out::Raw { name, dtype, shape } => {
+                let size = dtype.size_of_elems(shape.iter().product());
+                let mut buf = vec![0u8; 64 << 20];
+                let mut off = 0;
+                while off < size {
+                    let n = buf.len().min(size - off);
+                    st.read(name, off, &mut buf[..n])?;
+                    sink.write(&buf[..n])?;
+                    off += n;
+                }
+            }
+            Out::Quant {
+                name: _,
+                pick,
+                shape,
+                src,
+                scale,
+            } => {
+                let (n, k) = (
+                    shape[..shape.len() - 1].iter().product::<usize>(),
+                    shape[shape.len() - 1],
+                );
+                let info = st
+                    .info(src)
+                    .ok_or_else(|| anyhow::anyhow!("{src}: not in the checkpoint"))?;
+                let mut w32 = vec![0f32; n * k];
+                read_weight(&st, src, info.dtype, scale.as_deref(), n, k, &mut w32)?;
+                match pick {
+                    Pick::Mls2 => {
+                        let (q, s) = quantize_mls2(&w32, n, k);
+                        sink.write(&q)?;
+                        sink.write(&s)?;
+                    }
+                    Pick::Mls3 => {
+                        let (q, s) = crate::quantize_mls3(&w32, n, k);
+                        sink.write(&q)?;
+                        sink.write(&s)?;
+                    }
+                    Pick::Mls4 => {
+                        let (q, s) = quantize_mls4(&w32, n, k);
+                        sink.write(&q)?;
+                        sink.write(&s)?;
+                    }
+                    Pick::Mls8 => {
+                        let (q, s) = quantize_mls8(&w32, n, k);
+                        sink.write(&q)?;
+                        sink.write(&s)?;
+                    }
+                    Pick::RowI4 => {
+                        let (q, s) = quantize_rows_i4(&w32, n, k);
+                        sink.write(&q)?;
+                        sink.write(&s)?;
+                    }
+                    Pick::Keep => unreachable!(),
+                }
+            }
+        }
+        done += 1;
+        if done.is_multiple_of(200) || done == plan.len() {
+            log(&format!("[{done}/{}] {:.0}s", plan.len(), t0.elapsed().as_secs_f64()));
+        }
+    }
+    sink.finish()?;
+    Ok(())
+}
+
+/// Reads one weight as f32, dequantizing its block format when the source has one.
+fn read_weight(
+    st: &SafeTensors,
+    name: &str,
+    dtype: DType,
+    scale: Option<&str>,
+    n: usize,
+    k: usize,
+    out: &mut [f32],
+) -> anyhow::Result<()> {
+    match dtype {
+        DType::BF16 => {
+            let mut raw = vec![0u8; n * k * 2];
+            st.read(name, 0, &mut raw)?;
+            out.copy_from_slice(&bf16_rows(&raw));
+        }
+        DType::F32 => {
+            let mut raw = vec![0u8; n * k * 4];
+            st.read(name, 0, &mut raw)?;
+            for (o, c) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
+                *o = f32::from_le_bytes(*c);
+            }
+        }
+        DType::F8E4M3 => {
+            let s = scale.ok_or_else(|| anyhow::anyhow!("{name}: fp8 without a scale"))?;
+            let mut q = vec![0u8; n * k];
+            st.read(name, 0, &mut q)?;
+            let si = st
+                .info(s)
+                .ok_or_else(|| anyhow::anyhow!("{s}: not in the checkpoint"))?;
+            let mut sc = vec![0u8; si.shape.iter().product()];
+            st.read(s, 0, &mut sc)?;
+            fp8_rows(&q, &sc, n, k, out)?;
+        }
+        DType::I8 => {
+            let s = scale.ok_or_else(|| anyhow::anyhow!("{name}: fp4 without a scale"))?;
+            let mut q = vec![0u8; n * k / 2];
+            st.read(name, 0, &mut q)?;
+            let si = st
+                .info(s)
+                .ok_or_else(|| anyhow::anyhow!("{s}: not in the checkpoint"))?;
+            let mut sc = vec![0u8; si.shape.iter().product()];
+            st.read(s, 0, &mut sc)?;
+            fp4_rows(&q, &sc, n, k, out)?;
+        }
+        d => anyhow::bail!("{name}: {d:?} cannot be quantized"),
+    }
+    Ok(())
+}
+
+fn tensor_size(dtype: DType, shape: &[usize]) -> usize {
+    dtype.size_of_elems(shape.iter().product())
+}
+
+#[cfg(test)]
+mod round_trip {
+    use super::*;
+    use malleus_gguf::gguf::Gguf;
+    use malleus_gguf::quant::{Int2Grid, dequant_int2, unrotate_row};
+
+    /// Reads a quantized tensor back from a converted file and compares it with the source checkpoint's f32.
+    /// Run with the slice's file and the checkpoint:
+    ///
+    ///   DEEPSEEK_FILE=/golden/deepseek-slice/deepseek-v41-slice.malleus DEEPSEEK_CKPT=/models/deepseekv41-flash \
+    ///   cargo test -p malleus-convert round_trip -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads a converted slice and the checkpoint"]
+    fn a_slice_round_trips_through_the_file() {
+        let file = std::env::var("DEEPSEEK_FILE").expect("DEEPSEEK_FILE");
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let f = Gguf::open(std::path::Path::new(&file)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        println!("the file carries {} tensors", f.names().len());
+
+        // The attention projection is MLS8 in the map: int8 codes with one f32 scale per row, rotated.
+        let name = "layers.0.attn.wq_a.weight";
+        let info = f.info(name).unwrap();
+        let (n, k) = (info.shape[0], info.shape[1]);
+        assert_eq!(info.dtype, DType::Mls8, "the map asked for Q8_0");
+        let mut q = vec![0u8; n * k];
+        f.read(name, 0, &mut q).unwrap();
+        let mut s = vec![0u8; n * 4];
+        f.read(&format!("{name}.scales"), 0, &mut s).unwrap();
+        let scales: Vec<f32> = s.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+        let signs = malleus_gguf::quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED);
+        let mut got = vec![0f32; n * k];
+        for r in 0..n {
+            let row = &mut got[r * k..(r + 1) * k];
+            for (o, &b) in row.iter_mut().zip(&q[r * k..(r + 1) * k]) {
+                *o = b as i8 as f32 * scales[r];
+            }
+            unrotate_row(row, &signs);
+        }
+        let want = source_f32(&src, name, n, k);
+        let (cos, worst) = compare(&got, &want);
+        println!("{name} (Mls8): cosine {cos:.7}, worst |diff| {worst:.6}");
+        assert!(cos > 0.999, "{name} diverges: {cos}");
+
+        // A routed expert is MLS2 in the map: four 2-bit codes per byte, one f16 scale per 128.
+        let name = "layers.0.ffn.experts.0.w1.weight";
+        let info = f.info(name).unwrap();
+        let (n, k) = (info.shape[0], info.shape[1]);
+        assert_eq!(info.dtype, DType::Mls2, "the map asked for IQ2_XXS");
+        let mut q = vec![0u8; n * k / 4];
+        f.read(name, 0, &mut q).unwrap();
+        let mut s = vec![0u8; n * (k / 128) * 2];
+        f.read(&format!("{name}.scales"), 0, &mut s).unwrap();
+        let scales: Vec<f32> = s
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::f16::from_le_bytes(*c).to_f32())
+            .collect();
+        let mut got = vec![0f32; n * k];
+        let g = k / 128;
+        for r in 0..n {
+            for grp in 0..g {
+                let bytes = &q[r * k / 4 + grp * 32..r * k / 4 + grp * 32 + 32];
+                let mut blk = [0f32; 128];
+                dequant_int2(bytes, scales[r * g + grp], Int2Grid::E2m1, &mut blk);
+                got[r * k + grp * 128..r * k + grp * 128 + 128].copy_from_slice(&blk);
+            }
+            unrotate_row(&mut got[r * k..(r + 1) * k], &signs);
+        }
+        let want = source_f32(&src, name, n, k);
+        let (cos, worst) = compare(&got, &want);
+        println!("{name} (Mls2): cosine {cos:.7}, worst |diff| {worst:.6}");
+        assert!(cos > 0.90, "{name} diverges: {cos}");
+    }
+
+    /// The checkpoint's own value of a tensor, dequantized to f32.
+    fn source_f32(src: &SafeTensors, name: &str, n: usize, k: usize) -> Vec<f32> {
+        let info = src.info(name).unwrap();
+        let mut out = vec![0f32; n * k];
+        let mut q = vec![0u8; info.size];
+        src.read(name, 0, &mut q).unwrap();
+        match info.dtype {
+            DType::F8E4M3 => {
+                let mut s = vec![0u8; n.div_ceil(32) * (k / 32)];
+                src.read(&format!("{}.scale", name.trim_end_matches(".weight")), 0, &mut s)
+                    .unwrap();
+                fp8_rows(&q, &s, n, k, &mut out).unwrap();
+            }
+            DType::I8 => {
+                let mut s = vec![0u8; n * (k / 32)];
+                src.read(&format!("{}.scale", name.trim_end_matches(".weight")), 0, &mut s)
+                    .unwrap();
+                fp4_rows(&q, &s, n, k, &mut out).unwrap();
+            }
+            d => panic!("{name} is {d:?}, not a blocked weight"),
+        }
+        out
+    }
+
+    fn compare(a: &[f32], b: &[f32]) -> (f64, f64) {
+        let (mut dot, mut na, mut nb, mut worst) = (0f64, 0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            dot += (*x as f64) * (*y as f64);
+            na += (*x as f64) * (*x as f64);
+            nb += (*y as f64) * (*y as f64);
+            worst = worst.max((*x - *y).abs() as f64);
+        }
+        (dot / (na.sqrt() * nb.sqrt()), worst)
+    }
+}

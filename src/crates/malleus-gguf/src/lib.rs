@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod deepseek_alloc;
 pub mod fpquant;
 pub mod gguf;
 pub mod quant;
