@@ -26,12 +26,19 @@ use crate::weights::{GEMV_MAX_T, kv_ctx, pad128};
 const GIB: u64 = 1 << 30;
 /// The part of the working set that does not depend on the chunk (see `working_set_bytes`).
 const WORKING_SET_FIXED: u64 = 2 * GIB;
+/// What the plan has to leave free **on top of** its working set: the page cache, the desktop and the other
+/// containers live in the same RAM, and a request that leaves nothing does not fail cleanly — the host streams from
+/// disk until it is rebooted (issue #106: 33.5 GiB asked of the 33.6 GiB a 96 GiB host had left).
+const HOST_SLACK: u64 = 2 * GIB;
 
 /// `MemTotal` / `MemAvailable` from `/proc/meminfo`, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemInfo {
     pub total: u64,
     pub available: u64,
+    /// Where the numbers come from: `"gtt"`, `"ram"`, or `"gtt+ram"` when the driver's window was the wider of
+    /// the two and the RAM the kernel reports is what is left.
+    pub window: &'static str,
 }
 
 impl MemInfo {
@@ -51,17 +58,31 @@ impl MemInfo {
         Some(MemInfo {
             total: field(text, "MemTotal:")?,
             available: field(text, "MemAvailable:")?,
+            window: "ram",
         })
     }
 
-    /// What this host can still hand to the GPU. On an APU the weights live in GTT, not in the host's anonymous
-    /// pages: `/proc/meminfo` counts the other containers' memory and says nothing about the 96 GiB GTT window, so
-    /// the driver's own numbers win when they are there.
+    /// What this host can still hand to the GPU, and the narrower of the two windows that say so. On an APU the
+    /// weights live in GTT, so the driver's `mem_info_gtt_*` is the promise that matters; but a GTT window wider than
+    /// the RAM the kernel reports is not memory the host has (an APU whose window covers the whole address space, an
+    /// LXC that fakes `/proc/meminfo` small), and a run that believes it does not fail cleanly: it evicts the page
+    /// cache and the machine streams from disk until it is rebooted (`serve --ctx 524288` on Inkling-2 at 33 GiB
+    /// asked, issue #106). The smaller `MemAvailable` wins, and the line says which one it was.
     pub fn read() -> Option<MemInfo> {
-        if let Some(gtt) = Self::read_gtt() {
-            return Some(gtt);
+        let ram = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|t| Self::parse(&t));
+        Self::narrow(Self::read_gtt(), ram)
+    }
+
+    /// The narrower of the two windows: the smaller `MemAvailable` wins, and `total` follows the same window so the
+    /// printed pair stays one budget.
+    fn narrow(gtt: Option<MemInfo>, ram: Option<MemInfo>) -> Option<MemInfo> {
+        match (gtt, ram) {
+            (Some(g), Some(r)) if r.available < g.available => Some(MemInfo { ..r }),
+            (Some(g), Some(_)) => Some(MemInfo { window: "gtt+ram", ..g }),
+            (g, r) => g.or(r),
         }
-        Self::parse(&std::fs::read_to_string("/proc/meminfo").ok()?)
     }
 
     /// `mem_info_gtt_total` / `mem_info_gtt_used` of the card with the widest window, in bytes.
@@ -78,6 +99,7 @@ impl MemInfo {
                 best = Some(MemInfo {
                     total,
                     available: total.saturating_sub(used),
+                    window: "gtt",
                 });
             }
         }
@@ -232,7 +254,7 @@ pub fn session_bytes(cfg: &Config, ctx: usize, mtp: bool) -> u64 {
         let core = i.loop_end - i.loop_start;
         let kvd = (i.kv_heads * i.head_dim) as u64;
         let hist = 2 * (3 * kvd * 4) + 2 * (3 * cfg.hidden as u64 * 4);
-        let ring = (i.window + crate::inkling2::DRAFT_ROWS + 1).min(ctx) as u64;
+        let ring = (i.window + crate::inkling2::PREFILL_CHUNK + crate::inkling2::DRAFT_ROWS + 1).min(ctx) as u64;
         let mut t = 0u64;
         for s in 0..cfg.n_layers + (i.loop_passes.max(1) - 1) * core {
             let l = if s < cfg.n_layers {
@@ -352,9 +374,11 @@ pub fn check(label: &str, ctx: usize, usage: &Usage, info: Option<MemInfo>) -> R
         gib(usage.reserve),
         gib(usage.total()),
         info.map_or(String::new(), |i| format!(
-            ", {:.1} GiB available of {:.1}",
+            ", {:.1} GiB available of {:.1} ({}, {:.1} after the slack)",
             gib(i.available),
-            gib(i.total)
+            gib(i.total),
+            i.window,
+            gib(available_for_a_run(i))
         ))
     );
     let Some(info) = info else {
@@ -362,12 +386,12 @@ pub fn check(label: &str, ctx: usize, usage: &Usage, info: Option<MemInfo>) -> R
         return Ok(());
     };
     if std::env::var("MALLEUS_MEM_IGNORE").is_ok_and(|v| v != "0" && v != "false") {
-        if usage.short_by(info.available).is_some() {
+        if usage.short_by(available_for_a_run(info)).is_some() {
             eprintln!("memory: this does not fit, but MALLEUS_MEM_IGNORE is set: the allocator decides");
         }
         return Ok(());
     }
-    let Some(short) = usage.short_by(info.available) else {
+    let Some(short) = usage.short_by(available_for_a_run(info)) else {
         return Ok(());
     };
     // What to lower: the context is the only knob that moves the state term on its own.
@@ -376,7 +400,8 @@ pub fn check(label: &str, ctx: usize, usage: &Usage, info: Option<MemInfo>) -> R
     bail!(
         "memory: `{label}` does not fit on this host.\n\
          Need {:.1} GiB (weights {:.1} + state {:.1} x {} sessions + working set {:.1} + page cache {:.1}), \
-         available is {:.1}: {:.1} GiB missing.\n\
+         and this host can plan with {:.1} GiB ({:.1} free, less {:.1} for the rest of the machine): {:.1} GiB \
+         missing.\n\
          Each session at this context costs {:.1} GiB (~{} KiB per position, {:.1} GiB per 32k positions).\n\
          The working set follows the prefill chunk: lower MALLEUS_PREFILL_CHUNK first (it costs no prefill speed \
          down to 8192), then MALLEUS_CTX (or the session count, MALLEUS_SLOTS), or use a checkpoint with fewer \
@@ -387,12 +412,19 @@ pub fn check(label: &str, ctx: usize, usage: &Usage, info: Option<MemInfo>) -> R
         usage.sessions,
         gib(usage.reserve),
         gib(usage.host),
+        gib(available_for_a_run(info)),
         gib(info.available),
+        gib(HOST_SLACK),
         gib(short),
         gib(usage.session),
         per_position / 1024,
         gib(per_32k),
     );
+}
+
+/// The bytes a run may plan with: what the host has left, less the slack it keeps for everything else.
+pub fn available_for_a_run(info: MemInfo) -> u64 {
+    info.available.saturating_sub(HOST_SLACK)
 }
 
 fn env_gib(name: &str) -> Option<u64> {
@@ -454,12 +486,54 @@ mod tests {
         let m = MemInfo::parse(MEMINFO).unwrap();
         assert_eq!(m.total, 128_785_860 * 1024);
         assert_eq!(m.available, 122_971_191 * 1024);
+        assert_eq!(m.window, "ram");
+    }
+
+    #[test]
+    fn the_narrower_window_wins() {
+        // This host: the driver reports a 96 GiB GTT window, the kernel reports 32 GiB of RAM. The GTT window is
+        // not memory the host has, and a run that believes it freezes the machine (issue #106).
+        let gtt = MemInfo {
+            total: 96 * GIB,
+            available: 90 * GIB,
+            window: "gtt",
+        };
+        let ram = MemInfo::parse("MemTotal:       33554432 kB\nMemAvailable:   31200000 kB\n").unwrap();
+        let m = MemInfo::narrow(Some(gtt), Some(ram)).unwrap();
+        assert_eq!(m.window, "ram");
+        assert_eq!((m.total, m.available), (ram.total, ram.available));
+        // The usual APU: the window is the narrower one and stays the promise.
+        let big = MemInfo::parse(MEMINFO).unwrap();
+        let m = MemInfo::narrow(Some(gtt), Some(big)).unwrap();
+        assert_eq!(m.window, "gtt+ram");
+        assert_eq!((m.total, m.available), (gtt.total, gtt.available));
+        // One source missing is still one budget.
+        assert_eq!(MemInfo::narrow(Some(gtt), None).unwrap().window, "gtt");
+        assert_eq!(MemInfo::narrow(None, Some(ram)).unwrap().window, "ram");
+        assert!(MemInfo::narrow(None, None).is_none());
     }
 
     #[test]
     fn missing_available_is_not_a_number() {
         assert!(MemInfo::parse("MemTotal: 1 kB\n").is_none());
         assert!(MemInfo::parse("").is_none());
+    }
+
+    #[test]
+    fn a_run_leaves_the_host_something() {
+        let info = MemInfo {
+            total: 34 * GIB,
+            available: (3 * GIB) + HOST_SLACK - 1,
+            window: "ram",
+        };
+        assert_eq!(available_for_a_run(info), 3 * GIB - 1);
+        // Never negative, however little is left.
+        let info = MemInfo {
+            total: GIB,
+            available: GIB / 2,
+            window: "ram",
+        };
+        assert_eq!(available_for_a_run(info), 0);
     }
 
     #[test]
