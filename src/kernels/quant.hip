@@ -772,7 +772,7 @@ __device__ __forceinline__ void moe_grp_core(float* out, const float* x, const u
     const int ti = blockIdx.y;
     if (ti >= ntiles[0]) return;
     const int e = tiles[2 * ti], r0 = tiles[2 * ti + 1];
-    const int rows = min(8, offs[e + 1] - offs[e] - r0);
+    const int rows = min(MAXT, offs[e + 1] - offs[e] - r0);
     if (threadIdx.x < 8) {
         const int pr = perm[offs[e] + r0 + min((int)threadIdx.x, rows - 1)];
         // gate|up: one output row per pair; down: the expert-sorted row `moe_combine` finds through `pos`.
