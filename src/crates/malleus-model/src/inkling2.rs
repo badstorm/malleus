@@ -1773,84 +1773,28 @@ impl Graph {
                 copy_nq(model, &self.msg_out, &self.msg[qi], qi, t, h, 4, st)?;
             }
             let ctrl = layer.controller.as_ref().context("loop layer without controller")?;
-            if full {
-                control(
-                    model,
-                    st,
-                    &self.qin,
-                    &self.qin,
-                    &self.msg[0],
-                    &ctrl.attn,
-                    t,
-                    h,
-                    i.loop_rank,
-                    eps,
-                )?;
-                control(
-                    model,
-                    st,
-                    &self.kin,
-                    &self.kin,
-                    &self.msg[1],
-                    &ctrl.k,
-                    t,
-                    h,
-                    i.loop_rank,
-                    eps,
-                )?;
-                control(
-                    model,
-                    st,
-                    &self.vin,
-                    &self.vin,
-                    &self.msg[2],
-                    &ctrl.v,
-                    t,
-                    h,
-                    i.loop_rank,
-                    eps,
-                )?;
+            // A sliding layer's attention input is one query for all three streams, so each gate reads the same state
+            // and writes its own copy; a full layer has three.
+            let (cq, ck, cv) = if full {
+                (&self.qin, &self.kin, &self.vin)
             } else {
-                // The sliding layer's attention input is one query for all three streams, so each gate reads the
-                // same state and writes its own copy.
                 self.attn_in.copy_from_shared(0, &self.qin, 0, t * h * 4, st)?;
-                control(
-                    model,
-                    st,
-                    &self.qin,
-                    &self.attn_in,
-                    &self.msg[0],
-                    &ctrl.attn,
-                    t,
-                    h,
-                    i.loop_rank,
-                    eps,
-                )?;
-                control(
-                    model,
-                    st,
-                    &self.kin,
-                    &self.attn_in,
-                    &self.msg[1],
-                    &ctrl.k,
-                    t,
-                    h,
-                    i.loop_rank,
-                    eps,
-                )?;
-                control(
-                    model,
-                    st,
-                    &self.vin,
-                    &self.attn_in,
-                    &self.msg[2],
-                    &ctrl.v,
-                    t,
-                    h,
-                    i.loop_rank,
-                    eps,
-                )?;
-            }
+                (&self.qin, &self.attn_in, &self.attn_in)
+            };
+            // One launch for the three: each was a single block on a single compute unit, and three of those in a row
+            // are three latencies. Per gate the arithmetic is unchanged.
+            control3(
+                model,
+                st,
+                [&self.qin, &self.kin, &self.vin],
+                [cq, ck, cv],
+                [&self.msg[0], &self.msg[1], &self.msg[2]],
+                [&ctrl.attn, &ctrl.k, &ctrl.v],
+                t,
+                h,
+                i.loop_rank,
+                eps,
+            )?;
         }
 
         // 2. The input norms and the projections.
@@ -3325,6 +3269,52 @@ fn attn_wmma(
             extent.into(),
             window.into(),
             scale.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The three attention gates of an extra pass in one launch (see `inkling2_control3`).
+#[allow(clippy::too_many_arguments)]
+fn control3(
+    model: &Model,
+    st: &Stream,
+    out: [&DeviceBuffer; 3],
+    cur: [&DeviceBuffer; 3],
+    msg: [&DeviceBuffer; 3],
+    c: [&Gate; 3],
+    t: usize,
+    hidden: usize,
+    rank: usize,
+    eps: f32,
+) -> Result<()> {
+    model.k.get("inkling2_control3").launch(
+        (t as u32, 3, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            out[0].into(),
+            cur[0].into(),
+            msg[0].into(),
+            (&c[0].down).into(),
+            (&c[0].gain).into(),
+            (&c[0].forget).into(),
+            out[1].into(),
+            cur[1].into(),
+            msg[1].into(),
+            (&c[1].down).into(),
+            (&c[1].gain).into(),
+            (&c[1].forget).into(),
+            out[2].into(),
+            cur[2].into(),
+            msg[2].into(),
+            (&c[2].down).into(),
+            (&c[2].gain).into(),
+            (&c[2].forget).into(),
+            hidden.into(),
+            rank.into(),
+            eps.into(),
         ],
     )?;
     Ok(())

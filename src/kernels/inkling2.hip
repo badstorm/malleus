@@ -528,15 +528,14 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_moe_act(float* out, c
 //   forget = tanh(forget_w . gate)                      [hidden]
 //   out    = cur - forget * cur + gain * message
 // One block per token; the weights are bf16 like the checkpoint's, the arithmetic is fp32.
-extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, const float* cur, const float* msg,
-                                                                  const ik_bf16* down, const ik_bf16* gain_w,
-                                                                  const ik_bf16* forget_w, int hidden, int rank,
-                                                                  float eps) {
+__device__ __forceinline__ void control_body(float* out, const float* cur, const float* msg, const ik_bf16* down,
+                                             const ik_bf16* gain_w, const ik_bf16* forget_w, int hidden, int rank,
+                                             float eps, int t) {
     __shared__ float red[256];
     __shared__ float gate[128];
     __shared__ float nc[4096];
     __shared__ float nm[4096];
-    const int t = blockIdx.x, r = threadIdx.x;
+    const int r = threadIdx.x;
     const float* cp = cur + (size_t)t * hidden;
     const float* mp = msg + (size_t)t * hidden;
     // rms of both inputs, then the concatenated normed pair.
@@ -575,6 +574,29 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, c
             f += ik_bf2f(forget_w[(size_t)i * rank + j]) * gate[j];
         }
         out[(size_t)t * hidden + i] = cp[i] * (1.f - tanhf(f)) + tanhf(g) * mp[i];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, const float* cur, const float* msg,
+                                                                  const ik_bf16* down, const ik_bf16* gain_w,
+                                                                  const ik_bf16* forget_w, int hidden, int rank,
+                                                                  float eps) {
+    control_body(out, cur, msg, down, gain_w, forget_w, hidden, rank, eps, blockIdx.x);
+}
+
+// The three attention gates of an extra pass in one launch: they share the shapes and the rank, and each was one block
+// on one compute unit, so three launches with a block each were three serialised latencies. `blockIdx.y` picks the
+// gate; every gate's arithmetic is `control_body`'s, unchanged, so the result is bit-identical.
+extern "C" __global__ void __launch_bounds__(256) inkling2_control3(
+    float* o0, const float* c0, const float* m0, const ik_bf16* d0, const ik_bf16* g0, const ik_bf16* f0, float* o1,
+    const float* c1, const float* m1, const ik_bf16* d1, const ik_bf16* g1, const ik_bf16* f1, float* o2,
+    const float* c2, const float* m2, const ik_bf16* d2, const ik_bf16* g2, const ik_bf16* f2, int hidden, int rank,
+    float eps) {
+    const int t = blockIdx.x;
+    switch (blockIdx.y) {
+        case 1: control_body(o1, c1, m1, d1, g1, f1, hidden, rank, eps, t); break;
+        case 2: control_body(o2, c2, m2, d2, g2, f2, hidden, rank, eps, t); break;
+        default: control_body(o0, c0, m0, d0, g0, f0, hidden, rank, eps, t); break;
     }
 }
 
