@@ -18,7 +18,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use text::{THINK_END, TOOL_START, holdback, openai_tool_calls, parse_output};
+use text::{
+    Delta, MessageSplitter, THINK_END, TOOL_START, holdback, openai_tool_calls, parse_message_output, parse_output,
+};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
@@ -692,6 +694,9 @@ struct Prepared {
     image_token: Option<u32>,
     thinking: bool,
     tools: bool,
+    /// The output is written in message tokens (`<|content_thinking|>`, `<|content_text|>`,
+    /// `<|content_invoke_tool_json|>`, Inkling-2) instead of the `thinking` block and the XML tool calls.
+    msg: bool,
     max_tokens: usize,
     sampling: Sampling,
     stops: Vec<String>,
@@ -874,6 +879,7 @@ fn prepare(
         image_token,
         thinking,
         tools: tools.is_some(),
+        msg: chat.has_message_tokens(),
         max_tokens,
         sampling,
         stops,
@@ -1077,10 +1083,27 @@ struct Splitter {
     buf: String,
 }
 
-#[derive(Debug)]
-enum Delta {
-    Reasoning(String),
-    Content(String),
+/// One of the two turn formats: the Qwen XML above, or the message tokens of a family that writes them.
+enum StreamSplitter {
+    Qwen(Splitter),
+    Message(MessageSplitter),
+}
+
+impl StreamSplitter {
+    fn for_turn(p: &Prepared) -> Self {
+        if p.msg {
+            StreamSplitter::Message(MessageSplitter::new())
+        } else {
+            StreamSplitter::Qwen(Splitter::new(p.thinking, p.tools))
+        }
+    }
+
+    fn push(&mut self, s: &str, last: bool) -> Vec<Delta> {
+        match self {
+            StreamSplitter::Qwen(q) => q.push(s, last),
+            StreamSplitter::Message(m) => m.push(s, last),
+        }
+    }
 }
 
 impl Splitter {
@@ -1150,6 +1173,15 @@ impl Splitter {
             }
             return out;
         }
+    }
+}
+
+/// The turn split in the format the model writes it (see `Prepared::msg`).
+fn parse_turn(p: &Prepared, text: &str) -> text::Parsed {
+    if p.msg {
+        parse_message_output(text, p.tools)
+    } else {
+        parse_output(text, p.thinking, p.tools)
     }
 }
 
@@ -1271,7 +1303,7 @@ async fn chat_completions(
                 }
             }
         };
-        let parsed = parse_output(&g.text, p.thinking, p.tools);
+        let parsed = parse_turn(&p, &g.text);
         let mut msg = json!({ "role": "assistant", "content": parsed.content });
         if !parsed.reasoning.is_empty() {
             msg["reasoning_content"] = json!(parsed.reasoning);
@@ -1323,6 +1355,8 @@ async fn completions(State(st): State<Shared>, h: HeaderMap, Json(body): Json<Va
         image_token: None,
         thinking: false,
         tools: false,
+        // A raw completion returns the model's text as it is: no turn to split.
+        msg: false,
         max_tokens,
         sampling: sampling_from(&body, false),
         stops: stops_from(&body),
@@ -1418,7 +1452,7 @@ fn openai_stream(
         )) {
             return;
         }
-        let mut sp = Splitter::new(p.thinking, p.tools);
+        let mut sp = StreamSplitter::for_turn(&p);
         loop {
             let piece = match g.next(&chat).await {
                 Ok(x) => x,
@@ -1457,7 +1491,7 @@ fn openai_stream(
                 return;
             }
             if let Some(f) = done {
-                let parsed = parse_output(&g.text, p.thinking, p.tools);
+                let parsed = parse_turn(&p, &g.text);
                 if !parsed.tool_calls.is_empty() {
                     let mut calls = openai_tool_calls(&parsed.tool_calls, &id);
                     for (i, c) in calls.as_array_mut().unwrap().iter_mut().enumerate() {
@@ -1577,7 +1611,7 @@ async fn anthropic_messages(
                 Piece::Done { finish: f, .. } => break f,
             }
         };
-        let parsed = parse_output(&g.text, p.thinking, p.tools);
+        let parsed = parse_turn(&p, &g.text);
         let mut content = Vec::new();
         if !parsed.reasoning.is_empty() {
             content.push(json!({ "type": "thinking", "thinking": parsed.reasoning, "signature": "" }));
@@ -1605,7 +1639,7 @@ async fn anthropic_messages(
         if !ev("message_start", start) {
             return;
         }
-        let mut sp = Splitter::new(p.thinking, p.tools);
+        let mut sp = StreamSplitter::for_turn(&p);
         let mut idx: i64 = -1;
         let mut cur: Option<&'static str> = None;
         loop {
@@ -1667,7 +1701,7 @@ async fn anthropic_messages(
                         json!({ "type": "content_block_stop", "index": idx }),
                     );
                 }
-                let parsed = parse_output(&g.text, p.thinking, p.tools);
+                let parsed = parse_turn(&p, &g.text);
                 for (i, c) in parsed.tool_calls.iter().enumerate() {
                     idx += 1;
                     let _ = ev(
