@@ -12,7 +12,10 @@
 //! - `model.layers.N.mlp.experts.{gate_up_proj,down_proj}` (Ling-3.0-flash): the per-expert tensors fused into one
 //!   [E, rows, K] tensor per layer; in `gate_up` the gate rows of each expert come before its up rows (ADR 0002).
 
+pub mod codebook;
+pub mod deepseek;
 pub mod dequant;
+pub mod grid;
 
 use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::fpquant::{MXFP8_BLOCK, NVFP4_BLOCK, mxfp8_rows, nvfp4_rows};
@@ -119,6 +122,10 @@ pub enum Family {
     /// convolutions and a relative-position bias, 128 experts per layer, a vision tower and a loop-aware MTP head.
     /// Its routed experts arrive packed (NVFP4 or MXFP8) and are dequantised while they are read.
     Inkling2,
+    /// DeepSeek-V4.1-flash (`deepseek_v41`): 40 layers, 384 routed experts, Engram n-gram tables, hyper-connections,
+    /// a compressed indexer and a vision tower. Its precision map comes from the released 2.00 bpw build, and its
+    /// weights are fp8 blocks and packed fp4, so the converter reads them with its own dequantizers. Issue #83.
+    Deepseek41,
 }
 
 impl Family {
@@ -130,6 +137,7 @@ impl Family {
             "bailing_hybrid" => Family::Ling3,
             "hy_v4_flash" => Family::Hy4,
             "inkling2" | "inkling2_loop" | "inkling2_text" | "inkling2_loop_text" => Family::Inkling2,
+            "deepseek_v41" => Family::Deepseek41,
             t => bail!("unsupported model_type `{t}`"),
         })
     }
@@ -157,6 +165,7 @@ impl Family {
             Family::Dflash => "dflash",
             Family::Hy4 => "hy4",
             Family::Inkling2 => "inkling2",
+            Family::Deepseek41 => "deepseek_v41",
         }
     }
 
@@ -174,6 +183,8 @@ impl Family {
             Family::Hy4 => !expert,
             // Inkling-2 has no measurement of what an MLS8 prefill would buy: single copy until one exists.
             Family::Inkling2 => false,
+            // DeepSeek-V4.1 already carries a 2.00 bpw map chosen per tensor; a second copy would not fit.
+            Family::Deepseek41 => false,
         }
     }
 
@@ -203,6 +214,8 @@ impl Family {
             Family::Dflash => DFLASH_MLS4_SUFFIXES,
             Family::Hy4 => HY4_MLS4_SUFFIXES,
             Family::Inkling2 => INKLING2_MLS4_SUFFIXES,
+            // DeepSeek-V4.1 does not come through `classify`: its precision map is read from the released build.
+            Family::Deepseek41 => &[],
         };
         // The Engram key projections are one 2-D linear per hyper-connection channel (`key_projs.N.weight`), so a
         // suffix does not name them.
@@ -258,7 +271,12 @@ impl Family {
                 let last = u("num_hidden_layers") + u("num_nextn_predict_layers");
                 last.checked_sub(1 + MLS3_SKIP_LAST_LAYERS).map(|to| (from, to))
             }
-            Family::Qwen35 | Family::Qwen4Exp | Family::Dflash | Family::Hy4 | Family::Inkling2 => None,
+            Family::Qwen35
+            | Family::Qwen4Exp
+            | Family::Dflash
+            | Family::Hy4
+            | Family::Inkling2
+            | Family::Deepseek41 => None,
         }
     }
 
@@ -274,7 +292,9 @@ impl Family {
                 };
                 t["num_hidden_layers"].as_u64().map(|n| (0, n as usize - 1))
             }
-            Family::Qwen35 | Family::Ling3 | Family::Dflash | Family::Hy4 | Family::Inkling2 => None,
+            Family::Qwen35 | Family::Ling3 | Family::Dflash | Family::Hy4 | Family::Inkling2 | Family::Deepseek41 => {
+                None
+            }
         }
     }
 }
@@ -564,7 +584,7 @@ fn outer_scale(st: &SafeTensors, name: &str, e: usize) -> Result<f32> {
     Ok(a / d)
 }
 
-fn bf16_rows(bytes: &[u8]) -> Vec<f32> {
+pub(crate) fn bf16_rows(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<2>()
         .0
@@ -573,7 +593,7 @@ fn bf16_rows(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn quantize_mls4(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn quantize_mls4(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     let signs = quant::hadamard_signs(HADAMARD_SEED);
     let g = k / BLOCK;
     let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
@@ -600,7 +620,7 @@ fn quantize_mls4(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     (q, s)
 }
 
-fn quantize_mls3(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn quantize_mls3(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     let signs = quant::hadamard_signs(HADAMARD_SEED);
     let g = k / BLOCK;
     let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
@@ -627,7 +647,7 @@ fn quantize_mls3(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     (q, s)
 }
 
-fn quantize_mls2(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn quantize_mls2(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     let signs = quant::hadamard_signs(HADAMARD_SEED);
     let g = k / BLOCK;
     let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
@@ -654,7 +674,7 @@ fn quantize_mls2(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     (q, s)
 }
 
-fn quantize_mls8(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn quantize_mls8(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     let signs = quant::hadamard_signs(HADAMARD_SEED);
     let rows: Vec<(Vec<u8>, f32)> = (0..n)
         .into_par_iter()
@@ -676,7 +696,7 @@ fn quantize_mls8(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Unrotated int8 rows with a trailing f32 scale: [n, k + 4] bytes.
-fn quantize_rows_i8(w: &[f32], n: usize, k: usize) -> Vec<u8> {
+pub(crate) fn quantize_rows_i8(w: &[f32], n: usize, k: usize) -> Vec<u8> {
     let mut out = vec![0u8; n * (k + 4)];
     out.par_chunks_mut(k + 4).enumerate().for_each(|(r, o)| {
         let mut q = vec![0i8; k];
@@ -692,7 +712,7 @@ fn quantize_rows_i8(w: &[f32], n: usize, k: usize) -> Vec<u8> {
 /// Unrotated 4-bit rows, one f16 scale per row: `n * k / 2` bytes of nibbles (LSB first, `value + 8`) and `n`
 /// scales. The Engram rows are 96 wide and are read one at a time on the host, so neither the 128-wide rotation
 /// of MLS4 nor its per-block scale applies; per-row absmax keeps them at 52 bytes for a 192-byte bf16 row.
-fn quantize_rows_i4(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn quantize_rows_i4(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     let packed = k.div_ceil(2);
     let rows: Vec<(Vec<u8>, f32)> = (0..n)
         .into_par_iter()
@@ -718,7 +738,7 @@ fn quantize_rows_i4(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Hyper-connection low-rank width padded for the 128-wide rotation blocks of MLS8.
-fn pad128(n: usize) -> usize {
+pub(crate) fn pad128(n: usize) -> usize {
     n.next_multiple_of(BLOCK)
 }
 
@@ -988,6 +1008,16 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
     let config = read("config.json")?;
     let cfg: serde_json::Value = serde_json::from_str(&config)?;
     let fam = Family::from_config(&cfg)?;
+    // DeepSeek-V4.1 has its own converter: its precision map comes from the released 2.00 bpw build and its
+    // weights are blocked fp8 and packed fp4, neither of which the generic planner knows.
+    if fam == Family::Deepseek41 {
+        let path = std::env::var("MALLEUS_DEEPSEEK_ALLOC").map_err(|_| {
+            anyhow::anyhow!("deepseek_v41: set MALLEUS_DEEPSEEK_ALLOC to the released build's allocation text")
+        })?;
+        let text = std::fs::read_to_string(&path).with_context(|| path.clone())?;
+        let alloc = malleus_gguf::deepseek_alloc::Allocation::parse(&text)?;
+        return deepseek::convert(model_dir, out, &alloc, log);
+    }
     // Ling-3.0-flash stores the experts one tensor at a time: they are fused, one 3-D tensor per layer and projection.
     // Qwen stores them stacked, except the MTP layer of some checkpoints (Ornith): the geometry is only used for
     // names that match the per-expert pattern, and its keys live under `text_config` there.
@@ -1008,6 +1038,8 @@ pub fn convert(model_dir: &Path, out: &Path, opts: &Options, log: &dyn Fn(&str))
         Family::Hy4 => None,
         // Inkling-2 already stores its routed experts fused, one 3-D tensor per projection and layer.
         Family::Inkling2 => None,
+        // DeepSeek-V4.1 returns above, before the generic planner runs.
+        Family::Deepseek41 => None,
         Family::Qwen35 | Family::Qwen4Exp => {
             let t = if cfg["text_config"].is_object() {
                 &cfg["text_config"]
