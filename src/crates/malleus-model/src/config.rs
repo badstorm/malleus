@@ -504,6 +504,13 @@ impl MoeConfig {
 }
 
 impl Config {
+    /// The rows of the unembedding that are real tokens. Some checkpoints pad it (Inkling-2: 201 024 rows against
+    /// 200 058 tokens) and the engine runs the head on every row, so the rows past this one are not tokens: anything
+    /// that samples has to ignore them.
+    pub fn real_vocab(&self) -> usize {
+        self.inkling2.as_ref().map_or(self.vocab, |i| i.unpadded_vocab)
+    }
+
     pub fn from_hf(model_dir: &Path) -> Result<Self> {
         let cfg = std::fs::read_to_string(model_dir.join("config.json")).context("config.json")?;
         let gen_cfg = std::fs::read_to_string(model_dir.join("generation_config.json")).ok();
