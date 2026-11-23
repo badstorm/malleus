@@ -35,7 +35,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Hy4-flash (text + images) | `hy4-flash-mls4-mls8-dense.malleus` | 121.9 GB | **dense only** (406 tensors) | The 1M-window model. 90.5 GB on the device; golden 18/21, 89.95 % all-position, worst KL 1.247. The routed experts have no MLS8 copy: they do not fit. `MALLEUS_PREFILL_WEIGHTS=none` leaves the copies on the host. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
-| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. Session state is 393 KiB per token (48 KV slots). The vision tower runs (issue #74); the MTP head is not wired yet. |
+| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring of 1 032 rows, so a session is 2.5 GB at 32K. The vision tower runs (issue #74); the MTP head is not wired yet. |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
@@ -199,7 +199,7 @@ the KV cache (48 slots, one per layer and pass).
 | | value |
 |---|---|
 | weights on the device | 14.41 GB text + 0.64 GB vision (used, issue #74) + 0.27 GB (MTP, loaded, not used yet) |
-| session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
+| session state | 393 KiB per token on the 8 full-attention streams of the loop (8 KV heads × 128 × fp32 for K and V); the 40 sliding streams only ever read their window, so their keys and values are a ring of 1 032 rows. At 32K a session is **2.5 GB** instead of 12.9 GB, plus the convolution histories (~1 MB). |
 | prefill `pp512` / `pp4096` / `pp8192` / `pp32768` | **305** / — / **179** / **105** tok/s |
 | decode `tg16` at ctx 512 / 2048 / 8192 / 32768 | **16.6** / **15.5** / **14.1** / ~9 tok/s |
 
@@ -277,8 +277,10 @@ and one rescale of the row — so the dots pipeline instead of chaining: 65 -> 1
 282 -> 305 at 512. The same tile in the *decode* kernel measured *worse* (16.6 -> 16.1 tok/s) and was kept out: at a
 decode step there is one query row and what has to stay in flight is the loads, not the exponentials.
 
-The session state at 32K is 12.9 GiB of keys and values today (48 slots, fp32): a ring buffer for the 40 sliding slots
-takes it to 3.3 GiB, and fp16 halves it again.
+The session state at 32K was 12.9 GiB of keys and values (48 streams, fp32). The 40 sliding streams never read past
+their window, so they now keep a **ring of 1 032 rows** instead of the whole context: 2.5 GB at 32K, 5.2x less
+(8 full streams x 32 768 + 40 x 1 032 rows of 8 KiB). No arithmetic changed with it — `spec-exact` stays green at
+8 250 tokens, past the wrap — and fp16 keys and values would halve it again.
 
 Everything that is not attention is **flat with depth**: 289 tok/s at 512 tokens and 289 at 8 192, i.e. 3.46 ms per
 token for 8.7 GFLOP of experts and projections (2.5 TFLOPS). The degradation was one kernel reading the K and V of

@@ -474,10 +474,12 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_sconv_dec(float* y, c
 // keeps its own (max, sum, output) in registers and never crosses a barrier inside the loop; the four partials are
 // merged once at the end. The sink is the score of a virtual key whose value is zero, so it enters the denominator
 // only, and the output gate is applied after the merge.
+// A key sits at row `k0 + i`, wrapped when `ring` is not 0: a sliding layer only keeps its window, so its cache is a
+// ring and the first key of the window may be anywhere in it.
 extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, const float* q, const float* k,
                                                                   const float* v, const float* bias, const float* sink,
                                                                   const float* gate, int k0, int nk, int heads,
-                                                                  int nkv, int dim, float scale) {
+                                                                  int nkv, int dim, int ring, float scale) {
     __shared__ float sm[4], sl[4], sa[4][128];
     const int h = blockIdx.x, kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -489,13 +491,14 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, 
     float m = -INFINITY, l = 0.f;
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int i = i0; i < i1; ++i) {
-        const float4 kv = *(const float4*)(k + ((size_t)(k0 + i) * nkv + kh) * dim + 4 * lane);
+        const int row = ring > 0 ? (k0 + i >= ring ? k0 + i - ring : k0 + i) : k0 + i;
+        const float4 kv = *(const float4*)(k + ((size_t)row * nkv + kh) * dim + 4 * lane);
         float d = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
         const float sc = d * scale + bias[(size_t)h * nk + i];
         const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
-        const float4 vv = *(const float4*)(v + ((size_t)(k0 + i) * nkv + kh) * dim + 4 * lane);
+        const float4 vv = *(const float4*)(v + ((size_t)row * nkv + kh) * dim + 4 * lane);
         acc.x = acc.x * corr + p * vv.x;
         acc.y = acc.y * corr + p * vv.y;
         acc.z = acc.z * corr + p * vv.z;
