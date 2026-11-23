@@ -350,19 +350,26 @@ path.
 
 | document | ppl (ref) | top-1 | KL |
 |---|---|---|---|
-| it-pg56775 | 13.040 (12.723) | 90.53 % | 0.0273 |
-| it-pg18456 | 9.093 (8.979) | 91.60 % | 0.0259 |
-| en-pg48320 | 7.302 (6.949) | 91.80 % | 0.0485 |
-| en-pg11 | 5.432 (5.257) | 91.99 % | 0.0266 |
-| code-utils | 1.983 (1.912) | 96.00 % | 0.0278 |
-| code-module | 2.242 (2.182) | 96.00 % | 0.0217 |
-| chat-it | 53.712 (29.000) | 78.52 % | 0.3485 |
-| chat-en | 45.852 (40.006) | 83.20 % | 0.1799 |
-| **total** | **9.209 (8.188, +12.47 %)** | **89.92 %** | **0.0884** |
+| it-pg56775 | 13.055 (12.723) | 90.82 % | 0.0276 |
+| it-pg18456 | 9.097 (8.979) | 91.21 % | 0.0264 |
+| en-pg48320 | 7.296 (6.949) | 91.70 % | 0.0482 |
+| en-pg11 | 5.452 (5.257) | 91.99 % | 0.0272 |
+| code-utils | 1.977 (1.912) | 96.00 % | 0.0267 |
+| code-module | 2.242 (2.182) | 95.61 % | 0.0225 |
+| chat-it | 52.693 (29.000) | 78.32 % | 0.3557 |
+| chat-en | 46.362 (40.006) | 83.20 % | 0.1836 |
+| **total** | **9.197 (8.188, +12.32 %)** | **89.86 %** | **0.0897** |
 
-The two chat documents are the outliers (+90 % and +14 % perplexity against +1.7…+5.3 % for the six plain ones) and
-they are the only documents over 1 000 tokens whose tokens are *not* plain prose: they open with the reasoning-effort
-system line of the chat template. Open question, tracked in issue #70.
+The two chat documents are the outliers (+82 % and +16 % perplexity against +1.3…+5.0 % for the six plain ones) and
+they are the only documents whose tokens are *not* plain prose: they open with the two system messages of the chat
+template and the reasoning-effort line. `MALLEUS_EVAL_WORST=1` prints the positions the damage sits on, and the answer
+is two things: the preamble spikes (position 9 of both chat documents predicts `<|content_text|>` and costs a KL of
+19.7 on its own, because the reference is a spike there and this file is not) and a broad elevation over the rest
+(top-1 78 % against 91 % for the prose). It is not the step's kernels (the eval runs one forward), not the int8
+activations of the chunk MoE (`MALLEUS_INKLING2_MOE_PAIRS=1` gives the same +80 %), and not any of the bugs fixed in
+this round: it is the 4-bit file on that distribution. What generation is judged on does not move — the last-token
+top-1 of the 20 golden prompts is 20/20 on both paths — so the lever is a better file (calibration, or 8-bit for the
+experts), not a kernel. Open question, tracked in issue #70 and #74.
 
 ### Quality: the vision tower (issue #74)
 

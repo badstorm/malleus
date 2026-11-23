@@ -809,6 +809,7 @@ fn eval(model: &Path, set: &Path, blobs: &Path, chunk: usize) -> Result<()> {
             .collect();
         let mut sess = m.new_session(ids.len() + 1)?;
         let mut acc = [0f64; 5];
+        let mut worst: Vec<(f64, usize, u32)> = Vec::with_capacity(ids.len() - 1);
         for (ci, c) in ids.chunks(chunk).enumerate() {
             let logits = m.forward(&mut sess, c, None, c.len())?;
             for (j, row) in logits.chunks_exact(vocab).enumerate() {
@@ -825,6 +826,11 @@ fn eval(model: &Path, set: &Path, blobs: &Path, chunk: usize) -> Result<()> {
                 }
                 let (rr, ro) = ((1.0 - pr).max(1e-12), (1.0 - po).max(1e-12));
                 kl += rr * (rr.ln() - ro.ln());
+                // The worst positions and the token they are predicting, in token order: a damage that sits on the
+                // chat markers reads differently from one spread over the prose.
+                if i + 1 < ids.len() {
+                    worst.push((kl, i, ids[i + 1]));
+                }
                 acc[0] += kl;
                 acc[1] += (argmax(row) == ref_arg[i] as usize) as u8 as f64;
                 if i + 1 < ids.len() {
@@ -844,6 +850,15 @@ fn eval(model: &Path, set: &Path, blobs: &Path, chunk: usize) -> Result<()> {
             acc[1] / n * 100.0,
             acc[0] / n
         );
+        if std::env::var_os("MALLEUS_EVAL_WORST").is_some() {
+            worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let list: Vec<String> = worst
+                .iter()
+                .take(8)
+                .map(|(kl, i, t)| format!("pos {i} -> {t} ({kl:.3})"))
+                .collect();
+            println!("  worst: {}", list.join(", "));
+        }
         tot[0] += acc[0];
         tot[1] += acc[1];
         tot[2] += acc[2];
