@@ -310,14 +310,19 @@ the looped forward), greedy off:
 | metric | prefill (one forward) | decode (one token at a time, through the cache) |
 |---|---|---|
 | last-token top-1 against bf16 | **20/20** | **20/20** |
-| all-position argmax | 67.81 % (493/727) | 68.78 % (500/727) |
-| worst KL | 0.370 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.344 |
+| all-position argmax | 68.09 % (495/727) | 67.54 % (491/727) |
+| worst KL | 0.320 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.353 |
 
 `raw-continue` is the one prompt of the set that is not rendered through the chat template, and the only one whose
-KL is not in the 1e-5 range: it is where the file's 4 bits show. It is also the prompt the grouped prefill's int8
-activations move (the W4A8 GEMM against the per-pair GEMV's fp32), and the reason the prefill column reads 19/20
-while the decode path keeps 20/20: `MALLEUS_INKLING2_MOE_PAIRS=1` runs the old path, and the two differ by that one
-prompt.
+KL is not in the 1e-5 range: it is where the file's 4 bits show. The step and the verify read the experts grouped by
+expert in fp32 (`MALLEUS_INKLING2_MOE_PAIRS=1` runs the per-pair path, for an A/B); a prompt of 8+ tokens takes the
+int8 chunk path, which is why `raw-continue` is the prompt that separates the two columns.
+
+**Both columns are gates**: the same command with and without `--decode`, the second one feeding the prompt one token
+at a time through the cache. That column is the only one that covers the step's kernels, and it is where the group of
+experts a step reads was computing with unrotated activations for a day (0/20 and 41/727 here, issue #90): the prefill
+column was green the whole time, and `spec-exact` could not see it because the verify and the serial step took the same
+path.
 
 `eval` on the 8 documents of the eval set (four Gutenberg books, two source files, two chat continuations):
 

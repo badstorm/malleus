@@ -2315,7 +2315,9 @@ impl Graph {
                 (&self.route_ids).into(),
                 p.into(),
                 (experts + 1).into(),
-                8i32.into(),
+                // A tile holds at most the rows the kernel is instantiated for (`GEMV_MAX_T`): a wider tile would
+                // leave the rows past that count uncomputed.
+                (crate::weights::GEMV_MAX_T as i32).into(),
                 0i32.into(),
                 0i32.into(),
             ],
@@ -2340,7 +2342,7 @@ impl Graph {
                 topk.into(),
                 (2 * inter).into(),
                 h.into(),
-                Arg::U64(0),
+                (&model.signs).into(),
             ],
         )?;
         model.k.get("inkling2_moe_act").launch(
