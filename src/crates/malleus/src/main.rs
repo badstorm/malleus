@@ -299,6 +299,72 @@ fn is_converted(p: &Path) -> bool {
     p.is_file()
 }
 
+/// What a `.malleus` file carries, class by class, and what of it has to stay resident. A lookup table read a
+/// row at a time (the Engram tables) is counted apart from the weights the forward multiplies.
+fn file_inventory(path: &Path) -> Result<()> {
+    let g = Gguf::open(path)?;
+    let cfg = Config::from_json(
+        g.meta_str("openmalleus.hf_config")?,
+        g.meta_str("openmalleus.generation_config").ok(),
+    )?;
+    for line in malleus_model::deepseek::describe(&cfg)? {
+        println!("{line}");
+    }
+    let class = |n: &str| -> &'static str {
+        if n.contains(".engram.embed.") {
+            "engram table"
+        } else if n.starts_with("vision.") || n.starts_with("aligner.") || n.starts_with("image_") {
+            "vision"
+        } else if n.starts_with("mtp.") {
+            "dspark"
+        } else if n.contains(".ffn.experts.") {
+            "routed experts"
+        } else if n.contains(".ffn.") {
+            "moe"
+        } else if n.contains(".attn.") || n.contains("_norm") {
+            "attention"
+        } else if n.ends_with(".scales") {
+            "scales"
+        } else {
+            "embed+head"
+        }
+    };
+    let mut classes: Vec<(&'static str, usize, u64)> = Vec::new();
+    for t in g.tensors() {
+        let c = class(&t.name);
+        match classes.iter_mut().find(|(k, _, _)| *k == c) {
+            Some((_, n, b)) => {
+                *n += 1;
+                *b += t.size as u64;
+            }
+            None => classes.push((c, 1, t.size as u64)),
+        }
+    }
+    classes.sort_by_key(|c| std::cmp::Reverse(c.2));
+    let total: u64 = classes.iter().map(|c| c.2).sum();
+    let streamed: u64 = classes.iter().filter(|c| c.0 == "engram table").map(|c| c.2).sum();
+    println!(
+        "\n{}: {} tensors, {:.2} GB",
+        path.display(),
+        g.tensors().len(),
+        total as f64 / 1e9
+    );
+    for (k, n, b) in &classes {
+        println!("  {k:14} {n:6} tensors  {:8.2} GB", *b as f64 / 1e9);
+    }
+    println!(
+        "  resident {:.2} GB, read by row {:.2} GB{}",
+        (total - streamed) as f64 / 1e9,
+        streamed as f64 / 1e9,
+        if streamed == 0 {
+            " (the Engram tables are expected in a companion file)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
 /// Opens a converted model and checks that it is an Malleus file of a supported family.
 /// Prints what the draft declares and proves the weights load: the checkpoint is 738 MB, so this is the cheap way to
 /// check a conversion before the forward exists (issue #12).
@@ -320,7 +386,10 @@ fn open_converted(path: &Path) -> Result<Gguf> {
     let g = Gguf::open(path)?;
     let arch = g.malleus_arch()?;
     anyhow::ensure!(
-        matches!(arch, "qwen35" | "qwen4exp" | "ling3" | "hy4" | "inkling2"),
+        matches!(
+            arch,
+            "qwen35" | "qwen4exp" | "ling3" | "hy4" | "inkling2" | "deepseek_v41"
+        ),
         "unsupported model family `{arch}`"
     );
     Ok(g)
@@ -3117,6 +3186,10 @@ fn main() -> Result<()> {
             eprintln!("converted in {:.0}s", t0.elapsed().as_secs_f64());
         }
         Cmd::Inspect { model, image } => {
+            if is_converted(&model) {
+                file_inventory(&model)?;
+                return Ok(());
+            }
             let c = Config::from_hf(&model)?;
             for line in malleus_model::deepseek::describe(&c)? {
                 println!("{line}");
