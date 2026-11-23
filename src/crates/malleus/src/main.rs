@@ -139,6 +139,21 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         keep: Vec<String>,
     },
+    /// Split a model file in two: the tensors whose name matches the pattern go to one file, the rest to the
+    /// other. For the lookup tables that are read a row at a time and are shared between builds.
+    Split {
+        #[arg(long)]
+        model: PathBuf,
+        /// The part that matches `--match` (e.g. the Engram tables)
+        #[arg(long)]
+        out: PathBuf,
+        /// The rest of the model
+        #[arg(long)]
+        rest: PathBuf,
+        /// Name fragment that selects the tensors that go to `--out`
+        #[arg(long, default_value = ".engram.embed.weight")]
+        r#match: String,
+    },
     /// Start the OpenAI / Anthropic compatible API server
     Serve {
         /// Directory whose `*.malleus` files the server exposes by file stem
@@ -3214,6 +3229,39 @@ fn main() -> Result<()> {
                     out.display()
                 );
             }
+        }
+        Cmd::Split {
+            model,
+            out,
+            rest,
+            r#match,
+        } => {
+            // A split does not care which family the file is: it copies tensors.
+            let g = Gguf::open(&model)?;
+            let is_part = |n: &str| n.contains(r#match.as_str());
+            let part: u64 = g
+                .tensors()
+                .iter()
+                .filter(|t| is_part(&t.name))
+                .map(|t| t.size as u64)
+                .sum();
+            let all: u64 = g.tensors().iter().map(|t| t.size as u64).sum();
+            anyhow::ensure!(part > 0, "no tensor matches `{match}` in {}", model.display());
+            anyhow::ensure!(
+                part < all,
+                "every tensor matches `{match}`: the split would leave an empty model"
+            );
+            let t0 = Instant::now();
+            let (a, _) = malleus_gguf::gguf::rewrite_keeping(&g, &g.metadata, &out, &is_part)?;
+            let (b, _) = malleus_gguf::gguf::rewrite_keeping(&g, &g.metadata, &rest, &|n| !is_part(n))?;
+            eprintln!(
+                "{a} tensors ({:.2} GB) to {}, {b} tensors ({:.2} GB) to {}, in {:.0}s",
+                part as f64 / 1e9,
+                out.display(),
+                (all - part) as f64 / 1e9,
+                rest.display(),
+                t0.elapsed().as_secs_f64()
+            );
         }
         Cmd::Run {
             model,
