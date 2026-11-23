@@ -2,10 +2,12 @@
 
 pub mod config;
 pub mod deepseek;
+pub mod deepseek_text;
 pub mod deepseek_vision;
 pub mod dflash;
 pub mod engine;
 pub mod expert_cache;
+pub mod hostmath;
 pub mod hy4;
 pub mod image_pre;
 pub mod inkling2;

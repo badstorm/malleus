@@ -11,6 +11,69 @@ use anyhow::{Context, Result, ensure};
 use malleus_gguf::{DType, TensorSource};
 
 use crate::config::{Config, DeepseekVision};
+use crate::hostmath::{dot, gelu, linear, parallel_chunks, rmsnorm, silu};
+
+/// 2-D RoPE frequencies of a patch grid: row and column positions over the first and second half of the rotated width.
+fn rope_table(gh: usize, gw: usize, rope: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
+    let half = rope / 2;
+    let n = gh * gw;
+    let inv: Vec<f32> = (0..half)
+        .map(|j| 1.0 / theta.powf(2.0 * j as f32 / rope as f32))
+        .collect();
+    let mut cos = vec![0f32; n * rope];
+    let mut sin = vec![0f32; n * rope];
+    for p in 0..n {
+        let (row, col) = ((p / gw) as f32, (p % gw) as f32);
+        for j in 0..half {
+            let (a, b) = (row * inv[j], col * inv[j]);
+            cos[p * rope + j] = a.cos();
+            cos[p * rope + half + j] = b.cos();
+            sin[p * rope + j] = a.sin();
+            sin[p * rope + half + j] = b.sin();
+        }
+    }
+    (cos, sin)
+}
+
+/// Bidirectional attention of every head over the whole image, with the 2-D RoPE already applied to q and k.
+fn attention(q: &[f32], k: &[f32], v: &[f32], n: usize, heads: usize, head_dim: usize) -> Vec<f32> {
+    const BAND: usize = 128;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0f32; n * heads * head_dim];
+    let per_band = BAND * heads * head_dim;
+    parallel_chunks(&mut out, per_band, |band, o| {
+        let row0 = band * BAND;
+        let rows = o.len() / (heads * head_dim);
+        let mut scores = vec![0f32; rows * n];
+        for h in 0..heads {
+            for r in 0..rows {
+                let qr = &q[(row0 + r) * heads * head_dim + h * head_dim..][..head_dim];
+                let sc = &mut scores[r * n..(r + 1) * n];
+                for (j, sj) in sc.iter_mut().enumerate() {
+                    let kj = &k[j * heads * head_dim + h * head_dim..][..head_dim];
+                    *sj = dot(qr, kj, head_dim) * scale;
+                }
+                let max = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0f32;
+                for s in sc.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                let inv = 1.0 / sum;
+                let orow = &mut o[r * heads * head_dim + h * head_dim..][..head_dim];
+                for (j, &p) in sc.iter().enumerate() {
+                    let w = p * inv;
+                    let vj = &v[j * heads * head_dim + h * head_dim..][..head_dim];
+                    for t in 0..head_dim {
+                        orow[t] += w * vj[t];
+                    }
+                }
+            }
+        }
+    });
+    out
+}
+
 use crate::image_pre::{PreConfig, decode, resize_bicubic};
 
 /// One pre-LN ViT block: a fused qkv with biases, the output projection with its bias, and a gated MLP.
@@ -321,212 +384,6 @@ pub fn span_embeddings(
 // ------------------------------------------------------------------------------------------------------------------
 // Host math: a few seconds of f32 for one image, which is what the tower costs until it moves to the device.
 // ------------------------------------------------------------------------------------------------------------------
-
-/// Runs `f(index, chunk)` on disjoint chunks of `data`, one thread per available core.
-fn parallel_chunks<T: Send>(data: &mut [T], chunk: usize, f: impl Fn(usize, &mut [T]) + Sync) {
-    let chunks: Vec<(usize, &mut [T])> = data.chunks_mut(chunk).enumerate().collect();
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |v| v.get())
-        .min(chunks.len().max(1));
-    if threads <= 1 {
-        for (i, c) in chunks {
-            f(i, c);
-        }
-        return;
-    }
-    let queue = std::sync::Mutex::new(chunks.into_iter());
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                loop {
-                    let next = queue.lock().unwrap().next();
-                    match next {
-                        Some((i, c)) => f(i, c),
-                        None => break,
-                    }
-                }
-            });
-        }
-    });
-}
-
-/// A dot product with eight independent accumulators: Rust cannot reassociate a float reduction, so the lanes
-/// are what lets the compiler vectorise it.
-fn dot(x: &[f32], w: &[f32], k: usize) -> f32 {
-    let (xb, xt) = x[..k].as_chunks::<8>();
-    let (wb, wt) = w[..k].as_chunks::<8>();
-    let mut acc = [0f32; 8];
-    for (a, b) in xb.iter().zip(wb) {
-        for u in 0..8 {
-            acc[u] += a[u] * b[u];
-        }
-    }
-    let mut s: f32 = acc.iter().sum();
-    for (a, b) in xt.iter().zip(wt) {
-        s += a * b;
-    }
-    s
-}
-
-/// Two dots against the same weight row: the row is read once for two output rows.
-fn dots2(x0: &[f32], x1: &[f32], w: &[f32], k: usize) -> [f32; 2] {
-    let (w8, wt) = w[..k].as_chunks::<8>();
-    let (x08, x0t) = x0[..k].as_chunks::<8>();
-    let (x18, x1t) = x1[..k].as_chunks::<8>();
-    let mut a0 = [0f32; 8];
-    let mut a1 = [0f32; 8];
-    for ((c0, c1), cw) in x08.iter().zip(x18).zip(w8) {
-        for u in 0..8 {
-            a0[u] += c0[u] * cw[u];
-            a1[u] += c1[u] * cw[u];
-        }
-    }
-    let (mut s0, mut s1): (f32, f32) = (a0.iter().sum(), a1.iter().sum());
-    for ((t0, t1), tw) in x0t.iter().zip(x1t).zip(wt) {
-        s0 += t0 * tw;
-        s1 += t1 * tw;
-    }
-    [s0, s1]
-}
-
-/// `x [n, k] · wᵀ`, with `w [m, k]`, plus an optional bias: the reference's `nn.Linear`.
-///
-/// The output is built transposed (`[m, n]`, one contiguous run per output column) so that a task owns a range of
-/// columns and reads the whole input a few times instead of once per column; the rows are walked two at a time so
-/// each weight row serves two dots. The transpose at the end is blocked.
-fn linear(x: &[f32], n: usize, k: usize, w: &[f32], m: usize, bias: Option<&[f32]>) -> Vec<f32> {
-    const JB: usize = 32;
-    const IB: usize = 64;
-    let mut t = vec![0f32; m * n];
-    parallel_chunks(&mut t, JB * n, |b, cols| {
-        let j0 = b * JB;
-        let jn = cols.len() / n;
-        for i0 in (0..n).step_by(IB) {
-            let inner = IB.min(n - i0);
-            let pairs = inner / 2;
-            for jj in 0..jn {
-                let wj = &w[(j0 + jj) * k..][..k];
-                let bj = bias.map_or(0.0, |z| z[j0 + jj]);
-                let out = &mut cols[jj * n + i0..jj * n + i0 + inner];
-                for p in 0..pairs {
-                    let (r0, r1) = (i0 + 2 * p, i0 + 2 * p + 1);
-                    let [a, c] = dots2(&x[r0 * k..(r0 + 1) * k], &x[r1 * k..(r1 + 1) * k], wj, k);
-                    out[2 * p] = a + bj;
-                    out[2 * p + 1] = c + bj;
-                }
-                if inner % 2 == 1 {
-                    let r = i0 + inner - 1;
-                    out[inner - 1] = dot(&x[r * k..(r + 1) * k], wj, k) + bj;
-                }
-            }
-        }
-    });
-    // Blocked transpose of `[m, n]` into `[n, m]`.
-    const TB: usize = 32;
-    let mut out = vec![0f32; n * m];
-    for j0 in (0..m).step_by(TB) {
-        for i0 in (0..n).step_by(TB) {
-            let jn = TB.min(m - j0);
-            let inn = TB.min(n - i0);
-            for j in 0..jn {
-                for i in 0..inn {
-                    out[(i0 + i) * m + j0 + j] = t[(j0 + j) * n + i0 + i];
-                }
-            }
-        }
-    }
-    out
-}
-
-/// In-place RMSNorm over the last dimension of an `[n, dim]` matrix, multiplying by `weight`.
-fn rmsnorm(x: &mut [f32], dim: usize, weight: &[f32], eps: f32) {
-    parallel_chunks(x, dim, |_, row| {
-        let sq: f32 = row.iter().map(|v| v * v).sum();
-        let s = 1.0 / (sq / dim as f32 + eps).sqrt();
-        for (v, w) in row.iter_mut().zip(weight) {
-            *v = *v * s * w;
-        }
-    });
-}
-
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
-/// The exact `erf` of `F.gelu` (Abramowitz-Stegun 7.1.26, absolute error below 1.5e-7).
-fn erf(x: f64) -> f64 {
-    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
-    let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592)
-            * t
-            * (-x * x).exp();
-    if x < 0.0 { -y } else { y }
-}
-
-fn gelu(x: f32) -> f32 {
-    0.5 * x * (1.0 + erf(x as f64 / std::f64::consts::SQRT_2) as f32)
-}
-
-/// 2-D RoPE frequencies of a patch grid: row and column positions over the first and second half of the rotated width.
-fn rope_table(gh: usize, gw: usize, rope: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
-    let half = rope / 2;
-    let n = gh * gw;
-    let inv: Vec<f32> = (0..half)
-        .map(|j| 1.0 / theta.powf(2.0 * j as f32 / rope as f32))
-        .collect();
-    let mut cos = vec![0f32; n * rope];
-    let mut sin = vec![0f32; n * rope];
-    for p in 0..n {
-        let (row, col) = ((p / gw) as f32, (p % gw) as f32);
-        for j in 0..half {
-            let (a, b) = (row * inv[j], col * inv[j]);
-            cos[p * rope + j] = a.cos();
-            cos[p * rope + half + j] = b.cos();
-            sin[p * rope + j] = a.sin();
-            sin[p * rope + half + j] = b.sin();
-        }
-    }
-    (cos, sin)
-}
-
-/// Bidirectional attention of every head over the whole image, with the 2-D RoPE already applied to q and k.
-fn attention(q: &[f32], k: &[f32], v: &[f32], n: usize, heads: usize, head_dim: usize) -> Vec<f32> {
-    const BAND: usize = 128;
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0f32; n * heads * head_dim];
-    let per_band = BAND * heads * head_dim;
-    parallel_chunks(&mut out, per_band, |band, o| {
-        let row0 = band * BAND;
-        let rows = o.len() / (heads * head_dim);
-        let mut scores = vec![0f32; rows * n];
-        for h in 0..heads {
-            for r in 0..rows {
-                let qr = &q[(row0 + r) * heads * head_dim + h * head_dim..][..head_dim];
-                let sc = &mut scores[r * n..(r + 1) * n];
-                for (j, sj) in sc.iter_mut().enumerate() {
-                    let kj = &k[j * heads * head_dim + h * head_dim..][..head_dim];
-                    *sj = dot(qr, kj, head_dim) * scale;
-                }
-                let max = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0f32;
-                for s in sc.iter_mut() {
-                    *s = (*s - max).exp();
-                    sum += *s;
-                }
-                let inv = 1.0 / sum;
-                let orow = &mut o[r * heads * head_dim + h * head_dim..][..head_dim];
-                for (j, &p) in sc.iter().enumerate() {
-                    let w = p * inv;
-                    let vj = &v[j * heads * head_dim + h * head_dim..][..head_dim];
-                    for t in 0..head_dim {
-                        orow[t] += w * vj[t];
-                    }
-                }
-            }
-        }
-    });
-    out
-}
 
 /// The tower's forward and the aligner's merge. Returns `(vit [gh*gw, hidden], merged [n_llm_h*n_llm_w, dim])`.
 pub fn forward(w: &VisionWeights, patches: &[f32], gh: usize, gw: usize) -> Result<(Vec<f32>, Vec<f32>)> {
