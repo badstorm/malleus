@@ -463,36 +463,27 @@ pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&s
                 let info = st
                     .info(src)
                     .ok_or_else(|| anyhow::anyhow!("{src}: not in the checkpoint"))?;
-                let mut w32 = vec![0f32; n * k];
-                read_weight(&st, src, info.dtype, scale.as_deref(), n, k, &mut w32)?;
-                match pick {
-                    Pick::Mls2 => {
-                        let (q, s) = quantize_mls2(&w32, n, k);
-                        sink.write(&q)?;
-                        sink.write(&s)?;
-                    }
-                    Pick::Mls3 => {
-                        let (q, s) = crate::quantize_mls3(&w32, n, k);
-                        sink.write(&q)?;
-                        sink.write(&s)?;
-                    }
-                    Pick::Mls4 => {
-                        let (q, s) = quantize_mls4(&w32, n, k);
-                        sink.write(&q)?;
-                        sink.write(&s)?;
-                    }
-                    Pick::Mls8 => {
-                        let (q, s) = quantize_mls8(&w32, n, k);
-                        sink.write(&q)?;
-                        sink.write(&s)?;
-                    }
-                    Pick::RowI4 => {
-                        let (q, s) = quantize_rows_i4(&w32, n, k);
-                        sink.write(&q)?;
-                        sink.write(&s)?;
-                    }
-                    Pick::Keep => unreachable!(),
+                // The Engram tables are 98.31B elements each: materialising one as f32 is 393 GB. Quantise them
+                // row block by row block, writing each block as it is produced. The block is a multiple of 32
+                // rows so that the fp8 scales, which are shared by 32 rows, never straddle two blocks.
+                let rows = 32usize.max((32 << 20) / (k * 4) / 32 * 32);
+                let mut scales_out: Vec<u8> = Vec::new();
+                for r0 in (0..n).step_by(rows) {
+                    let block = rows.min(n - r0);
+                    let mut w32 = vec![0f32; block * k];
+                    read_weight_rows(&st, src, info.dtype, scale.as_deref(), r0, block, k, &mut w32)?;
+                    let (q, s) = match pick {
+                        Pick::Mls2 => quantize_mls2(&w32, block, k),
+                        Pick::Mls3 => crate::quantize_mls3(&w32, block, k),
+                        Pick::Mls4 => quantize_mls4(&w32, block, k),
+                        Pick::Mls8 => quantize_mls8(&w32, block, k),
+                        Pick::RowI4 => quantize_rows_i4(&w32, block, k),
+                        Pick::Keep => unreachable!(),
+                    };
+                    sink.write(&q)?;
+                    scales_out.extend_from_slice(&s);
                 }
+                sink.write(&scales_out)?;
             }
         }
         done += 1;
@@ -504,50 +495,49 @@ pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&s
     Ok(())
 }
 
-/// Reads one weight as f32, dequantizing its block format when the source has one.
-fn read_weight(
+/// Reads rows `[row0, row0 + rows)` of one weight as f32, dequantizing its block format when the source has one.
+/// `row0` is a multiple of 32 for the blocked formats, so a block's scales always come from one scale row.
+fn read_weight_rows(
     st: &SafeTensors,
     name: &str,
     dtype: DType,
     scale: Option<&str>,
-    n: usize,
+    row0: usize,
+    rows: usize,
     k: usize,
     out: &mut [f32],
 ) -> anyhow::Result<()> {
     match dtype {
         DType::BF16 => {
-            let mut raw = vec![0u8; n * k * 2];
-            st.read(name, 0, &mut raw)?;
+            let mut raw = vec![0u8; rows * k * 2];
+            st.read(name, row0 * k * 2, &mut raw)?;
             out.copy_from_slice(&bf16_rows(&raw));
         }
         DType::F32 => {
-            let mut raw = vec![0u8; n * k * 4];
-            st.read(name, 0, &mut raw)?;
+            let mut raw = vec![0u8; rows * k * 4];
+            st.read(name, row0 * k * 4, &mut raw)?;
             for (o, c) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
                 *o = f32::from_le_bytes(*c);
             }
         }
         DType::F8E4M3 => {
             let s = scale.ok_or_else(|| anyhow::anyhow!("{name}: fp8 without a scale"))?;
-            let mut q = vec![0u8; n * k];
-            st.read(name, 0, &mut q)?;
-            let si = st
-                .info(s)
-                .ok_or_else(|| anyhow::anyhow!("{s}: not in the checkpoint"))?;
-            let mut sc = vec![0u8; si.shape.iter().product()];
-            st.read(s, 0, &mut sc)?;
-            fp8_rows(&q, &sc, n, k, out)?;
+            let mut q = vec![0u8; rows * k];
+            st.read(name, row0 * k, &mut q)?;
+            let groups = k / BLOCK;
+            let sn = rows.div_ceil(FP8_BLOCK) * groups;
+            let mut sc = vec![0u8; sn];
+            st.read(s, (row0 / FP8_BLOCK) * groups, &mut sc)?;
+            fp8_rows(&q, &sc, rows, k, out)?;
         }
         DType::I8 => {
             let s = scale.ok_or_else(|| anyhow::anyhow!("{name}: fp4 without a scale"))?;
-            let mut q = vec![0u8; n * k / 2];
-            st.read(name, 0, &mut q)?;
-            let si = st
-                .info(s)
-                .ok_or_else(|| anyhow::anyhow!("{s}: not in the checkpoint"))?;
-            let mut sc = vec![0u8; si.shape.iter().product()];
-            st.read(s, 0, &mut sc)?;
-            fp4_rows(&q, &sc, n, k, out)?;
+            let mut q = vec![0u8; rows * k / 2];
+            st.read(name, row0 * k / 2, &mut q)?;
+            let groups = k / BLOCK;
+            let mut sc = vec![0u8; rows * groups];
+            st.read(s, row0 * groups, &mut sc)?;
+            fp4_rows(&q, &sc, rows, k, out)?;
         }
         d => anyhow::bail!("{name}: {d:?} cannot be quantized"),
     }
@@ -667,5 +657,57 @@ mod round_trip {
             worst = worst.max((*x - *y).abs() as f64);
         }
         (dot / (na.sqrt() * nb.sqrt()), worst)
+    }
+}
+
+#[cfg(test)]
+mod chunked_read {
+    use super::*;
+
+    /// The Engram tables are 98.31B elements: the converter reads them in row blocks. A block must dequantise
+    /// to exactly what the whole-tensor read would give, so the block size cannot change the numbers.
+    /// Run with the checkpoint: `DEEPSEEK_CKPT=/models/deepseekv41-flash cargo test -p malleus-convert chunked_read -- --ignored`
+    #[test]
+    #[ignore = "reads the checkpoint"]
+    fn a_row_block_matches_the_whole_read() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let st = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let name = "layers.1.engram.embed.weight";
+        let info = st.info(name).expect("the engram table");
+        let k = info.shape[1];
+        let whole = 96usize;
+        let mut all = vec![0f32; whole * k];
+        read_weight_rows(
+            &st,
+            name,
+            info.dtype,
+            Some("layers.1.engram.embed.scale"),
+            0,
+            whole,
+            k,
+            &mut all,
+        )
+        .unwrap();
+        for block in [32usize, 64] {
+            let mut parts = Vec::with_capacity(whole * k);
+            for r0 in (0..whole).step_by(block) {
+                let mut b = vec![0f32; block * k];
+                read_weight_rows(
+                    &st,
+                    name,
+                    info.dtype,
+                    Some("layers.1.engram.embed.scale"),
+                    r0,
+                    block,
+                    k,
+                    &mut b,
+                )
+                .unwrap();
+                parts.extend_from_slice(&b);
+            }
+            let worst = all.iter().zip(&parts).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert_eq!(worst, 0.0, "block {block} differs from the whole read");
+        }
+        println!("{}: {whole} rows x {k}, blocks match the whole read", name);
     }
 }

@@ -12,8 +12,10 @@
 //! - `model.layers.N.mlp.experts.{gate_up_proj,down_proj}` (Ling-3.0-flash): the per-expert tensors fused into one
 //!   [E, rows, K] tensor per layer; in `gate_up` the gate rows of each expert come before its up rows (ADR 0002).
 
+pub mod codebook;
 pub mod deepseek;
 pub mod dequant;
+pub mod grid;
 
 use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::fpquant::{MXFP8_BLOCK, NVFP4_BLOCK, mxfp8_rows, nvfp4_rows};
