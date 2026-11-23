@@ -693,7 +693,7 @@ fn rope_inv(rope: usize, theta: f32, original: usize, factor: f32, beta_fast: f3
         .map(|j| 1.0 / theta.powf(2.0 * j as f32 / rope as f32))
         .collect();
     if original > 0 && factor > 1.0 {
-        let (o, t) = (original as f32, theta as f32);
+        let (o, t) = (original as f32, theta);
         let corrected =
             |rotations: f32| rope as f32 * (o / (rotations * 2.0 * std::f32::consts::PI)).ln() / (2.0 * t.ln());
         let low = corrected(beta_fast).floor().max(0.0);
