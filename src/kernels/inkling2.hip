@@ -207,6 +207,146 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, cons
     }
 }
 
+// The same attention on the tensor cores: a 16x16x16 WMMA tile instead of one fp32 dot per thread-cycle. The block
+// is still 16 query rows of one head, and the four warps split the 128 dims of the score (two 16-wide chunks each)
+// and own two of the eight 16-wide output tiles. Q, K and V are staged in fp16 — the precision the reference keeps
+// its own cache in — and the relative bias is added in fp32 after the score tile, as the fp32 kernel does.
+//
+// The fragment layouts are the ones the other families use: a 16x16 A or B tile is read as sixteen contiguous halves
+// from row `lane % 16`, and the fp32 accumulator holds element `i` of lane `l` at (row `2i + l / 16`, col `l % 16`).
+// The score tile is (query, key), so the sixteen keys of a query row sit in the sixteen lanes of a half-warp at one
+// element: the row max and the row sum are four shuffles, and the rescale of the output is per element.
+typedef _Float16 ik_h16 __attribute__((ext_vector_type(16)));
+typedef float ik_f8 __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void __launch_bounds__(128) inkling2_attn_wmma(float* out, const float* q, const float* k,
+                                                                    const float* v, const float* rel, const float* proj,
+                                                                    const float* sink, const float* gate, int T,
+                                                                    int heads, int nkv, int dim, int d_rel, int extent,
+                                                                    int window, float scale) {
+    __shared__ __attribute__((aligned(16))) _Float16 qs[IKA_TQ][128];
+    __shared__ __attribute__((aligned(16))) _Float16 ks[IKA_KB][128];
+    __shared__ __attribute__((aligned(16))) _Float16 vt[128][IKA_KB];
+    __shared__ __attribute__((aligned(16))) _Float16 ps[IKA_TQ][IKA_KB];
+    __shared__ float rs[IKA_TQ][16];
+    __shared__ float bt[IKA_TQ][IKA_KB];
+    __shared__ float sp[4][IKA_TQ][IKA_KB];
+    const int h = blockIdx.x % heads, q0 = (blockIdx.x / heads) * IKA_TQ;
+    const int kh = h / (heads / nkv);
+    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int qlast = min(T - 1, q0 + IKA_TQ - 1);
+    const int k0 = window > 0 ? max(0, q0 - window + 1) : 0;
+    // The row of the score tile this lane's element `i` belongs to, and the key it holds.
+    const int half = lane / 16, col = lane % 16;
+    // Q, scaled once: the fragment is read straight out of shared, so the scale has to be in it.
+    for (int e = threadIdx.x; e < IKA_TQ * dim; e += 128) {
+        const int t = q0 + e / dim, d = e % dim;
+        qs[e / dim][d] = t < T ? (_Float16)(q[((size_t)t * heads + h) * dim + d] * scale) : (_Float16)0.f;
+    }
+    for (int e = threadIdx.x; e < IKA_TQ * d_rel; e += 128) {
+        rs[e / d_rel][e % d_rel] = q0 + e / d_rel <= qlast ? rel[((size_t)(q0 + e / d_rel) * heads + h) * d_rel + e % d_rel]
+                                                           : 0.f;
+    }
+    // The running max and sum of this lane's eight rows, and the sink as the score of a virtual key with no value.
+    float m[8], l[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int t = q0 + 2 * i + half;
+        m[i] = sink && t < T ? sink[(size_t)t * heads + h] : -INFINITY;
+        l[i] = sink && t < T ? 1.f : 0.f;
+    }
+    ik_f8 o[2];
+#pragma unroll
+    for (int f = 0; f < 2; ++f) o[f] = (ik_f8){0, 0, 0, 0, 0, 0, 0, 0};
+    __syncthreads();
+    for (int kc = k0; kc <= qlast; kc += IKA_KB) {
+        // A B fragment is one column of the product's right operand, sixteen elements along the contraction: the
+        // score's is a key's sixteen dims (K as it is), the output's is a dim's sixteen keys (V transposed).
+        for (int e = threadIdx.x; e < IKA_KB * dim; e += 128) {
+            const int j = e / dim, d = e % dim, s = kc + j;
+            const float kv = s <= qlast ? k[((size_t)s * nkv + kh) * dim + d] : 0.f;
+            const float vv = s <= qlast ? v[((size_t)s * nkv + kh) * dim + d] : 0.f;
+            ks[j][d] = (_Float16)kv;
+            vt[d][j] = (_Float16)vv;
+        }
+        // The bias tile, as in the fp32 kernel: rel[q0+iq] . proj[:, (q0+iq) - (kc+j)], zero outside the extent or
+        // the causal window of that row.
+        for (int e = threadIdx.x; e < IKA_TQ * IKA_KB; e += 128) {
+            const int iq = e / IKA_KB, j = e % IKA_KB, s = kc + j, t = q0 + iq;
+            float acc_b = 0.f;
+            const int d = t - s;
+            if (d >= 0 && d < extent && s <= t && t < T && (window == 0 || s >= t - window + 1)) {
+                for (int i = 0; i < d_rel; ++i) acc_b += rs[iq][i] * proj[(size_t)i * extent + d];
+            }
+            bt[iq][j] = acc_b;
+        }
+        __syncthreads();
+        // The score: this warp's two 16-wide chunks of the 128 dims, summed in the accumulator.
+        ik_f8 s8 = (ik_f8){0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            const int chunk = wave * 2 + c;
+            const ik_h16 a = *(const ik_h16*)&qs[lane % 16][chunk * 16];
+            const ik_h16 b = *(const ik_h16*)&ks[lane % 16][chunk * 16];
+            s8 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s8);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sp[wave][2 * i + half][col] = s8[i];
+        __syncthreads();
+        // The softmax of the 16 keys of each row: the four partials, the bias, the mask, then four shuffles.
+        float p[8], alpha[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int row = 2 * i + half, t = q0 + row, s = kc + col;
+            float sc = sp[0][row][col] + sp[1][row][col] + sp[2][row][col] + sp[3][row][col] + bt[row][col];
+            const int w0 = window > 0 ? max(0, t - window + 1) : 0;
+            if (s > t || s < w0 || t >= T) sc = -INFINITY;
+            float mx = sc;
+#pragma unroll
+            for (int o2 = 1; o2 < 16; o2 <<= 1) mx = fmaxf(mx, __shfl_xor(mx, o2, 32));
+            const float mn = fmaxf(m[i], mx);
+            alpha[i] = mn == -INFINITY ? 1.f : expf(m[i] - mn);
+            p[i] = sc == -INFINITY ? 0.f : expf(sc - mn);
+            float sum = p[i];
+#pragma unroll
+            for (int o2 = 1; o2 < 16; o2 <<= 1) sum += __shfl_xor(sum, o2, 32);
+            l[i] = l[i] * alpha[i] + sum;
+            m[i] = mn;
+        }
+#pragma unroll
+        for (int f = 0; f < 2; ++f)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[f][i] *= alpha[i];
+        // P as an A fragment: the accumulator layout is the transpose of it, so it goes through shared.
+#pragma unroll
+        for (int i = 0; i < 8; ++i) ps[2 * i + half][col] = (_Float16)p[i];
+        __syncthreads();
+        const ik_h16 pa = *(const ik_h16*)&ps[lane % 16][0];
+#pragma unroll
+        for (int f = 0; f < 2; ++f) {
+            const int tile = wave * 2 + f;
+            const ik_h16 b = *(const ik_h16*)&vt[tile * 16 + lane % 16][0];
+            o[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, b, o[f]);
+        }
+        __syncthreads();
+    }
+    // The output: element `i` of tile `f` is (row 2i + half, dim tile*16 + col), and `l[i]` is that row's sum.
+#pragma unroll
+    for (int f = 0; f < 2; ++f) {
+        const int tile = wave * 2 + f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int row = 2 * i + half, t = q0 + row;
+            if (t >= T) continue;
+            const float inv = l[i] > 0.f ? 1.f / l[i] : 0.f;
+            const size_t at = ((size_t)t * heads + h) * dim + tile * 16 + col;
+            float val = o[f][i] * inv;
+            if (gate) val /= 1.f + expf(-gate[at]);
+            out[at] = val;
+        }
+    }
+}
+
 // The relative bias of one query row against `nk` cached keys, for the decode path: bias is [heads, nk], `rel` is
 // [heads, d_rel] of the single query row. One thread per (head, key).
 extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias_dec(float* bias, const float* rel,

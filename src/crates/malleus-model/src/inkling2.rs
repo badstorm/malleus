@@ -3180,30 +3180,36 @@ fn attn(
     window: usize,
     scale: f32,
 ) -> Result<()> {
-    model.k.get("inkling2_attn").launch(
-        ((t.div_ceil(16) * heads) as u32, 1, 1),
-        (128, 1, 1),
-        0,
-        st,
-        &[
-            out.into(),
-            q.into(),
-            k.into(),
-            v.into(),
-            rel.into(),
-            proj.into(),
-            sink.into(),
-            gate.into(),
-            t.into(),
-            heads.into(),
-            nkv.into(),
-            dim.into(),
-            d_rel.into(),
-            extent.into(),
-            window.into(),
-            scale.into(),
-        ],
-    )?;
+    // The tensor-core tile is the same block shape (16 query rows of one head) with the dots on WMMA: Q, K and V go
+    // through fp16, the bias is still added in fp32. `MALLEUS_INKLING2_ATTN_F32=1` keeps the fp32 kernel for an A/B.
+    let wmma = dim == 128 && std::env::var_os("MALLEUS_INKLING2_ATTN_F32").is_none();
+    model
+        .k
+        .get(if wmma { "inkling2_attn_wmma" } else { "inkling2_attn" })
+        .launch(
+            ((t.div_ceil(16) * heads) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            st,
+            &[
+                out.into(),
+                q.into(),
+                k.into(),
+                v.into(),
+                rel.into(),
+                proj.into(),
+                sink.into(),
+                gate.into(),
+                t.into(),
+                heads.into(),
+                nkv.into(),
+                dim.into(),
+                d_rel.into(),
+                extent.into(),
+                window.into(),
+                scale.into(),
+            ],
+        )?;
     Ok(())
 }
 
