@@ -289,7 +289,14 @@ token for 8.7 GFLOP of experts and projections (2.5 TFLOPS). The degradation was
 every visible key once per query row — `depth × 8 KiB` per slot per token, 832 MiB per token at 8 192 over the 48
 slots. The block now holds four query rows, one per warp, and stages the keys in shared memory once per 16-key chunk:
 four times less traffic and eight times fewer barriers. What is left of the slope is the 8 full-attention slots, which
-really do read the whole context — the next factor there is 16 query rows per tile (WMMA), not another barrier trick.
+really do read the whole context.
+
+The 16x16x16 WMMA tile of that kernel is in, and it is **1.3-1.5x on the kernel and +10 % on a 512-token prompt, and
+nothing at depth**: 414.7 -> 284.4 ms at T=4096, 5262 -> 4142 at T=16384, `pp512` 304.5/309.2 -> 342.3/333.7 tok/s,
+`pp2048`/`pp8192` unchanged, and at 32K 27.6/10.79/44.4 -> 27.8/11.09/46.3 (pp512/tg4/fill, inside the noise). The
+reason is that at depth this kernel does not run: a chunk that continues a cache reads the cache one row at a time
+(`inkling2_attn_dec`), so the tile only ever sees a prompt that starts at position 0. The next step is the tiled
+kernel reading the cache, which is also what makes chunked prefill pay.
 
 Decode has the same shape of problem from the other side: 78 ms per token at a 512-token context, of which 28 is the
 2.24 GB of weights at the bandwidth wall, ~4 the sliding layers' 1024-key window and the rest the decode attention
@@ -310,8 +317,8 @@ the looped forward), greedy off:
 | metric | prefill (one forward) | decode (one token at a time, through the cache) |
 |---|---|---|
 | last-token top-1 against bf16 | **20/20** | **20/20** |
-| all-position argmax | 68.09 % (495/727) | 67.54 % (491/727) |
-| worst KL | 0.320 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.353 |
+| all-position argmax | 70.70 % (514/727) | 67.54 % (491/727) |
+| worst KL | 0.305 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.353 |
 
 `raw-continue` is the one prompt of the set that is not rendered through the chat template, and the only one whose
 KL is not in the 1e-5 range: it is where the file's 4 bits show. The step and the verify read the experts grouped by

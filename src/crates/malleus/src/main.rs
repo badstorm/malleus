@@ -2478,6 +2478,8 @@ fn kernel_test() -> Result<()> {
                 h2.into(),
                 nkv2.into(),
                 dim.into(),
+                // No ring: the cache of this check is linear, so position `p` is row `p`.
+                0i32.into(),
                 scale.into(),
             ],
         )?;
@@ -2672,6 +2674,7 @@ fn kernel_test() -> Result<()> {
             }
         }
         println!("inkling2_control   rel err {:.2e}", rel_err(&want, &got));
+        inkling2_attn_ab(&k, &s, &mut rnd)?;
         // The tower's two new kernels (issue #74): the axial RoPE and the attention, each against a host replica.
         {
             let (p, hh, d) = (37usize, 16usize, 64usize);
@@ -2797,6 +2800,197 @@ fn kernel_test() -> Result<()> {
                 .map(|i| x0[i] + half::bf16::from_bits(lam[i % n]).to_f32() * y0[i])
                 .collect();
             println!("inkling2_vis_scale rel err {:.2e}", rel_err(&want, &got));
+        }
+    }
+    Ok(())
+}
+
+/// The prefill attention, fp32 tile against WMMA tile, on the shapes the model runs: the WMMA kernel reads Q, K and V
+/// through fp16, so the two differ by that rounding and by nothing else.
+fn inkling2_attn_ab(k: &Kernels, s: &malleus_hip::Stream, rnd: &mut impl FnMut() -> f32) -> Result<()> {
+    use malleus_hip::{Arg, DeviceBuffer};
+    let (heads, nkv, dim, d_rel, extent) = (24usize, 8usize, 128usize, 16usize, 1024usize);
+    let scale = 1.0f32 / (dim as f32).sqrt();
+    for (t, window, sink_on) in [
+        (1usize, 0usize, false),
+        (1, 0, true),
+        (16, 0, false),
+        (16, 0, true),
+        (16, 4, true),
+        (48, 0, true),
+        (48, 40, true),
+        (160, 1024, true),
+        (33, 0, true),
+        // The depths the prefill is measured at: what the tile is for.
+        (4096, 0, true),
+        (4096, 1024, true),
+        (16384, 0, true),
+    ] {
+        let q: Vec<f32> = (0..t * heads * dim).map(|_| rnd()).collect();
+        let kk: Vec<f32> = (0..t * nkv * dim).map(|_| rnd()).collect();
+        let vv: Vec<f32> = (0..t * nkv * dim).map(|_| rnd()).collect();
+        let rel: Vec<f32> = (0..t * heads * d_rel).map(|_| rnd()).collect();
+        let proj: Vec<f32> = (0..d_rel * extent).map(|_| rnd() * 0.1).collect();
+        let sink: Vec<f32> = (0..t * heads).map(|_| rnd()).collect();
+        let gate: Vec<f32> = (0..t * heads * dim).map(|_| rnd()).collect();
+        let (qa, ka, va) = (
+            DeviceBuffer::from_slice(&q)?,
+            DeviceBuffer::from_slice(&kk)?,
+            DeviceBuffer::from_slice(&vv)?,
+        );
+        let (ra, pa) = (DeviceBuffer::from_slice(&rel)?, DeviceBuffer::from_slice(&proj)?);
+        let (sa, ga) = (DeviceBuffer::from_slice(&sink)?, DeviceBuffer::from_slice(&gate)?);
+        let (o1, o2) = (
+            DeviceBuffer::zeroed(t * heads * dim * 4)?,
+            DeviceBuffer::zeroed(t * heads * dim * 4)?,
+        );
+        k.get("inkling2_attn").launch(
+            ((t.div_ceil(16) * heads) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            s,
+            &[
+                (&o1).into(),
+                (&qa).into(),
+                (&ka).into(),
+                (&va).into(),
+                (&ra).into(),
+                (&pa).into(),
+                if sink_on { (&sa).into() } else { Arg::U64(0) },
+                if sink_on { (&ga).into() } else { Arg::U64(0) },
+                t.into(),
+                heads.into(),
+                nkv.into(),
+                dim.into(),
+                d_rel.into(),
+                extent.into(),
+                window.into(),
+                scale.into(),
+            ],
+        )?;
+        k.get("inkling2_attn_wmma").launch(
+            ((t.div_ceil(16) * heads) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            s,
+            &[
+                (&o2).into(),
+                (&qa).into(),
+                (&ka).into(),
+                (&va).into(),
+                (&ra).into(),
+                (&pa).into(),
+                if sink_on { (&sa).into() } else { Arg::U64(0) },
+                if sink_on { (&ga).into() } else { Arg::U64(0) },
+                t.into(),
+                heads.into(),
+                nkv.into(),
+                dim.into(),
+                d_rel.into(),
+                extent.into(),
+                window.into(),
+                scale.into(),
+            ],
+        )?;
+        s.synchronize()?;
+        let (a, b) = (
+            o1.download::<f32>(t * heads * dim)?,
+            o2.download::<f32>(t * heads * dim)?,
+        );
+        // Where the two first disagree, in (token, head, dim): the tile of a row narrows down the fragment.
+        let bad = a
+            .iter()
+            .zip(&b)
+            .position(|(x, y)| (x - y).abs() > 1e-2 * x.abs().max(1.0));
+        let at = bad.map_or(String::new(), |i| {
+            format!(
+                "  first diff t={} h={} d={}",
+                i / (heads * dim),
+                (i / dim) % heads,
+                i % dim
+            )
+        });
+        println!(
+            "inkling2_attn T={t:4} window={window:5} sink={sink_on:5} rel err {:.2e}{at}",
+            rel_err(&b, &a)
+        );
+        if std::env::var_os("MALLEUS_ATTN_AB_TIME").is_some() {
+            let grid = ((t.div_ceil(16) * heads) as u32, 1, 1);
+            for name in ["inkling2_attn", "inkling2_attn_wmma"] {
+                for _ in 0..2 {
+                    k.get(name).launch(
+                        grid,
+                        (128, 1, 1),
+                        0,
+                        s,
+                        &[
+                            (&o2).into(),
+                            (&qa).into(),
+                            (&ka).into(),
+                            (&va).into(),
+                            (&ra).into(),
+                            (&pa).into(),
+                            (&sa).into(),
+                            (&ga).into(),
+                            t.into(),
+                            heads.into(),
+                            nkv.into(),
+                            dim.into(),
+                            d_rel.into(),
+                            extent.into(),
+                            window.into(),
+                            scale.into(),
+                        ],
+                    )?;
+                }
+                s.synchronize()?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..3 {
+                    k.get(name).launch(
+                        grid,
+                        (128, 1, 1),
+                        0,
+                        s,
+                        &[
+                            (&o2).into(),
+                            (&qa).into(),
+                            (&ka).into(),
+                            (&va).into(),
+                            (&ra).into(),
+                            (&pa).into(),
+                            (&sa).into(),
+                            (&ga).into(),
+                            t.into(),
+                            heads.into(),
+                            nkv.into(),
+                            dim.into(),
+                            d_rel.into(),
+                            extent.into(),
+                            window.into(),
+                            scale.into(),
+                        ],
+                    )?;
+                }
+                s.synchronize()?;
+                println!("  {name:20} {:7.1} ms", t0.elapsed().as_secs_f64() * 1e3 / 3.0);
+            }
+        }
+        if std::env::var_os("MALLEUS_ATTN_AB_VERBOSE").is_some() {
+            let show = |v: &[f32]| {
+                v.iter()
+                    .take(6)
+                    .map(|x| format!("{x:+.4}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            println!("  fp32 t0h0: {}", show(&a[..]));
+            println!("  wmma t0h0: {}", show(&b[..]));
+            // The row of token 1 (two visible keys) and of the last token, where the window matters.
+            println!("  fp32 t1h0: {}", show(&a[heads * dim..]));
+            println!("  wmma t1h0: {}", show(&b[heads * dim..]));
+            let last = (t - 1) * heads * dim;
+            println!("  fp32 t{}h0: {}", t - 1, show(&a[last..]));
+            println!("  wmma t{}h0: {}", t - 1, show(&b[last..]));
         }
     }
     Ok(())
