@@ -291,12 +291,27 @@ slots. The block now holds four query rows, one per warp, and stages the keys in
 four times less traffic and eight times fewer barriers. What is left of the slope is the 8 full-attention slots, which
 really do read the whole context.
 
-The 16x16x16 WMMA tile of that kernel is in, and it is **1.3-1.5x on the kernel and +10 % on a 512-token prompt, and
-nothing at depth**: 414.7 -> 284.4 ms at T=4096, 5262 -> 4142 at T=16384, `pp512` 304.5/309.2 -> 342.3/333.7 tok/s,
-`pp2048`/`pp8192` unchanged, and at 32K 27.6/10.79/44.4 -> 27.8/11.09/46.3 (pp512/tg4/fill, inside the noise). The
-reason is that at depth this kernel does not run: a chunk that continues a cache reads the cache one row at a time
-(`inkling2_attn_dec`), so the tile only ever sees a prompt that starts at position 0. The next step is the tiled
-kernel reading the cache, which is also what makes chunked prefill pay.
+The 16x16x16 WMMA tile of that kernel is in: 1.3-1.5x on the kernel (414.7 -> 284.4 ms at T=4096, 5262 -> 4142 at
+T=16384) and +10 % on a 512-token prompt. Alone it bought nothing at depth, because at depth that kernel did not run —
+a chunk that continues a cache read the cache one row at a time.
+
+**The same tile now reads the cache** (`inkling2_attn_wmma_cached`: the keys and values come from the session's fp16
+cache, position `p` at row `p % ring` on a sliding layer), and the scheduler feeds the prompt in pieces of **512**
+tokens (`inkling2::PREFILL_CHUNK`). That is what the issue was after, and it is worth 4x at depth (`malleus bench
+--depth 32768 --prompt 512 --decode 4`, gfx1150):
+
+| at 32K | per-row cache attention | tiled, reading the cache |
+|---|---|---|
+| `pp512` | 27.7 tok/s | **116.4** |
+| fill (32 768 tokens) | 46.4 tok/s | **166.6** |
+| `tg4` | 11.14 tok/s | 11.19 |
+| elapsed | 725 s | **201 s** |
+
+The ring grows with the chunk (`window + 512 + 8`, 1 544 rows instead of 1 032): a chunk writes all its keys before it
+attends, so a smaller ring would clobber keys the chunk's own first rows still see. That costs 80 MB of session state
+at 32K (1.25 -> 1.33 GB) and nothing measurable. The gates are the prefill ones: `golden` unchanged (20/20,
+514/727, KL 0.305) also with `--chunk 512`, and `golden --pad 4096` — the chunked run against the same prompt in one
+forward, past the point where the ring wraps — agrees on **4096/4096** argmax with a last-row KL of 0.
 
 Decode has the same shape of problem from the other side: 78 ms per token at a 512-token context, of which 28 is the
 2.24 GB of weights at the bandwidth wall, ~4 the sliding layers' 1024-key window and the rest the decode attention

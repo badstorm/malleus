@@ -65,6 +65,15 @@ enum Cmd {
         /// Feed the prompts one token at a time (the decode weights and kernels) instead of one prefill
         #[arg(long)]
         decode: bool,
+        /// Feed the prompt in pieces of this many tokens, which is what a long prompt does in service: the attention
+        /// then reads the session's cache instead of the chunk's own keys
+        #[arg(long)]
+        chunk: Option<usize>,
+        /// Repeat the prompt cyclically up to at least this many tokens and compare the chunked run against the same
+        /// prompt in one forward: the sliding cache's ring only wraps past a few thousand tokens, and no fixture is
+        /// that long
+        #[arg(long)]
+        pad: Option<usize>,
     },
     /// Convert a safetensors bf16 model directory to an Malleus model file (.malleus)
     Convert {
@@ -854,6 +863,7 @@ fn eval(model: &Path, set: &Path, blobs: &Path, chunk: usize) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn golden(
     model: &Path,
     golden: &Path,
@@ -862,12 +872,59 @@ fn golden(
     greedy: bool,
     only: Option<&str>,
     decode: bool,
+    chunk: Option<usize>,
+    pad: Option<usize>,
 ) -> Result<()> {
     let g: serde_json::Value = serde_json::from_reader(std::fs::File::open(golden)?)?;
     let m = load_model(model)?;
     let vocab = m.cfg.vocab;
     let mut worst_kl: f64 = 0.0;
     let (mut top1_ok, mut top1_n, mut pos_ok, mut pos_n) = (0, 0, 0usize, 0usize);
+    if let Some(n) = pad {
+        // The chunked run against the same prompt in one forward: no fixture is long enough to wrap the sliding
+        // cache's ring, and that is where a chunked prefill differs from the tiled kernel reading its own keys.
+        let e = g["text"]
+            .as_array()
+            .context("text")?
+            .iter()
+            .find(|e| only.is_none_or(|o| o.split(',').any(|x| e["id"].as_str() == Some(x))))
+            .context("no prompt to pad")?;
+        let id = e["id"].as_str().unwrap_or("?");
+        let base: Vec<u32> = e["input_ids"]
+            .as_array()
+            .context("ids")?
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let mut ids = base.clone();
+        while ids.len() < n {
+            let take = (n - ids.len()).min(base.len());
+            ids.extend_from_slice(&base[..take]);
+        }
+        let mut one = m.new_session(ctx)?;
+        let a = m.forward(&mut one, &ids, None, ids.len())?;
+        let mut pieces = m.new_session(ctx)?;
+        let mut b = Vec::with_capacity(ids.len() * vocab);
+        for part in ids.chunks(chunk.unwrap_or(malleus_model::inkling2::PREFILL_CHUNK)) {
+            b.extend(m.forward(&mut pieces, part, None, part.len())?);
+        }
+        let (pa, pb): (Vec<usize>, Vec<usize>) = (
+            a.chunks_exact(vocab).map(argmax).collect(),
+            b.chunks_exact(vocab).map(argmax).collect(),
+        );
+        let agree = pa.iter().zip(&pb).filter(|(x, y)| x == y).count();
+        let (la, lb) = (
+            log_softmax(&a[(ids.len() - 1) * vocab..]),
+            log_softmax(&b[(ids.len() - 1) * vocab..]),
+        );
+        let kl: f64 = la.iter().zip(&lb).map(|(r, o)| r.exp() * (r - o)).sum();
+        println!(
+            "{id} padded to {} tokens: chunked against one forward, argmax {agree}/{}, last-row KL {kl:.6}",
+            ids.len(),
+            ids.len()
+        );
+        return Ok(());
+    }
     for e in g["text"].as_array().context("text")? {
         let id = e["id"].as_str().unwrap_or("?");
         if only.is_some_and(|o| !o.split(',').any(|x| x == id)) {
@@ -891,6 +948,15 @@ fn golden(
             let mut l = Vec::with_capacity(ids.len() * vocab);
             for &id in &ids {
                 l.extend(m.forward(&mut sess, &[id], None, 1)?);
+            }
+            l
+        } else if let Some(n) = chunk {
+            // The pieces of a prompt, as a long prompt runs in service: every piece but the first continues the
+            // session, so its attention reads the cache. Each piece returns its own rows, so the comparison sees the
+            // whole prompt.
+            let mut l = Vec::with_capacity(ids.len() * vocab);
+            for part in ids.chunks(n) {
+                l.extend(m.forward(&mut sess, part, None, part.len())?);
             }
             l
         } else {
@@ -2457,7 +2523,11 @@ fn kernel_test() -> Result<()> {
             }
         }
         println!("inkling2_rel_bias_dec rel err {:.2e}", rel_err(&wantb, &biasb));
-        // One query over a cache of `nkb` keys from `k0b`, `posb` being its last one.
+        // One query over a cache of `nkb` keys from `k0b`, `posb` being its last one. The cache is fp16 since the
+        // half-precision one landed, so the check rounds the same way the kernel reads it.
+        let khalf: Vec<u16> = ka.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
+        let vhalf: Vec<u16> = va.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
+        let (kad, vad) = (DeviceBuffer::from_slice(&khalf)?, DeviceBuffer::from_slice(&vhalf)?);
         let biasd = DeviceBuffer::from_slice(&wantb)?;
         let od = DeviceBuffer::zeroed(h2 * dim * 4)?;
         k.get("inkling2_attn_dec").launch(
@@ -2492,7 +2562,8 @@ fn kernel_test() -> Result<()> {
                 .map(|ss| {
                     let mut acc = 0f32;
                     for i in 0..dim {
-                        acc += qa[hh * dim + i] * ka[((k0b + ss) * nkv2 + kh) * dim + i];
+                        acc +=
+                            qa[hh * dim + i] * half::f16::from_bits(khalf[((k0b + ss) * nkv2 + kh) * dim + i]).to_f32();
                     }
                     acc * scale + wantb[hh * nkb + ss]
                 })
@@ -2502,7 +2573,8 @@ fn kernel_test() -> Result<()> {
             for i in 0..dim {
                 let mut acc = 0f32;
                 for ss in 0..nkb {
-                    acc += (sc[ss] - mx).exp() / sum * va[((k0b + ss) * nkv2 + kh) * dim + i];
+                    acc += (sc[ss] - mx).exp() / sum
+                        * half::f16::from_bits(vhalf[((k0b + ss) * nkv2 + kh) * dim + i]).to_f32();
                 }
                 let g = ga[hh * dim + i];
                 want[hh * dim + i] = acc / (1.0 + (-g).exp());
@@ -2805,26 +2877,106 @@ fn kernel_test() -> Result<()> {
     Ok(())
 }
 
-/// The prefill attention, fp32 tile against WMMA tile, on the shapes the model runs: the WMMA kernel reads Q, K and V
-/// through fp16, so the two differ by that rounding and by nothing else.
+/// The prefill attention: the fp32 tile against the WMMA one on the same rows, then the cache-reading tile against the
+/// last rows of a run that carried the same keys in its own buffers. The WMMA kernels read Q, K and V through fp16, so
+/// the two differ by that rounding and by nothing else.
 fn inkling2_attn_ab(k: &Kernels, s: &malleus_hip::Stream, rnd: &mut impl FnMut() -> f32) -> Result<()> {
-    use malleus_hip::{Arg, DeviceBuffer};
+    use malleus_hip::DeviceBuffer;
     let (heads, nkv, dim, d_rel, extent) = (24usize, 8usize, 128usize, 16usize, 1024usize);
-    let scale = 1.0f32 / (dim as f32).sqrt();
-    for (t, window, sink_on) in [
-        (1usize, 0usize, false),
-        (1, 0, true),
-        (16, 0, false),
-        (16, 0, true),
-        (16, 4, true),
-        (48, 0, true),
-        (48, 40, true),
-        (160, 1024, true),
-        (33, 0, true),
-        // The depths the prefill is measured at: what the tile is for.
-        (4096, 0, true),
-        (4096, 1024, true),
-        (16384, 0, true),
+    let verbose = std::env::var_os("MALLEUS_ATTN_AB_VERBOSE").is_some();
+    let timed = std::env::var_os("MALLEUS_ATTN_AB_TIME").is_some();
+
+    // One tile of `t` rows: `cache` is (k, v, rows, ring, pos) when the keys come from the session, `(k, v)` are the
+    // chunk's own otherwise. Everything is per call, so the launcher stays one line.
+    #[allow(clippy::too_many_arguments)]
+    fn tile(
+        k: &Kernels,
+        s: &malleus_hip::Stream,
+        name: &str,
+        out: &DeviceBuffer,
+        q: &DeviceBuffer,
+        (kk, vv): (&DeviceBuffer, &DeviceBuffer),
+        cache: Option<(&DeviceBuffer, &DeviceBuffer, usize, usize, usize)>,
+        rel: &DeviceBuffer,
+        proj: &DeviceBuffer,
+        sink: &DeviceBuffer,
+        gate: &DeviceBuffer,
+        t: usize,
+        window: usize,
+    ) -> Result<()> {
+        let (heads, nkv, dim, d_rel, extent) = (24usize, 8usize, 128usize, 16usize, 1024usize);
+        let (ck, cv, rows, ring, pos) = cache.unwrap_or((kk, vv, 0, 0, 0));
+        // The fp32 kernel is the one the tile replaced: no cache, and its own argument list.
+        if name == "inkling2_attn" {
+            k.get(name).launch(
+                ((t.div_ceil(16) * heads) as u32, 1, 1),
+                (128, 1, 1),
+                0,
+                s,
+                &[
+                    out.into(),
+                    q.into(),
+                    kk.into(),
+                    vv.into(),
+                    rel.into(),
+                    proj.into(),
+                    sink.into(),
+                    gate.into(),
+                    t.into(),
+                    heads.into(),
+                    nkv.into(),
+                    dim.into(),
+                    d_rel.into(),
+                    extent.into(),
+                    window.into(),
+                    (1.0f32 / (dim as f32).sqrt()).into(),
+                ],
+            )?;
+            return Ok(());
+        }
+        k.get(name).launch(
+            ((t.div_ceil(16) * heads) as u32, 1, 1),
+            (128, 1, 1),
+            0,
+            s,
+            &[
+                out.into(),
+                q.into(),
+                kk.into(),
+                vv.into(),
+                ck.into(),
+                cv.into(),
+                rows.into(),
+                ring.into(),
+                pos.into(),
+                rel.into(),
+                proj.into(),
+                sink.into(),
+                gate.into(),
+                t.into(),
+                heads.into(),
+                nkv.into(),
+                dim.into(),
+                d_rel.into(),
+                extent.into(),
+                window.into(),
+                (1.0f32 / (dim as f32).sqrt()).into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    for (t, window) in [
+        (1usize, 0usize),
+        (16, 0),
+        (16, 4),
+        (48, 0),
+        (48, 40),
+        (160, 1024),
+        (33, 0),
+        (4096, 0),
+        (4096, 1024),
+        (16384, 0),
     ] {
         let q: Vec<f32> = (0..t * heads * dim).map(|_| rnd()).collect();
         let kk: Vec<f32> = (0..t * nkv * dim).map(|_| rnd()).collect();
@@ -2844,60 +2996,39 @@ fn inkling2_attn_ab(k: &Kernels, s: &malleus_hip::Stream, rnd: &mut impl FnMut()
             DeviceBuffer::zeroed(t * heads * dim * 4)?,
             DeviceBuffer::zeroed(t * heads * dim * 4)?,
         );
-        k.get("inkling2_attn").launch(
-            ((t.div_ceil(16) * heads) as u32, 1, 1),
-            (128, 1, 1),
-            0,
+        tile(
+            k,
             s,
-            &[
-                (&o1).into(),
-                (&qa).into(),
-                (&ka).into(),
-                (&va).into(),
-                (&ra).into(),
-                (&pa).into(),
-                if sink_on { (&sa).into() } else { Arg::U64(0) },
-                if sink_on { (&ga).into() } else { Arg::U64(0) },
-                t.into(),
-                heads.into(),
-                nkv.into(),
-                dim.into(),
-                d_rel.into(),
-                extent.into(),
-                window.into(),
-                scale.into(),
-            ],
+            "inkling2_attn",
+            &o1,
+            &qa,
+            (&ka, &va),
+            None,
+            &ra,
+            &pa,
+            &sa,
+            &ga,
+            t,
+            window,
         )?;
-        k.get("inkling2_attn_wmma").launch(
-            ((t.div_ceil(16) * heads) as u32, 1, 1),
-            (128, 1, 1),
-            0,
+        tile(
+            k,
             s,
-            &[
-                (&o2).into(),
-                (&qa).into(),
-                (&ka).into(),
-                (&va).into(),
-                (&ra).into(),
-                (&pa).into(),
-                if sink_on { (&sa).into() } else { Arg::U64(0) },
-                if sink_on { (&ga).into() } else { Arg::U64(0) },
-                t.into(),
-                heads.into(),
-                nkv.into(),
-                dim.into(),
-                d_rel.into(),
-                extent.into(),
-                window.into(),
-                scale.into(),
-            ],
+            "inkling2_attn_wmma",
+            &o2,
+            &qa,
+            (&ka, &va),
+            None,
+            &ra,
+            &pa,
+            &sa,
+            &ga,
+            t,
+            window,
         )?;
         s.synchronize()?;
-        let (a, b) = (
-            o1.download::<f32>(t * heads * dim)?,
-            o2.download::<f32>(t * heads * dim)?,
-        );
-        // Where the two first disagree, in (token, head, dim): the tile of a row narrows down the fragment.
+        let a = o1.download::<f32>(t * heads * dim)?;
+        let b = o2.download::<f32>(t * heads * dim)?;
         let bad = a
             .iter()
             .zip(&b)
@@ -2911,71 +3042,10 @@ fn inkling2_attn_ab(k: &Kernels, s: &malleus_hip::Stream, rnd: &mut impl FnMut()
             )
         });
         println!(
-            "inkling2_attn T={t:4} window={window:5} sink={sink_on:5} rel err {:.2e}{at}",
+            "inkling2_attn T={t:4} window={window:5} rel err {:.2e}{at}",
             rel_err(&b, &a)
         );
-        if std::env::var_os("MALLEUS_ATTN_AB_TIME").is_some() {
-            let grid = ((t.div_ceil(16) * heads) as u32, 1, 1);
-            for name in ["inkling2_attn", "inkling2_attn_wmma"] {
-                for _ in 0..2 {
-                    k.get(name).launch(
-                        grid,
-                        (128, 1, 1),
-                        0,
-                        s,
-                        &[
-                            (&o2).into(),
-                            (&qa).into(),
-                            (&ka).into(),
-                            (&va).into(),
-                            (&ra).into(),
-                            (&pa).into(),
-                            (&sa).into(),
-                            (&ga).into(),
-                            t.into(),
-                            heads.into(),
-                            nkv.into(),
-                            dim.into(),
-                            d_rel.into(),
-                            extent.into(),
-                            window.into(),
-                            scale.into(),
-                        ],
-                    )?;
-                }
-                s.synchronize()?;
-                let t0 = std::time::Instant::now();
-                for _ in 0..3 {
-                    k.get(name).launch(
-                        grid,
-                        (128, 1, 1),
-                        0,
-                        s,
-                        &[
-                            (&o2).into(),
-                            (&qa).into(),
-                            (&ka).into(),
-                            (&va).into(),
-                            (&ra).into(),
-                            (&pa).into(),
-                            (&sa).into(),
-                            (&ga).into(),
-                            t.into(),
-                            heads.into(),
-                            nkv.into(),
-                            dim.into(),
-                            d_rel.into(),
-                            extent.into(),
-                            window.into(),
-                            scale.into(),
-                        ],
-                    )?;
-                }
-                s.synchronize()?;
-                println!("  {name:20} {:7.1} ms", t0.elapsed().as_secs_f64() * 1e3 / 3.0);
-            }
-        }
-        if std::env::var_os("MALLEUS_ATTN_AB_VERBOSE").is_some() {
+        if verbose {
             let show = |v: &[f32]| {
                 v.iter()
                     .take(6)
@@ -2985,12 +3055,171 @@ fn inkling2_attn_ab(k: &Kernels, s: &malleus_hip::Stream, rnd: &mut impl FnMut()
             };
             println!("  fp32 t0h0: {}", show(&a[..]));
             println!("  wmma t0h0: {}", show(&b[..]));
-            // The row of token 1 (two visible keys) and of the last token, where the window matters.
-            println!("  fp32 t1h0: {}", show(&a[heads * dim..]));
-            println!("  wmma t1h0: {}", show(&b[heads * dim..]));
-            let last = (t - 1) * heads * dim;
-            println!("  fp32 t{}h0: {}", t - 1, show(&a[last..]));
-            println!("  wmma t{}h0: {}", t - 1, show(&b[last..]));
+        }
+        if timed {
+            for name in ["inkling2_attn", "inkling2_attn_wmma"] {
+                for _ in 0..2 {
+                    tile(k, s, name, &o2, &qa, (&ka, &va), None, &ra, &pa, &sa, &ga, t, window)?;
+                }
+                s.synchronize()?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..3 {
+                    tile(k, s, name, &o2, &qa, (&ka, &va), None, &ra, &pa, &sa, &ga, t, window)?;
+                }
+                s.synchronize()?;
+                println!("  {name:22} {:7.1} ms", t0.elapsed().as_secs_f64() * 1e3 / 3.0);
+            }
+        }
+    }
+    // The cache-reading tile. A chunk of `tt` rows from `pos` of a run of `n` rows must give the last `tt` rows the
+    // same run gave when it carried its keys itself; the second shape is a sliding layer whose ring wraps inside the
+    // chunk, so the first visible key is not at row 0.
+    // (rows of the run, first row of the chunk, rows of the chunk, window, ring). A ring must hold `window + chunk`
+    // keys or the chunk overwrites keys its own first rows still see, which the scheduler never asks for.
+    for (n, pos, tt, window, ring) in [
+        (64usize, 32usize, 32usize, 0usize, 0usize),
+        (100, 60, 32, 24, 0),
+        (100, 60, 32, 24, 100),
+        (100, 60, 32, 24, 60),
+    ] {
+        // A ring only makes sense for the chunk itself: a whole run does not fit in one, and filling it with keys the
+        // session has not written yet would clobber keys the first rows still see.
+        let steps: Vec<(usize, usize)> = if ring > 0 {
+            vec![(1, pos)]
+        } else {
+            vec![(0, 0), (1, pos)]
+        };
+        for (step, pos) in steps {
+            let tt = if step == 0 { n } else { tt };
+            let q: Vec<f32> = (0..n * heads * dim).map(|_| rnd()).collect();
+            let kk: Vec<f32> = (0..n * nkv * dim).map(|_| rnd()).collect();
+            let vv: Vec<f32> = (0..n * nkv * dim).map(|_| rnd()).collect();
+            let rel: Vec<f32> = (0..n * heads * d_rel).map(|_| rnd()).collect();
+            let proj: Vec<f32> = (0..d_rel * extent).map(|_| rnd() * 0.1).collect();
+            let sink: Vec<f32> = (0..n * heads).map(|_| rnd()).collect();
+            let gate: Vec<f32> = (0..n * heads * dim).map(|_| rnd()).collect();
+            let (qa, ka, va) = (
+                DeviceBuffer::from_slice(&q)?,
+                DeviceBuffer::from_slice(&kk)?,
+                DeviceBuffer::from_slice(&vv)?,
+            );
+            let (ra, pa) = (DeviceBuffer::from_slice(&rel)?, DeviceBuffer::from_slice(&proj)?);
+            let (sa, ga) = (DeviceBuffer::from_slice(&sink)?, DeviceBuffer::from_slice(&gate)?);
+            let rows = if ring > 0 { ring } else { n };
+            let (mut ck, mut cv) = (vec![0u16; rows * nkv * dim], vec![0u16; rows * nkv * dim]);
+            // Only the keys the session has written when the chunk runs: the chunk's own last position at most.
+            for p in 0..(pos + tt) {
+                let at = if ring > 0 { p % ring } else { p };
+                for i in 0..nkv * dim {
+                    ck[at * nkv * dim + i] = half::f16::from_f32(kk[p * nkv * dim + i]).to_bits();
+                    cv[at * nkv * dim + i] = half::f16::from_f32(vv[p * nkv * dim + i]).to_bits();
+                }
+            }
+            let (cka, cva) = (DeviceBuffer::from_slice(&ck)?, DeviceBuffer::from_slice(&cv)?);
+            let full = DeviceBuffer::zeroed(n * heads * dim * 4)?;
+            tile(
+                k,
+                s,
+                "inkling2_attn_wmma",
+                &full,
+                &qa,
+                (&ka, &va),
+                None,
+                &ra,
+                &pa,
+                &sa,
+                &ga,
+                n,
+                window,
+            )?;
+            let full32 = DeviceBuffer::zeroed(n * heads * dim * 4)?;
+            tile(
+                k,
+                s,
+                "inkling2_attn",
+                &full32,
+                &qa,
+                (&ka, &va),
+                None,
+                &ra,
+                &pa,
+                &sa,
+                &ga,
+                n,
+                window,
+            )?;
+            // The chunk: its own buffers are rows [pos, n) of the run, and `pos` says where they sit in the session.
+            let chunk = DeviceBuffer::zeroed(tt * heads * dim * 4)?;
+            // The slices are locals: the launch is asynchronous, so a temporary buffer would be freed while the kernel
+            // still reads it.
+            let (qc, rc) = (
+                DeviceBuffer::from_slice(&q[pos * heads * dim..(pos + tt) * heads * dim])?,
+                DeviceBuffer::from_slice(&rel[pos * heads * d_rel..(pos + tt) * heads * d_rel])?,
+            );
+            let (sc, gc) = (
+                DeviceBuffer::from_slice(&sink[pos * heads..(pos + tt) * heads])?,
+                DeviceBuffer::from_slice(&gate[pos * heads * dim..(pos + tt) * heads * dim])?,
+            );
+            tile(
+                k,
+                s,
+                "inkling2_attn_wmma_cached",
+                &chunk,
+                &qc,
+                (&ka, &va),
+                Some((&cka, &cva, rows, ring, pos)),
+                &rc,
+                &pa,
+                &sc,
+                &gc,
+                tt,
+                window,
+            )?;
+            s.synchronize()?;
+            let want = full.download::<f32>(n * heads * dim)?;
+            let got = chunk.download::<f32>(tt * heads * dim)?;
+            let want = &want[pos * heads * dim..];
+            let bad = want
+                .iter()
+                .zip(&got)
+                .position(|(x, y)| (x - y).abs() > 1e-2 * x.abs().max(1.0));
+            let at = bad.map_or(String::new(), |i| {
+                format!(
+                    "  first diff row={} h={} d={}",
+                    i / (heads * dim),
+                    (i / dim) % heads,
+                    i % dim
+                )
+            });
+            let want32 = full32.download::<f32>(n * heads * dim)?;
+            println!(
+                "inkling2_attn cached pos={pos:3} window={window:5} ring={ring:3} rel err {:.2e} (fp32 {:.2e}){at}",
+                rel_err(&got, want),
+                rel_err(&got, &want32[pos * heads * dim..])
+            );
+            if verbose {
+                let show = |v: &[f32], at: usize| {
+                    v[at..at + 8]
+                        .iter()
+                        .map(|x| format!("{x:+.4}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                for (name, v) in [("want", want), ("got ", &got[..])] {
+                    println!("  {name} r0h0 d48..55 {}", show(v, 48));
+                    println!("  {name} r0h0 d56..63 {}", show(v, 56));
+                }
+                for r in 0..tt.min(3) {
+                    let row = &got[r * heads * dim..(r + 1) * heads * dim];
+                    let want_row = &want[r * heads * dim..(r + 1) * heads * dim];
+                    println!(
+                        "  row {:3} (pos {:3}) rel err {:.2e}",
+                        r,
+                        pos + r,
+                        rel_err(row, want_row)
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -3248,7 +3477,9 @@ fn main() -> Result<()> {
             greedy,
             only,
             decode,
-        } => golden(&model, &g, &blobs, ctx, greedy, only.as_deref(), decode)?,
+            chunk,
+            pad,
+        } => golden(&model, &g, &blobs, ctx, greedy, only.as_deref(), decode, chunk, pad)?,
         Cmd::SpecExact {
             model,
             golden: g,

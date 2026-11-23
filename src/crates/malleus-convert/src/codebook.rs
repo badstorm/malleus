@@ -234,8 +234,8 @@ mod tests {
 mod experiment {
     use super::*;
     use crate::deepseek::fp4_rows;
-    use malleus_gguf::safetensors::SafeTensors;
     use malleus_gguf::TensorSource;
+    use malleus_gguf::safetensors::SafeTensors;
 
     /// Measures what a 2-bit quantizer costs on a real expert, so the codebook is chosen on numbers and not on
     /// theory. Run with the checkpoint mounted:
