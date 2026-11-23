@@ -122,6 +122,81 @@ pub fn load_matrix(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Re
             }
             Ok(w)
         }
+        // Our own quantized formats. The codes are rotated with the Hadamard signs, so a row is dequantised
+        // group by group and then unrotated; RowI4 is the Engram table, which is never rotated.
+        DType::Mls2 | DType::Mls3 | DType::Mls4 | DType::Mls8 | DType::RowI4 => {
+            ensure!(
+                info.shape == [n, k],
+                "{name}: shape {:?}, expected [{n}, {k}]",
+                info.shape
+            );
+            let codes = src.read_all(name)?;
+            let raw = src.read_all(&format!("{name}.scales"))?;
+            let signs = malleus_gguf::quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED);
+            let mut w = vec![0f32; n * k];
+            match info.dtype {
+                DType::RowI4 => {
+                    let scales = f16_scales(&raw)?;
+                    ensure!(scales.len() == n, "{name}: {} row scales", scales.len());
+                    for r in 0..n {
+                        let row = &mut w[r * k..(r + 1) * k];
+                        malleus_gguf::quant::dequant_int4(&codes[r * k / 2..(r + 1) * k / 2], scales[r], row);
+                    }
+                }
+                DType::Mls8 => {
+                    let scales = f32_scales(&raw)?;
+                    ensure!(scales.len() == n, "{name}: {} row scales", scales.len());
+                    for r in 0..n {
+                        let row = &mut w[r * k..(r + 1) * k];
+                        for (o, &b) in row.iter_mut().zip(&codes[r * k..(r + 1) * k]) {
+                            *o = b as i8 as f32 * scales[r];
+                        }
+                        malleus_gguf::quant::unrotate_row(row, &signs);
+                    }
+                }
+                DType::Mls2 | DType::Mls3 | DType::Mls4 => {
+                    let scales = f16_scales(&raw)?;
+                    let groups = k / malleus_gguf::quant::BLOCK;
+                    ensure!(scales.len() == n * groups, "{name}: {} group scales", scales.len());
+                    // Bytes one 128-wide group takes: 4 codes per byte, 3 per 8 bytes, 2 per byte.
+                    let per = match info.dtype {
+                        DType::Mls2 => malleus_gguf::quant::BLOCK / 4,
+                        DType::Mls3 => malleus_gguf::quant::BLOCK / 8 * 3,
+                        _ => malleus_gguf::quant::BLOCK / 2,
+                    };
+                    for r in 0..n {
+                        let row = &mut w[r * k..(r + 1) * k];
+                        for g in 0..groups {
+                            let at = r * groups * per + g * per;
+                            let mut out = [0f32; malleus_gguf::quant::BLOCK];
+                            match info.dtype {
+                                DType::Mls2 => malleus_gguf::quant::dequant_int2(
+                                    &codes[at..at + per],
+                                    scales[r * groups + g],
+                                    malleus_gguf::quant::Int2Grid::E2m1,
+                                    &mut out,
+                                ),
+                                DType::Mls3 => malleus_gguf::quant::dequant_int3(
+                                    &codes[at..at + per],
+                                    scales[r * groups + g],
+                                    &mut out,
+                                ),
+                                _ => malleus_gguf::quant::dequant_int4(
+                                    &codes[at..at + per],
+                                    scales[r * groups + g],
+                                    &mut out,
+                                ),
+                            }
+                            row[g * malleus_gguf::quant::BLOCK..(g + 1) * malleus_gguf::quant::BLOCK]
+                                .copy_from_slice(&out);
+                        }
+                        malleus_gguf::quant::unrotate_row(row, &signs);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            Ok(w)
+        }
         other => bail!("{name}: cannot read a matrix stored as {other:?}"),
     }
 }
@@ -133,11 +208,26 @@ fn f8_e4m3(b: u8) -> f32 {
     let man = (b & 0x7) as f32;
     if exp == 0 {
         sign * man * (1.0 / 8.0) * 2f32.powi(-6)
-    } else if exp == 0xF {
-        if man == 0.0 { sign * f32::INFINITY } else { f32::NAN }
+    } else if exp == 0xF && man == 7.0 {
+        // e4m3fn has no infinity: the only NaN is the all-ones mantissa at the top exponent.
+        f32::NAN
     } else {
         sign * (1.0 + man / 8.0) * 2f32.powi(exp - 7)
     }
+}
+
+fn f16_scales(raw: &[u8]) -> Result<Vec<f32>> {
+    Ok(raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::f16::from_le_bytes(*c).to_f32())
+        .collect())
+}
+
+fn f32_scales(raw: &[u8]) -> Result<Vec<f32>> {
+    ensure!(raw.len().is_multiple_of(4), "a scale block of {} bytes", raw.len());
+    Ok(raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
 }
 
 /// Reads a vector (`[n]`) of f32 or bf16.
@@ -1116,6 +1206,32 @@ mod tests {
             sum / got.len() as f64
         );
         cos
+    }
+
+    /// The loader reads our own `.malleus` file: every quantized format dequantises and unrotates to what the
+    /// checkpoint's source produced, up to the quantizer's own error.
+    /// DEEPSEEK_FILE=.../deepseek-v41-flash-mls2.malleus DEEPSEEK_CKPT=/models/deepseekv41-flash
+    #[test]
+    #[ignore = "reads the converted file and the checkpoint"]
+    fn the_loader_reads_our_own_file() {
+        let file = std::env::var("DEEPSEEK_FILE").expect("DEEPSEEK_FILE");
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let g = malleus_gguf::gguf::Gguf::open(std::path::Path::new(&file)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        for (name, floor) in [
+            ("layers.0.attn.wq_a.weight", 0.99),
+            ("layers.0.attn.wkv.weight", 0.99),
+            ("layers.0.ffn.experts.0.w1.weight", 0.90),
+            ("layers.0.ffn.shared_experts.w1.weight", 0.98),
+        ] {
+            let info = g.info(name).unwrap();
+            let (n, k) = (info.shape[0], info.shape[1]);
+            let got = load_matrix(&g, name, n, k).unwrap();
+            let want = load_matrix(&src, name, n, k).unwrap();
+            let cos = compare(name, &got, &want);
+            eprintln!("{name} {:?}: cosine {cos:.7}", info.dtype);
+            assert!(cos > floor, "{name}: {cos} below {floor}");
+        }
     }
 
     /// The text graph against `scripts/deepseek_ref.py`: every stage the reference dumps, on the same weights.

@@ -348,10 +348,15 @@ pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&s
             }
             continue;
         }
+        // A packed fp4 source counts its pairs in the shape: the width the file stores is twice that.
+        let mut shape = info.shape.clone();
+        if info.dtype == DType::I8 {
+            *shape.last_mut().expect("a matrix has a last dimension") *= 2;
+        }
         plan.push(Out::Quant {
             name: name.clone(),
             pick,
-            shape: info.shape.clone(),
+            shape,
             src: name.clone(),
             scale,
         });
