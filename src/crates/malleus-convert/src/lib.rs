@@ -12,6 +12,7 @@
 //! - `model.layers.N.mlp.experts.{gate_up_proj,down_proj}` (Ling-3.0-flash): the per-expert tensors fused into one
 //!   [E, rows, K] tensor per layer; in `gate_up` the gate rows of each expert come before its up rows (ADR 0002).
 
+pub mod deepseek;
 pub mod dequant;
 
 use anyhow::{Context, Result, bail, ensure};
