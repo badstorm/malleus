@@ -1234,6 +1234,41 @@ mod tests {
         }
     }
 
+    /// A sample across the stack, through the loader: every layer has its own rotation and its own scales, and
+    /// the indexed layers carry a compressor and an indexer the first two do not. The Engram tables are not
+    /// part of this: they are 98.31B elements and are read a row at a time, never as a matrix.
+    /// DEEPSEEK_FILE=.../deepseek-v41-flash-mls2.malleus DEEPSEEK_CKPT=/models/deepseekv41-flash
+    #[test]
+    #[ignore = "reads the converted file and the checkpoint"]
+    fn a_sample_across_the_stack_round_trips() {
+        let file = std::env::var("DEEPSEEK_FILE").expect("DEEPSEEK_FILE");
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let g = malleus_gguf::gguf::Gguf::open(std::path::Path::new(&file)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let mut checked = 0;
+        for layer in [0usize, 1, 2, 5, 20, 39] {
+            for (suffix, floor) in [
+                ("attn.wq_a.weight", 0.999),
+                ("attn.wkv.weight", 0.999),
+                ("ffn.experts.0.w1.weight", 0.93),
+                ("ffn.experts.0.w2.weight", 0.93),
+                ("ffn.shared_experts.w1.weight", 0.99),
+            ] {
+                let name = format!("layers.{layer}.{suffix}");
+                let (n, k) = {
+                    let i = g.info(&name).unwrap();
+                    (i.shape[0], i.shape[1])
+                };
+                let got = load_matrix(&g, &name, n, k).unwrap();
+                let want = load_matrix(&src, &name, n, k).unwrap();
+                let cos = compare(&name, &got, &want);
+                assert!(cos > floor, "{name}: {cos} below {floor}");
+                checked += 1;
+            }
+        }
+        eprintln!("{checked} tensors across six layers agree with the checkpoint");
+    }
+
     /// The text graph against `scripts/deepseek_ref.py`: every stage the reference dumps, on the same weights.
     #[test]
     #[ignore = "needs the tiny reference dump"]
