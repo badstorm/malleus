@@ -1391,6 +1391,10 @@ pub struct Cache {
 /// Rows of target state the MTP head keeps: a verify is at most `GEMV_MAX_T` tokens, plus the bonus one.
 pub const DRAFT_ROWS: usize = crate::weights::GEMV_MAX_T + 1;
 
+/// Tokens a prefill chunk of this model carries: the scheduler feeds the prompt in pieces of this size, and the
+/// sliding cache's ring is sized for one (`window + PREFILL_CHUNK + DRAFT_ROWS + 1`).
+pub const PREFILL_CHUNK: usize = 512;
+
 impl Cache {
     pub fn new(model: &Model, max_ctx: usize) -> Result<Self> {
         let c = &model.cfg;
@@ -1413,8 +1417,14 @@ impl Cache {
             .collect();
         let mut out = Vec::with_capacity(slots);
         for &is_full in full.iter() {
-            // A sliding layer reads at most its window back, so the rest of the cache would never be read again.
-            let ring = if is_full { 0 } else { i.window + DRAFT_ROWS + 1 };
+            // A sliding layer reads at most its window back, so the rest of the cache would never be read again. The
+            // ring holds a whole prefill chunk on top of the window: a chunk writes all its keys before it attends,
+            // so a smaller ring would clobber keys the chunk's own first rows still see.
+            let ring = if is_full {
+                0
+            } else {
+                i.window + PREFILL_CHUNK + DRAFT_ROWS + 1
+            };
             let rows = if ring > 0 { ring.min(max_ctx) } else { max_ctx };
             out.push(Slot {
                 k: DeviceBuffer::alloc(rows * kvd * 2)?,
@@ -2014,7 +2024,43 @@ impl Graph {
             Some(p) if p.pos > 0 => t,
             _ => 0,
         };
-        if cached > 0 {
+        if cached >= 16 && wmma_attention(hd) {
+            // A prompt chunk that continues a session: the tile reads the cache instead of the chunk's own keys, so a
+            // long prompt is processed in pieces at the tiled kernel's speed. The rows of a *verify* stay on the
+            // per-row path below (it is at most six rows): bit-identity with the serial step is what `spec-exact`
+            // checks, and the serial step is a one-token call.
+            let p = place.as_ref().context("cache chunk without a slot")?;
+            if std::env::var_os("MALLEUS_INKLING2_CHUNK_DEBUG").is_some() {
+                eprintln!(
+                    "chunk tile: layer {l} pos {} t {t} rows {} ring {} window {window} qlast {}",
+                    p.pos,
+                    p.slot.rows,
+                    p.slot.ring,
+                    p.pos + t - 1
+                );
+            }
+            attn_wmma(
+                model,
+                st,
+                &self.attn_out,
+                &self.q,
+                &self.k,
+                &self.v,
+                Some((&p.slot.k, &p.slot.v, p.slot.rows, p.slot.ring, p.pos)),
+                &self.r,
+                &layer.rel_logits,
+                &self.sink,
+                &self.gate,
+                t,
+                heads,
+                kv,
+                hd,
+                d_rel,
+                i.rel_extent,
+                window,
+                scale,
+            )?;
+        } else if cached > 0 {
             // Row by row through the one-token kernels: the row of a verify is then computed by the same code that
             // computes it one step at a time, which is what makes the verify bit-identical.
             let p = place.as_ref().context("cache row without a slot")?;
@@ -3182,11 +3228,12 @@ fn attn(
 ) -> Result<()> {
     // The tensor-core tile is the same block shape (16 query rows of one head) with the dots on WMMA: Q, K and V go
     // through fp16, the bias is still added in fp32. `MALLEUS_INKLING2_ATTN_F32=1` keeps the fp32 kernel for an A/B.
-    let wmma = dim == 128 && std::env::var_os("MALLEUS_INKLING2_ATTN_F32").is_none();
-    model
-        .k
-        .get(if wmma { "inkling2_attn_wmma" } else { "inkling2_attn" })
-        .launch(
+    if wmma_attention(dim) {
+        attn_wmma(
+            model, st, out, q, k, v, None, rel, proj, sink, gate, t, heads, nkv, dim, d_rel, extent, window, scale,
+        )
+    } else {
+        model.k.get("inkling2_attn").launch(
             ((t.div_ceil(16) * heads) as u32, 1, 1),
             (128, 1, 1),
             0,
@@ -3210,6 +3257,76 @@ fn attn(
                 scale.into(),
             ],
         )?;
+        Ok(())
+    }
+}
+
+/// Whether the tiled attention runs on the tensor cores: the tile holds a head's 128 dims, and the fp32 kernel is
+/// kept for an A/B.
+fn wmma_attention(dim: usize) -> bool {
+    dim == 128 && std::env::var_os("MALLEUS_INKLING2_ATTN_F32").is_none()
+}
+
+/// A tile of the attention: the chunk's own keys and values when `cache` is `None`, the session's fp16 cache
+/// ([rows, nkv, dim], position `p` at row `p % ring` when the layer slides) otherwise.
+#[allow(clippy::too_many_arguments)]
+fn attn_wmma(
+    model: &Model,
+    st: &Stream,
+    out: &DeviceBuffer,
+    q: &DeviceBuffer,
+    k: &DeviceBuffer,
+    v: &DeviceBuffer,
+    cache: Option<(&DeviceBuffer, &DeviceBuffer, usize, usize, usize)>,
+    rel: &DeviceBuffer,
+    proj: &DeviceBuffer,
+    sink: &DeviceBuffer,
+    gate: &DeviceBuffer,
+    t: usize,
+    heads: usize,
+    nkv: usize,
+    dim: usize,
+    d_rel: usize,
+    extent: usize,
+    window: usize,
+    scale: f32,
+) -> Result<()> {
+    let name = if cache.is_some() {
+        "inkling2_attn_wmma_cached"
+    } else {
+        "inkling2_attn_wmma"
+    };
+    let (ck, cv, rows, ring, pos) = cache.unwrap_or((k, v, 0, 0, 0));
+    model.k.get(name).launch(
+        ((t.div_ceil(16) * heads) as u32, 1, 1),
+        (128, 1, 1),
+        0,
+        st,
+        &[
+            out.into(),
+            q.into(),
+            // Without a cache the kernels read this call's own keys and values; with one they are not read at all.
+            k.into(),
+            v.into(),
+            ck.into(),
+            cv.into(),
+            rows.into(),
+            ring.into(),
+            pos.into(),
+            rel.into(),
+            proj.into(),
+            sink.into(),
+            gate.into(),
+            t.into(),
+            heads.into(),
+            nkv.into(),
+            dim.into(),
+            d_rel.into(),
+            extent.into(),
+            window.into(),
+            scale.into(),
+        ],
+    )?;
     Ok(())
 }
 

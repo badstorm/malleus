@@ -536,10 +536,11 @@ pub fn sample_spec(logits: &[f32], s: &Sampling, draft: u32, rng: &mut impl FnMu
 /// Prompt tokens per forward (MALLEUS_PREFILL_CHUNK overrides): larger chunks read the MoE expert weights fewer
 /// times per token, at the cost of scratch memory.
 fn prefill_chunk(model: &Model) -> usize {
-    // Inkling-2 attends over the whole prompt inside one forward: a second chunk has no key/value to read yet, so
-    // the prompt goes in whole (issue #70, the tiled cached attention is the next increment).
+    // Inkling-2's attention reads the session's cache for the prefix now (`inkling2_attn_wmma_cached`), so a long
+    // prompt can go in pieces: the pieces are what keeps the per-forward scratch bounded, and the sliding cache's
+    // ring is sized for exactly this chunk.
     if model.cfg.family == malleus_model::Family::Inkling2 {
-        return usize::MAX;
+        return malleus_model::inkling2::PREFILL_CHUNK;
     }
     malleus_model::memplan::prefill_chunk(&model.cfg)
 }
