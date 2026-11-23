@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod deepseek;
+pub mod deepseek_vision;
 pub mod dflash;
 pub mod engine;
 pub mod expert_cache;
