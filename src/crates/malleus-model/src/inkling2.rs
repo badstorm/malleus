@@ -1354,7 +1354,9 @@ fn argmax(v: &[f32], n: usize) -> u32 {
 /// two extra passes over the core (`n_layers + (passes - 1) * core`). Keys and values are fp32 like the rest of the
 /// graph; at 24 heads x 8 KV heads x 128 that is 8 KiB per token per slot (393 KiB per token over the 48 slots).
 pub struct Slot {
-    /// [`rows`, kv_heads * head_dim] fp32, the keys after the convolution, the clip and the L2 norm.
+    /// [`rows`, kv_heads * head_dim] fp16, the keys after the convolution, the clip and the L2 norm: half the bytes
+    /// of fp32 and the same rounding the reference uses for its own cache. The convolution histories below stay
+    /// fp32 — they are inputs, not the cache.
     k: DeviceBuffer,
     v: DeviceBuffer,
     /// Rows of `k`/`v`, and the ring they are indexed with: a sliding layer only ever reads the last `window` keys,
@@ -1415,8 +1417,8 @@ impl Cache {
             let ring = if is_full { 0 } else { i.window + DRAFT_ROWS + 1 };
             let rows = if ring > 0 { ring.min(max_ctx) } else { max_ctx };
             out.push(Slot {
-                k: f32s(rows * kvd)?,
-                v: f32s(rows * kvd)?,
+                k: DeviceBuffer::alloc(rows * kvd * 2)?,
+                v: DeviceBuffer::alloc(rows * kvd * 2)?,
                 rows,
                 ring: if rows == max_ctx { 0 } else { rows },
                 // Zeroed: the taps before the first token are the reference's left padding.
@@ -1483,31 +1485,6 @@ struct Place<'a> {
 
 /// Keeps the last three rows of a convolution's input in `past` ([3, C], oldest first), so the next call convolves
 /// across the boundary. `pos` is the position of the first row of `x`; rows before the sequence stay zero.
-/// Writes `t` rows of a layer's keys (or values) at logical position `pos`, into the slot's ring when it has one:
-/// only the last `ring` rows survive a chunk longer than the ring, and the copy that crosses the end is split in two.
-fn kv_write(
-    dst: &DeviceBuffer,
-    capacity: usize,
-    ring: usize,
-    pos: usize,
-    t: usize,
-    src: &DeviceBuffer,
-    c: usize,
-    st: &Stream,
-) -> Result<()> {
-    // A ring keeps the last `capacity` rows of a chunk; without one every row of it fits (`capacity` is the context).
-    let rows = t.min(capacity);
-    let first = pos + t - rows;
-    let start = if ring > 0 { first % ring } else { first };
-    let upto = if ring > 0 { ring } else { capacity };
-    let n = (upto - start).min(rows);
-    dst.copy_from_shared(start * c * 4, src, (first - pos) * c * 4, n * c * 4, st)?;
-    if n < rows {
-        dst.copy_from_shared(0, src, (first - pos + n) * c * 4, (rows - n) * c * 4, st)?;
-    }
-    Ok(())
-}
-
 fn keep_last3(st: &Stream, past: &DeviceBuffer, x: &DeviceBuffer, pos: usize, t: usize, c: usize) -> Result<()> {
     for i in 0..3 {
         // The row of the new history is global position pos + t - 3 + i: from `x` when the call has it, from the old
@@ -2009,8 +1986,23 @@ impl Graph {
         clip(model, st, &self.r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
         // The keys and values of this layer, as attention reads them, across every position the session holds.
         if let Some(p) = place.as_mut() {
-            kv_write(&p.slot.k, p.slot.rows, p.slot.ring, p.pos, t, &self.k, kvd, st)?;
-            kv_write(&p.slot.v, p.slot.rows, p.slot.ring, p.pos, t, &self.v, kvd, st)?;
+            for (dst, src) in [(&p.slot.k, &self.k), (&p.slot.v, &self.v)] {
+                model.k.get("inkling2_kv_store").launch(
+                    ((t * kvd).div_ceil(256) as u32, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    st,
+                    &[
+                        dst.into(),
+                        src.into(),
+                        p.pos.into(),
+                        t.into(),
+                        p.slot.rows.into(),
+                        p.slot.ring.into(),
+                        kvd.into(),
+                    ],
+                )?;
+            }
         }
         let window = if full { 0 } else { i.window };
         let scale = 1.0 / (hd as f32).sqrt();
