@@ -165,7 +165,7 @@ impl EngramState {
                     let src = compressed[i - shift];
                     (if src == -1 { pad } else { src }, src == -1)
                 };
-                let product = if blocked { pad } else { token } as i64 * self.multipliers[layer][shift];
+                let product = (if blocked { pad } else { token }) * self.multipliers[layer][shift];
                 if shift == 0 {
                     rolling = product;
                 } else {
