@@ -339,8 +339,19 @@ impl Weights {
         let embed = load_matrix(src, "embed.weight", c.vocab, h)?;
         let head = load_matrix(src, "head.weight", c.vocab, h)?;
         let norm = load_vector(src, "norm.weight", h)?;
+        // A slice of the stack, for a stage-by-stage comparison against the reference: `MALLEUS_DEEPSEEK_LAYERS=0`
+        // loads layer 0 alone and the forward then runs embed -> that block -> norm -> head.
+        let only: Option<Vec<usize>> = std::env::var("MALLEUS_DEEPSEEK_LAYERS").ok().map(|s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse().ok())
+                .collect::<Vec<usize>>()
+        });
         let mut layers = Vec::with_capacity(n);
         for i in 0..n {
+            if only.as_ref().is_some_and(|l| !l.contains(&i)) {
+                progress(i + 1, n);
+                continue;
+            }
             let p = |s: &str| format!("layers.{i}.{s}");
             let hc = |which: &str| -> Result<Hc> {
                 Ok(Hc {
@@ -478,6 +489,36 @@ impl Weights {
         })
     }
 
+    /// Runs the attention of one loaded layer on an already-normed input. This is the stage gate for the
+    /// compressors, the two-level indexer and the sparse attention, which the whole-graph comparison cannot
+    /// isolate: an isolated layer is fed a fixed input on both sides.
+    pub fn attention_stage(&self, index: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+        let l = self.layers.get(index).context("no such layer loaded")?;
+        let mut shared = Shared::default();
+        let mut hook = |_: &str, _: &[f32]| Ok(());
+        self.attention(l, x, t, &mut shared, &mut hook, index)
+    }
+
+    /// Parameters held on the host, for the load report.
+    pub fn parameters(&self) -> usize {
+        let lin = |l: &Lin| l.n * l.k;
+        let mut t = self.embed.len() + self.head.len() + self.norm.len();
+        for l in &self.layers {
+            t += lin(&l.attn.wq_a)
+                + lin(&l.attn.wq_b)
+                + lin(&l.attn.wkv)
+                + lin(&l.attn.wo_a)
+                + lin(&l.attn.wo_b)
+                + lin(&l.moe.gate)
+                + (l.moe.bias.len());
+            for (a, b, c) in &l.moe.experts {
+                t += lin(a) + lin(b) + lin(c);
+            }
+            t += lin(&l.moe.shared.0) + lin(&l.moe.shared.1) + lin(&l.moe.shared.2);
+        }
+        t
+    }
+
     /// Bytes held on the host.
     pub fn bytes(&self) -> usize {
         fn lin(l: &Lin) -> usize {
@@ -548,7 +589,8 @@ impl Hc {
             flat[i * hd..(i + 1) * hd].copy_from_slice(&h[i * hd..(i + 1) * hd]);
         }
         let mix_n = (2 + hc) * hc;
-        let mut mixes = linear(&flat, t, hd, &self.f, mix_n, Some(&self.base));
+        // No bias here: the reference adds `hc_base` inside the split, on each coefficient's own scale.
+        let mut mixes = linear(&flat, t, hd, &self.f, mix_n, None);
         // one statistic per token over the whole flattened stream
         for i in 0..t {
             let row = &flat[i * hd..(i + 1) * hd];
@@ -628,22 +670,51 @@ fn hc_pre(h: &[f32], pre: &[f32], t: usize, hc: usize, hidden: usize) -> Vec<f32
     out
 }
 
-/// Expand a sub-layer output back over the streams and mix the residual in.
+/// Expand a sub-layer output back over the streams and mix the residual in: `y[e] = post[e] * x + Σ_c comb[c, e] *
+/// residual[c]`, which is the reference's `post.unsqueeze(-1) * x.unsqueeze(-2) + sum(comb.unsqueeze(-1) *
+/// residual.unsqueeze(-2), dim=2)`: the surviving index of that sum is comb's *second* stream, so the output
+/// stream is its column while the sum runs over its rows.
 fn hc_post(x: &[f32], res: &[f32], post: &[f32], comb: &[f32], t: usize, hc: usize, hidden: usize) -> Vec<f32> {
     let mut out = vec![0f32; t * hc * hidden];
     for i in 0..t {
-        for c in 0..hc {
-            let p = post[i * hc + c];
+        for e in 0..hc {
+            let p = post[i * hc + e];
             for d in 0..hidden {
                 let mut v = p * x[i * hidden + d];
-                for e in 0..hc {
-                    v += comb[(i * hc + c) * hc + e] * res[(i * hc + e) * hidden + d];
+                for c in 0..hc {
+                    v += comb[(i * hc + c) * hc + e] * res[(i * hc + c) * hidden + d];
                 }
-                out[(i * hc + c) * hidden + d] = v;
+                out[(i * hc + e) * hidden + d] = v;
             }
         }
     }
     out
+}
+
+/// The inverse frequencies of a rotary dimension, with the YaRN blend the checkpoint was trained with.
+///
+/// `original` is the context the model was trained on: when it is non-zero, the dimensions whose wavelength is
+/// longer than `beta_fast` turns of that context are divided by `factor`, those shorter than `beta_slow` are
+/// left alone, and the band between the two fades linearly. The reference applies it to the compressed layers'
+/// base only; the window layers rotate at their own base with no extrapolation.
+fn rope_inv(rope: usize, theta: f32, original: usize, factor: f32, beta_fast: f32, beta_slow: f32) -> Vec<f32> {
+    let half = rope / 2;
+    let mut inv: Vec<f32> = (0..half)
+        .map(|j| 1.0 / theta.powf(2.0 * j as f32 / rope as f32))
+        .collect();
+    if original > 0 && factor > 1.0 {
+        let (o, t) = (original as f32, theta);
+        let corrected =
+            |rotations: f32| rope as f32 * (o / (rotations * 2.0 * std::f32::consts::PI)).ln() / (2.0 * t.ln());
+        let low = corrected(beta_fast).floor().max(0.0);
+        let high = corrected(beta_slow).ceil().min(rope as f32 - 1.0);
+        for (j, f) in inv.iter_mut().enumerate() {
+            let ramp = ((j as f32 - low) / (high - low).max(1e-3)).clamp(0.0, 1.0);
+            let smooth = 1.0 - ramp;
+            *f = *f / factor * (1.0 - smooth) + *f * smooth;
+        }
+    }
+    inv
 }
 
 /// RoPE in place on the last `rope` values of every row of an `[rows, row]` matrix (interleaved pairs).
@@ -652,19 +723,16 @@ fn rope_rows(
     rows: usize,
     row: usize,
     rope: usize,
-    theta: f32,
+    inv: &[f32],
     pos: impl Fn(usize) -> f32,
     inverse: bool,
 ) {
     let half = rope / 2;
-    let inv: Vec<f32> = (0..half)
-        .map(|j| 1.0 / theta.powf(2.0 * j as f32 / rope as f32))
-        .collect();
     for i in 0..rows {
         let p = pos(i);
         let base = i * row + row - rope;
-        for j in 0..half {
-            let angle = p * inv[j];
+        for (j, &f) in inv.iter().enumerate().take(half) {
+            let angle = p * f;
             let (s, c) = (angle.sin(), angle.cos());
             let s = if inverse { -s } else { s };
             let (a, b) = (x[base + 2 * j], x[base + 2 * j + 1]);
@@ -675,8 +743,8 @@ fn rope_rows(
 }
 
 /// The same on the tail of every head of a `[t, heads, head_dim]` tensor: the reference rotates `x[..., -rope:]`.
-fn rope_heads(x: &mut [f32], t: usize, heads: usize, head_dim: usize, rope: usize, theta: f32, inverse: bool) {
-    rope_rows(x, t * heads, head_dim, rope, theta, |i| (i / heads) as f32, inverse);
+fn rope_heads(x: &mut [f32], t: usize, heads: usize, head_dim: usize, rope: usize, inv: &[f32], inverse: bool) {
+    rope_rows(x, t * heads, head_dim, rope, inv, |i| (i / heads) as f32, inverse);
 }
 
 /// The sliding-window slots each query reads during a prefill of `t` tokens.
@@ -827,9 +895,10 @@ impl Weights {
             // FFN: its own mixes, and the pre-mix the attention just produced.
             let fm = l.hc_ffn.mixes(&h, t, h_dim, hc, d.hc_iters, d.hc_eps);
             let x = hc_pre(&h, &am.pre, t, hc, h_dim);
+            hook(&format!("ffn_premix{layer}"), &x)?;
             let mut xn = x.clone();
             rmsnorm(&mut xn, h_dim, &l.ffn_norm, self.eps);
-            let ffn_out = moe(&l.moe, &xn, t, h_dim, d, None)?;
+            let ffn_out = moe(&l.moe, &xn, t, h_dim, d, None, &mut hook, layer)?;
             h = hc_post(&ffn_out, &h, &fm.post, &fm.comb, t, hc, h_dim);
             hook(&format!("ffn{layer}"), &ffn_out)?;
             pre_mix = fm.pre;
@@ -855,19 +924,26 @@ impl Weights {
         let d = &self.c;
         let a = &l.attn;
         let (heads, hd, rd) = (a.heads, a.head_dim, a.rope);
-        // The window layers rotate at the plain base, the compressed ones at the longer one.
-        let theta = if a.ratio > 0 {
-            d.rope_params.compress_theta
+        // The window layers rotate at the plain base, the compressed ones at the longer one, with YaRN.
+        let inv = if a.ratio > 0 {
+            rope_inv(
+                rd,
+                d.rope_params.compress_theta,
+                d.rope_params.original_seq,
+                d.rope_params.factor,
+                d.rope_params.beta_fast,
+                d.rope_params.beta_slow,
+            )
         } else {
-            d.rope_params.theta
+            rope_inv(rd, d.rope_params.theta, 0, 1.0, 0.0, 0.0)
         };
         let mut qr = a.wq_a.mat(x, t);
         rmsnorm(&mut qr, a.q_lora, &a.q_norm, self.eps);
         let mut q = a.wq_b.mat(&qr, t);
-        rope_heads(&mut q, t, heads, hd, rd, theta, false);
+        rope_heads(&mut q, t, heads, hd, rd, &inv, false);
         let mut kv = a.wkv.mat(x, t);
         rmsnorm(&mut kv, hd, &a.kv_norm, self.eps);
-        rope_rows(&mut kv, t, hd, rd, theta, |i| i as f32, false);
+        rope_rows(&mut kv, t, hd, rd, &inv, |i| i as f32, false);
         let (win, wm) = window_idxs(t, d.window);
         let mut kv_all = kv.clone();
         let mut n_kv = t;
@@ -888,6 +964,7 @@ impl Weights {
                             t,
                             hd,
                             rd,
+                            &inv,
                             d,
                             shared,
                             self.eps,
@@ -900,7 +977,7 @@ impl Weights {
                             .context("an indexed layer without a published top-k list")?,
                     };
                     let mut rotated = lat;
-                    rope_rows(&mut rotated, groups, hd, rd, theta, |i| (i * a.ratio) as f32, false);
+                    rope_rows(&mut rotated, groups, hd, rd, &inv, |i| (i * a.ratio) as f32, false);
                     shared.compress_kv = rotated;
                     shared.compress_len = groups;
                     hook(&format!("ckv{layer}"), &shared.compress_kv)?;
@@ -909,7 +986,7 @@ impl Weights {
                 None => {
                     // Not a source: read what the source with this ratio published.
                     let cidxs = match &a.indexer {
-                        Some(ix) => indexer(ix, x, &qr, None, 0, t, hd, rd, d, shared, self.eps, hook, layer)?,
+                        Some(ix) => indexer(ix, x, &qr, None, 0, t, hd, rd, &inv, d, shared, self.eps, hook, layer)?,
                         None => shared
                             .topk
                             .clone()
@@ -954,12 +1031,19 @@ impl Weights {
     /// The grouped output projection: `wo_a` is block-diagonal over the head groups, then `wo_b`.
     fn out_projection(&self, a: &Attn, mut o: Vec<f32>, t: usize) -> Vec<f32> {
         let (heads, hd, rd) = (a.heads, a.head_dim, a.rope);
-        let theta = if a.ratio > 0 {
-            self.c.rope_params.compress_theta
+        let inv = if a.ratio > 0 {
+            rope_inv(
+                rd,
+                self.c.rope_params.compress_theta,
+                self.c.rope_params.original_seq,
+                self.c.rope_params.factor,
+                self.c.rope_params.beta_fast,
+                self.c.rope_params.beta_slow,
+            )
         } else {
-            self.c.rope_params.theta
+            rope_inv(rd, self.c.rope_params.theta, 0, 1.0, 0.0, 0.0)
         };
-        rope_heads(&mut o, t, heads, hd, rd, theta, true);
+        rope_heads(&mut o, t, heads, hd, rd, &inv, true);
         let per_group = heads * hd / a.o_groups;
         let mut g = vec![0f32; t * a.o_groups * a.o_lora];
         for i in 0..t {
@@ -1027,6 +1111,7 @@ fn indexer(
     t: usize,
     _hd: usize,
     rd: usize,
+    inv: &[f32],
     d: &DeepseekConfig,
     shared: &mut Shared,
     eps: f32,
@@ -1034,7 +1119,6 @@ fn indexer(
     layer: usize,
 ) -> Result<Vec<i32>> {
     let (heads, dim) = (ix.heads, ix.dim);
-    let theta = d.rope_params.compress_theta;
     if ix.owns_k {
         let rows = groups;
         let mut k = match (&ix.wk, latent) {
@@ -1042,7 +1126,7 @@ fn indexer(
             _ => bail!("an index-key owner without a latent"),
         };
         rmsnorm(&mut k, dim, ix.k_norm.as_ref().expect("the owner has a key norm"), eps);
-        rope_rows(&mut k, rows, dim, rd, theta, |i| (i * ix.ratio) as f32, false);
+        rope_rows(&mut k, rows, dim, rd, inv, |i| (i * ix.ratio) as f32, false);
         shared.index_k = k;
         shared.index_len = rows;
         hook(&format!("ixk{layer}"), &shared.index_k)?;
@@ -1050,7 +1134,7 @@ fn indexer(
     let n_ix = shared.index_len;
     ensure!(n_ix > 0, "the indexer has no keys");
     let mut q = ix.wq_b.mat(qr, t);
-    rope_heads(&mut q, t, heads, dim, rd, theta, false);
+    rope_heads(&mut q, t, heads, dim, rd, inv, false);
     let w = ix.weights_proj.mat(x, t);
     let scale = (dim as f32).powf(-0.5) * (heads as f32).powf(-0.5);
 
@@ -1111,6 +1195,7 @@ fn indexer(
 }
 
 /// The FFN: `top_k` routed experts plus the shared one, both under the SwiGLU clamps.
+#[allow(clippy::too_many_arguments)]
 fn moe(
     m: &Moe,
     x: &[f32],
@@ -1118,11 +1203,21 @@ fn moe(
     hidden: usize,
     d: &DeepseekConfig,
     image_mask: Option<&[bool]>,
+    hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
+    layer: usize,
 ) -> Result<Vec<f32>> {
     let experts = m.experts.len();
+    hook(&format!("ffn_in{layer}"), x)?;
     let mut scores = linear(x, t, hidden, &m.gate.w, experts, None);
     for v in scores.iter_mut() {
-        *v = (v.exp() + 1.0).ln().sqrt(); // sqrt(softplus(x))
+        // sqrt(softplus(x)), with torch's threshold: above 20 the exponential would only add noise (and
+        // overflow past 88), so softplus is the identity there.
+        let x = *v;
+        *v = if x > 20.0 {
+            x.sqrt()
+        } else {
+            (1.0 + x.exp()).ln().sqrt()
+        };
     }
     // The bias steers the selection only; the weights come from the raw scores.
     let mut out = vec![0f32; t * hidden];
@@ -1232,6 +1327,122 @@ mod tests {
             eprintln!("{name} {:?}: cosine {cos:.7}", info.dtype);
             assert!(cos > floor, "{name}: {cos} below {floor}");
         }
+    }
+
+    /// Layer 0 on the checkpoint's own weights, against `scripts/deepseek_ref_layer.py`: the embedding, the
+    /// attention output, the MoE output, the block output and the logits. `MALLEUS_DEEPSEEK_LAYERS=0` makes the
+    /// loader keep one layer, which is what the reference runs.
+    ///
+    ///   MALLEUS_DEEPSEEK_LAYERS=0 DEEPSEEK_CKPT=/models/deepseekv41-flash DEEPSEEK_REF_LAYER=/golden/deepseek-ref/layer0
+    #[test]
+    #[ignore = "loads one real layer (54 GB) and compares against the reference"]
+    fn layer_zero_matches_the_reference_on_the_real_weights() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let dir = std::env::var("DEEPSEEK_REF_LAYER").expect("DEEPSEEK_REF_LAYER");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&ckpt)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let t0 = std::time::Instant::now();
+        let w = Weights::load(&src, &c, &|_, _| {}).unwrap();
+        assert_eq!(w.layers.len(), 1, "set MALLEUS_DEEPSEEK_LAYERS=0");
+        eprintln!(
+            "loaded {:.1}B parameters in {:.0}s",
+            w.parameters() as f64 / 1e9,
+            t0.elapsed().as_secs_f64()
+        );
+        let mut worst = 1.0f64;
+        let logits = w
+            .forward_with(&ids, |name, values| {
+                let path = format!("{dir}/{name}.f32");
+                if std::path::Path::new(&path).exists() {
+                    let cos = compare(name, values, &f32_file(&path));
+                    worst = worst.min(cos);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let cos = compare("logits_all", &logits, &f32_file(&format!("{dir}/logits_all.f32")));
+        eprintln!("layer 0: worst stage {worst:.6}, logits {cos:.6}");
+        assert!(worst > 0.999, "a stage diverges: {worst}");
+        assert!(cos > 0.999, "the logits diverge: {cos}");
+    }
+
+    /// An isolated layer's attention against the reference: the compressor, the indexer and the sparse attention
+    /// on the checkpoint's own weights. `MALLEUS_DEEPSEEK_LAYERS=<layer>` loads that layer alone.
+    ///
+    ///   MALLEUS_DEEPSEEK_LAYERS=2 DEEPSEEK_CKPT=/models/deepseekv41-flash DEEPSEEK_REF_LAYER=/golden/deepseek-ref/layer2
+    #[test]
+    #[ignore = "loads one real layer and compares against the reference"]
+    fn an_isolated_layer_attention_matches() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let dir = std::env::var("DEEPSEEK_REF_LAYER").expect("DEEPSEEK_REF_LAYER");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let layer: usize = std::env::var("DEEPSEEK_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let x = f32_file(&format!("{dir}/x{layer}.f32"));
+        let c = Config::from_hf(std::path::Path::new(&ckpt)).unwrap();
+        let d = c.deepseek.as_ref().unwrap().clone();
+        let hc = d.hc_mult;
+        let t = x.len() / (hc * c.hidden);
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let w = Weights::load(&src, &c, &|_, _| {}).unwrap();
+        assert_eq!(w.layers.len(), 1, "set MALLEUS_DEEPSEEK_LAYERS={layer}");
+        // The reference normalises the collapsed streams before the attention; the same here.
+        let mut xn = hc_pre(&x, &identity_mix(t, hc), t, hc, c.hidden);
+        rmsnorm(&mut xn, c.hidden, &w.layers[0].attn_norm, w.eps);
+        let got = w.attention_stage(0, &xn, t).unwrap();
+        let cos = compare(
+            &format!("attn{layer}"),
+            &got,
+            &f32_file(&format!("{dir}/attn{layer}.f32")),
+        );
+        assert!(cos > 0.999, "attn{layer} diverges: {cos}");
+        let _ = manifest;
+    }
+
+    /// A sample across the stack, through the loader: every layer has its own rotation and its own scales, and
+    /// the indexed layers carry a compressor and an indexer the first two do not. The Engram tables are not
+    /// part of this: they are 98.31B elements and are read a row at a time, never as a matrix.
+    /// DEEPSEEK_FILE=.../deepseek-v41-flash-mls2.malleus DEEPSEEK_CKPT=/models/deepseekv41-flash
+    #[test]
+    #[ignore = "reads the converted file and the checkpoint"]
+    fn a_sample_across_the_stack_round_trips() {
+        let file = std::env::var("DEEPSEEK_FILE").expect("DEEPSEEK_FILE");
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let g = malleus_gguf::gguf::Gguf::open(std::path::Path::new(&file)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let mut checked = 0;
+        for layer in [0usize, 1, 2, 5, 20, 39] {
+            for (suffix, floor) in [
+                ("attn.wq_a.weight", 0.999),
+                ("attn.wkv.weight", 0.999),
+                ("ffn.experts.0.w1.weight", 0.93),
+                ("ffn.experts.0.w2.weight", 0.93),
+                ("ffn.shared_experts.w1.weight", 0.99),
+            ] {
+                let name = format!("layers.{layer}.{suffix}");
+                let (n, k) = {
+                    let i = g.info(&name).unwrap();
+                    (i.shape[0], i.shape[1])
+                };
+                let got = load_matrix(&g, &name, n, k).unwrap();
+                let want = load_matrix(&src, &name, n, k).unwrap();
+                let cos = compare(&name, &got, &want);
+                assert!(cos > floor, "{name}: {cos} below {floor}");
+                checked += 1;
+            }
+        }
+        eprintln!("{checked} tensors across six layers agree with the checkpoint");
     }
 
     /// The text graph against `scripts/deepseek_ref.py`: every stage the reference dumps, on the same weights.
