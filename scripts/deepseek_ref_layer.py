@@ -76,6 +76,8 @@ def main() -> None:
     ap.add_argument("--reference", required=True, type=Path, help="the directory holding model.py")
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--prompt", default="The capital of France is")
+    ap.add_argument("--layer", type=int, default=0, help="which layer to run in isolation")
+    ap.add_argument("--tokens", type=int, default=40, help="positions fed to an isolated layer")
     a = ap.parse_args()
 
     # The graph's two kernels, in torch, exactly as `deepseek_ref.py` does for the tiny model.
@@ -98,7 +100,7 @@ def main() -> None:
         vocab_size=vocab,
         dim=dim,
         moe_inter_dim=t["moe_intermediate_size"],
-        n_layers=1,
+        n_layers=a.layer + 1,
         n_mtp_layers=0,
         n_heads=t["num_attention_heads"],
         n_routed_experts=t["n_routed_experts"],
@@ -115,18 +117,20 @@ def main() -> None:
         o_groups=t["o_groups"],
         o_lora_rank=t["o_lora_rank"],
         window_size=t["sliding_window"],
-        compress_ratios=(0,),
-        kv_source_layers=(),
-        index_source_layers=(),
+        compress_ratios=tuple(t["compress_ratios"][: a.layer + 1]),
+        kv_source_layers=tuple(x for x in t["kv_source_layer_ids"] if x <= a.layer),
+        index_source_layers=tuple(x for x in t["index_source_layer_ids"] if x <= a.layer),
         compress_rope_theta=t["compress_rope_theta"],
         original_seq_len=0,
         rope_theta=t["rope_theta"],
         index_n_heads=t["index_n_heads"],
         index_head_dim=t["index_head_dim"],
         index_topk=t["index_topk"],
-        candidate_source_layer=-1,
-        candidate_topk_blocks=0,
-        candidate_block_size=0,
+        candidate_source_layer=(
+            t["candidate_source_layer_id"] if t["candidate_source_layer_id"] <= a.layer else -1
+        ),
+        candidate_topk_blocks=t["candidate_topk_blocks"],
+        candidate_block_size=t["candidate_block_size"],
         hc_mult=t["hc_mult"],
         hc_sinkhorn_iters=t["hc_sinkhorn_iters"],
         hc_eps=t["hc_eps"],
@@ -147,19 +151,15 @@ def main() -> None:
     state = model.state_dict()
     loaded = 0
     for name in list(state):
-        if name.startswith("layers.0.") or name in ("embed.weight", "norm.weight", "head.weight"):
+        if name.startswith(f"layers.{a.layer}.") or (
+            a.layer == 0 and name in ("embed.weight", "norm.weight", "head.weight")
+        ):
             src = ck.f32(name)
             if tuple(src.shape) != tuple(state[name].shape):
                 raise SystemExit(f"{name}: checkpoint {src.shape} vs module {tuple(state[name].shape)}")
             state[name].copy_(torch.from_numpy(src.reshape(state[name].shape)))
             loaded += 1
     print(f"loaded {loaded} of {len(state)} tensors, {sum(p.numel() for p in model.parameters())/1e9:.1f}B parameters", file=sys.stderr)
-
-    from tokenizers import Tokenizer
-
-    tok = Tokenizer.from_file(str(a.checkpoint / "tokenizer.json"))
-    ids = tok.encode(a.prompt, add_special_tokens=False).ids
-    x = torch.tensor([ids], dtype=torch.int64)
 
     dumps = {}
 
@@ -169,27 +169,49 @@ def main() -> None:
 
         return f
 
-    handles = [model.embed.register_forward_hook(hook("embed"))]
-    for i, layer in enumerate(model.layers):
-        handles.append(layer.register_forward_hook(hook(f"block{i}", lambda o: o[0])))
-        handles.append(layer.attn.register_forward_hook(hook(f"attn{i}")))
-        handles.append(layer.ffn.register_forward_hook(hook(f"ffn{i}")))
-        handles.append(layer.ffn_norm.register_forward_hook(hook(f"ffn_in{i}")))
-        handles.append(
-            layer.ffn_norm.register_forward_hook(
-                lambda _m, inp, _o, i=i: dumps.__setitem__(
-                    f"ffn_premix{i}", inp[0].detach().float().reshape(-1).numpy()
+    hc = args.hc_mult
+    if a.layer != 0:
+        # An isolated layer is run on its own input: the earlier layers are not loaded, so the stack would feed
+        # it zeros. A deterministic input is enough to compare compressors, indexers and attention.
+        g = torch.Generator().manual_seed(1234)
+        x = torch.randn(1, a.tokens, hc, dim, generator=g)
+        layer = model.layers[a.layer]
+        layer.attn.register_forward_hook(hook(f"attn{a.layer}"))
+        layer.register_forward_hook(hook(f"block{a.layer}", lambda o: o[0]))
+        with torch.inference_mode():
+            x = x * 0.02
+            pre = ref.make_identity_pre_mix(x, hc)
+            layer(x, 0, pre, None)
+        dumps[f"x{a.layer}"] = x.detach().float().reshape(-1).numpy()
+        ids = list(range(a.tokens))
+    else:
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_file(str(a.checkpoint / "tokenizer.json"))
+        ids = tok.encode(a.prompt, add_special_tokens=False).ids
+        x = torch.tensor([ids], dtype=torch.int64)
+
+        handles = [model.embed.register_forward_hook(hook("embed"))]
+        for i, layer in enumerate(model.layers):
+            handles.append(layer.register_forward_hook(hook(f"block{i}", lambda o: o[0])))
+            handles.append(layer.attn.register_forward_hook(hook(f"attn{i}")))
+            handles.append(layer.ffn.register_forward_hook(hook(f"ffn{i}")))
+            handles.append(layer.ffn_norm.register_forward_hook(hook(f"ffn_in{i}")))
+            handles.append(
+                layer.ffn_norm.register_forward_hook(
+                    lambda _m, inp, _o, i=i: dumps.__setitem__(
+                        f"ffn_premix{i}", inp[0].detach().float().reshape(-1).numpy()
+                    )
                 )
             )
-        )
-    final = {}
-    handles.append(model.norm.register_forward_hook(lambda _m, _i, o: final.setdefault("h", o.detach().float())))
-    with torch.inference_mode():
-        _ids, logits, _ = model(x, 0)
-        logits_all = model.head(final["h"], full_logits=True)
-    for h in handles:
-        h.remove()
-    dumps["logits_all"] = logits_all.detach().float().reshape(-1).numpy()
+        final = {}
+        handles.append(model.norm.register_forward_hook(lambda _m, _i, o: final.setdefault("h", o.detach().float())))
+        with torch.inference_mode():
+            _ids, logits, _ = model(x, 0)
+            logits_all = model.head(final["h"], full_logits=True)
+        for h in handles:
+            h.remove()
+        dumps["logits_all"] = logits_all.detach().float().reshape(-1).numpy()
     dumps["ids"] = np.array(ids, np.float32)
 
     a.out.mkdir(parents=True, exist_ok=True)

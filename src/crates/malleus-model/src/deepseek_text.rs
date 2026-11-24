@@ -489,6 +489,16 @@ impl Weights {
         })
     }
 
+    /// Runs the attention of one loaded layer on an already-normed input. This is the stage gate for the
+    /// compressors, the two-level indexer and the sparse attention, which the whole-graph comparison cannot
+    /// isolate: an isolated layer is fed a fixed input on both sides.
+    pub fn attention_stage(&self, index: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+        let l = self.layers.get(index).context("no such layer loaded")?;
+        let mut shared = Shared::default();
+        let mut hook = |_: &str, _: &[f32]| Ok(());
+        self.attention(l, x, t, &mut shared, &mut hook, index)
+    }
+
     /// Parameters held on the host, for the load report.
     pub fn parameters(&self) -> usize {
         let lin = |l: &Lin| l.n * l.k;
@@ -1362,6 +1372,42 @@ mod tests {
         eprintln!("layer 0: worst stage {worst:.6}, logits {cos:.6}");
         assert!(worst > 0.999, "a stage diverges: {worst}");
         assert!(cos > 0.999, "the logits diverge: {cos}");
+    }
+
+    /// An isolated layer's attention against the reference: the compressor, the indexer and the sparse attention
+    /// on the checkpoint's own weights. `MALLEUS_DEEPSEEK_LAYERS=<layer>` loads that layer alone.
+    ///
+    ///   MALLEUS_DEEPSEEK_LAYERS=2 DEEPSEEK_CKPT=/models/deepseekv41-flash DEEPSEEK_REF_LAYER=/golden/deepseek-ref/layer2
+    #[test]
+    #[ignore = "loads one real layer and compares against the reference"]
+    fn an_isolated_layer_attention_matches() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let dir = std::env::var("DEEPSEEK_REF_LAYER").expect("DEEPSEEK_REF_LAYER");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let layer: usize = std::env::var("DEEPSEEK_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let x = f32_file(&format!("{dir}/x{layer}.f32"));
+        let c = Config::from_hf(std::path::Path::new(&ckpt)).unwrap();
+        let d = c.deepseek.as_ref().unwrap().clone();
+        let hc = d.hc_mult;
+        let t = x.len() / (hc * c.hidden);
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let w = Weights::load(&src, &c, &|_, _| {}).unwrap();
+        assert_eq!(w.layers.len(), 1, "set MALLEUS_DEEPSEEK_LAYERS={layer}");
+        // The reference normalises the collapsed streams before the attention; the same here.
+        let mut xn = hc_pre(&x, &identity_mix(t, hc), t, hc, c.hidden);
+        rmsnorm(&mut xn, c.hidden, &w.layers[0].attn_norm, w.eps);
+        let got = w.attention_stage(0, &xn, t).unwrap();
+        let cos = compare(
+            &format!("attn{layer}"),
+            &got,
+            &f32_file(&format!("{dir}/attn{layer}.f32")),
+        );
+        assert!(cos > 0.999, "attn{layer} diverges: {cos}");
+        let _ = manifest;
     }
 
     /// A sample across the stack, through the loader: every layer has its own rotation and its own scales, and
