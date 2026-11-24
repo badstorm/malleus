@@ -315,6 +315,118 @@ struct Layer {
     hc_ffn: Hc,
     attn: Attn,
     moe: Moe,
+    engram: Option<Engram>,
+}
+
+/// The Engram memory of one layer, on the host: the rows a position hashes to go through `wkv` into one key per
+/// residual copy plus a shared value, and the gate is a normalised dot of the stream against the key. The table
+/// itself is in the companion file and is read a row at a time, so only the projections are held here.
+pub struct Engram {
+    wkv: Lin,
+    q_weight: Vec<f32>,
+    k_weight: Vec<f32>,
+    /// Table tensor in the companion file, and the position of this layer among `engram_layer_ids` (which is the
+    /// index into the hash ids, not the layer's).
+    table: String,
+    position: usize,
+}
+
+/// What an Engram layer needs on top of the backbone file: the hash ids, already computed, and the companion file
+/// that holds the tables.
+pub struct EngramInput<'a> {
+    /// One `[t, (max_ngram - 1) * heads]` list per table, in `engram_layer_ids` order.
+    pub hash: &'a [Vec<u64>],
+    pub table: &'a dyn TensorSource,
+}
+
+impl Engram {
+    /// The layer's projections, from the backbone. The table is not here: 98.31B rows stay in the companion file.
+    pub fn load(src: &dyn TensorSource, c: &Config, layer: usize) -> Result<Self> {
+        let d = c.deepseek.as_ref().context("no deepseek config")?;
+        let e = d.engram.as_ref().context("the config carries no Engram")?;
+        let position = e
+            .layers
+            .iter()
+            .position(|&l| l == layer)
+            .with_context(|| format!("layer {layer} carries no Engram table"))?;
+        let p = |s: &str| format!("layers.{layer}.engram.{s}");
+        let cols = (e.max_ngram - 1) * e.n_heads * e.head_dim;
+        Ok(Engram {
+            wkv: load_lin(src, &p("wkv.weight"), c.hidden * (d.hc_mult + 1), cols)?,
+            q_weight: load_matrix(src, &p("q_weight"), d.hc_mult, c.hidden)?,
+            k_weight: load_matrix(src, &p("k_weight"), d.hc_mult, c.hidden)?,
+            table: p("embed.weight"),
+            position,
+        })
+    }
+
+    /// Writes the lookup into the streams: `h` is `[t, hc, hidden]`, `hash` is `[t, (max_ngram - 1) * heads]` of
+    /// table rows and `table` is the file holding them.
+    pub fn forward(
+        &self,
+        table: &dyn TensorSource,
+        h: &mut [f32],
+        hash: &[u64],
+        t: usize,
+        hidden: usize,
+        hc: usize,
+        eps: f32,
+    ) -> Result<()> {
+        ensure!(
+            t > 0 && hash.len().is_multiple_of(t) && h.len() == t * hc * hidden,
+            "engram: {} ids and {} values for {t} positions x {hc} copies x {hidden}",
+            hash.len(),
+            h.len()
+        );
+        let cols = hash.len() / t;
+        ensure!(
+            cols > 0 && self.wkv.k.is_multiple_of(cols),
+            "engram: {} projected values for {cols} buckets",
+            self.wkv.k
+        );
+        let head_dim = self.wkv.k / cols;
+        let stride = (hc + 1) * hidden;
+        let clamp = 1e-6f32;
+        let inv_sqrt_hidden = 1.0 / (hidden as f32).sqrt();
+        // A prompt can be a million positions: read and project them a block at a time, so the rows of the lookup
+        // never have to exist all at once.
+        const CHUNK: usize = 1024;
+        let mut out = vec![0f32; h.len()];
+        for (block, chunk) in hash.chunks(CHUNK * cols).enumerate() {
+            let n = chunk.len() / cols;
+            // The rows of those positions, one read each, then the block in one projection.
+            let rows = crate::deepseek_engram::read_rows(table, &self.table, chunk, head_dim)?;
+            let kv = self.wkv.mat(&rows, n);
+            for b in 0..n {
+                let i = block * CHUNK + b;
+                let kv = &kv[b * stride..(b + 1) * stride];
+                let value = &kv[hc * hidden..];
+                for c in 0..hc {
+                    let at = (i * hc + c) * hidden;
+                    let stream = &h[at..at + hidden];
+                    let key = &kv[c * hidden..(c + 1) * hidden];
+                    let weight = &self.q_weight[c * hidden..(c + 1) * hidden];
+                    let kweight = &self.k_weight[c * hidden..(c + 1) * hidden];
+                    let (mut sh, mut sk, mut dot) = (0f32, 0f32, 0f32);
+                    for j in 0..hidden {
+                        sh += stream[j] * stream[j];
+                        sk += key[j] * key[j];
+                        dot += stream[j] * weight[j] * kweight[j] * key[j];
+                    }
+                    // One rstd per copy over `hidden`, not one over the copies: the reference does the same.
+                    let rstd = (1.0 / (sh / hidden as f32 + eps).sqrt()) * (1.0 / (sk / hidden as f32 + eps).sqrt());
+                    let d = dot * rstd * inv_sqrt_hidden;
+                    // Signed sqrt before the sigmoid: the gate keeps the sign of the dot and its loudness.
+                    let gate = 1.0 / (1.0 + (-d.abs().max(clamp).sqrt().copysign(d)).exp());
+                    for j in 0..hidden {
+                        out[at + j] = stream[j] + gate * value[j];
+                    }
+                }
+            }
+        }
+        h.copy_from_slice(&out);
+        Ok(())
+    }
 }
 
 /// Everything the text graph reads, on the host in f32.
@@ -473,6 +585,10 @@ impl Weights {
                 hc_ffn: hc("hc_ffn")?,
                 attn,
                 moe,
+                engram: match &d.engram {
+                    Some(e) if e.layers.contains(&i) => Some(Engram::load(src, c, i)?),
+                    _ => None,
+                },
             });
             progress(i + 1, n);
         }
@@ -502,6 +618,7 @@ impl Weights {
     /// Parameters held on the host, for the load report.
     pub fn parameters(&self) -> usize {
         let lin = |l: &Lin| l.n * l.k;
+        let engram = |e: &Engram| lin(&e.wkv) + e.q_weight.len() + e.k_weight.len();
         let mut t = self.embed.len() + self.head.len() + self.norm.len();
         for l in &self.layers {
             t += lin(&l.attn.wq_a)
@@ -515,6 +632,7 @@ impl Weights {
                 t += lin(a) + lin(b) + lin(c);
             }
             t += lin(&l.moe.shared.0) + lin(&l.moe.shared.1) + lin(&l.moe.shared.2);
+            t += l.engram.as_ref().map_or(0, engram);
         }
         t
     }
@@ -524,6 +642,7 @@ impl Weights {
         fn lin(l: &Lin) -> usize {
             l.w.len() * 4
         }
+        let engram = |e: &Engram| (lin(&e.wkv) + e.q_weight.len() + e.k_weight.len()) * 4;
         let mut t = (self.embed.len() + self.head.len() + self.norm.len()) * 4;
         for l in &self.layers {
             t += lin(&l.attn.wq_a)
@@ -539,6 +658,7 @@ impl Weights {
             for (a, b, c) in &l.moe.experts {
                 t += lin(a) + lin(b) + lin(c);
             }
+            t += l.engram.as_ref().map_or(0, engram);
         }
         t
     }
@@ -859,11 +979,17 @@ fn select_candidate_blocks(
 impl Weights {
     /// One prefill of `ids` at `start_pos == 0`. Returns the logits of every position, `[t, vocab]`.
     pub fn forward(&self, ids: &[u32]) -> Result<Vec<f32>> {
-        self.forward_with(ids, |_, _| Ok(()))
+        self.forward_with(ids, None, |_, _| Ok(()))
     }
 
-    /// The same, calling `hook(name, values)` after each stage the reference dumps.
-    pub fn forward_with(&self, ids: &[u32], mut hook: impl FnMut(&str, &[f32]) -> Result<()>) -> Result<Vec<f32>> {
+    /// The same, calling `hook(name, values)` after each stage the reference dumps. A stack with an Engram layer
+    /// needs `engram`: the hash ids and the companion file that holds the tables.
+    pub fn forward_with(
+        &self,
+        ids: &[u32],
+        engram: Option<&EngramInput>,
+        mut hook: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
         let d = &self.c;
         let (h_dim, hc, t) = (self.hidden, d.hc_mult, ids.len());
         ensure!(t > 0, "an empty prompt");
@@ -883,6 +1009,17 @@ impl Weights {
         let mut pre_mix = identity_mix(t, hc);
         let mut shared = Shared::default();
         for (layer, l) in self.layers.iter().enumerate() {
+            // The Engram lookup is written into the streams before the block's own sub-layers.
+            if let Some(e) = &l.engram {
+                let input = engram
+                    .context("this stack carries an Engram table: it needs its hash ids and its companion file")?;
+                let hash = input
+                    .hash
+                    .get(e.position)
+                    .with_context(|| format!("engram: no hash ids for table {}", e.position))?;
+                e.forward(input.table, &mut h, hash, t, h_dim, hc, self.eps)?;
+                hook(&format!("engram{layer}"), &h)?;
+            }
             // Attention: its mixes come from the streams, the pre-mix from the previous sub-layer.
             let am = l.hc_attn.mixes(&h, t, h_dim, hc, d.hc_iters, d.hc_eps);
             let x = hc_pre(&h, &pre_mix, t, hc, h_dim);
@@ -1271,6 +1408,8 @@ fn expert(w1: &Lin, w2: &Lin, w3: &Lin, x: &[f32], limit: f32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deepseek_engram::EngramState;
+    use malleus_gguf::gguf::Gguf;
     use malleus_gguf::safetensors::SafeTensors;
 
     fn f32_file(path: &str) -> Vec<f32> {
@@ -1359,7 +1498,7 @@ mod tests {
         );
         let mut worst = 1.0f64;
         let logits = w
-            .forward_with(&ids, |name, values| {
+            .forward_with(&ids, None, |name, values| {
                 let path = format!("{dir}/{name}.f32");
                 if std::path::Path::new(&path).exists() {
                     let cos = compare(name, values, &f32_file(&path));
@@ -1466,7 +1605,7 @@ mod tests {
         let mut worst: Vec<(String, f64)> = Vec::new();
         let mut last_topk: Vec<f32> = Vec::new();
         let logits = w
-            .forward_with(&ids, |name, values| {
+            .forward_with(&ids, None, |name, values| {
                 if name.starts_with("topk") {
                     last_topk = values.to_vec();
                 }
@@ -1497,5 +1636,56 @@ mod tests {
         );
         assert!(all_cos > 0.999, "the logits diverge: {all_cos}");
         assert!(cos_last > 0.99, "the last row diverges: {cos_last}");
+    }
+
+    /// The Engram forward against the release's own module: the rows come from our 4-bit table, `wkv` and the two
+    /// gate vectors from the checkpoint, and the gate itself is the reference's `Engram` in torch. The hash ids are
+    /// recomputed here from the state, so the lookup, the rows and the gate are compared together.
+    ///
+    ///   DEEPSEEK_CKPT=... DEEPSEEK_ENGRAM=.../golden/deepseek-engram \
+    ///   DEEPSEEK_ENGRAM_TABLE=.../deepseek-v41-flash-engram.malleus DEEPSEEK_REF_ENGRAM=.../golden/deepseek-ref/engram1
+    #[test]
+    #[ignore = "reads the checkpoint and the companion table"]
+    fn the_engram_forward_matches_the_reference() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let base = std::env::var("DEEPSEEK_ENGRAM").expect("DEEPSEEK_ENGRAM");
+        let table = std::env::var("DEEPSEEK_ENGRAM_TABLE").expect("DEEPSEEK_ENGRAM_TABLE");
+        let dir = std::env::var("DEEPSEEK_REF_ENGRAM").expect("DEEPSEEK_REF_ENGRAM");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let layer = manifest["layer"].as_u64().unwrap() as usize;
+        let (t, hc, hidden) = (
+            ids.len(),
+            manifest["hc"].as_u64().unwrap() as usize,
+            manifest["hidden"].as_u64().unwrap() as usize,
+        );
+        let c = Config::from_hf(std::path::Path::new(&ckpt)).unwrap();
+        let d = c.deepseek.as_ref().unwrap().clone();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let e = Engram::load(&src, &c, layer).unwrap();
+        let state = EngramState::from_json(
+            &std::fs::read_to_string(format!("{base}-state.json")).unwrap(),
+            &std::fs::read(format!("{base}-token-map.i32")).unwrap(),
+        )
+        .unwrap();
+        let hash = state.hash_ids(&ids, e.position);
+        let table = Gguf::open(std::path::Path::new(&table)).unwrap();
+        // Stage by stage: the rows out of the table, the projection they go through, the gate's output.
+        let head_dim = e.wkv.k / (hash.len() / t);
+        let rows = crate::deepseek_engram::read_rows(&table, &e.table, &hash, head_dim).unwrap();
+        compare("rows", &rows, &f32_file(&format!("{dir}/rows.f32")));
+        let kv = e.wkv.mat(&rows, t);
+        compare("kv", &kv, &f32_file(&format!("{dir}/kv.f32")));
+        let mut h = f32_file(&format!("{dir}/x.f32"));
+        assert_eq!(h.len(), t * hc * hidden);
+        e.forward(&table, &mut h, &hash, t, hidden, hc, d.eps).unwrap();
+        let cos = compare("engram", &h, &f32_file(&format!("{dir}/out.f32")));
+        assert!(cos > 0.9999, "the Engram forward diverges: {cos}");
     }
 }
