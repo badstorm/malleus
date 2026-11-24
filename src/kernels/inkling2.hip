@@ -669,18 +669,18 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_sconv_dec(float* y, c
 // only, and the output gate is applied after the merge.
 // A key sits at row `k0 + i`, wrapped when `ring` is not 0: a sliding layer only keeps its window, so its cache is a
 // ring and the first key of the window may be anywhere in it.
-extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, const float* q, const __half* k,
+extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, const float* q, const __half* k,
                                                                   const __half* v, const float* bias, const float* sink,
                                                                   const float* gate, int k0, int nk, int heads,
                                                                   int nkv, int dim, int ring, float scale) {
-    __shared__ float sm[4], sl[4], sa[4][128];
+    __shared__ float sm[8], sl[8], sa[8][128];
     const int h = blockIdx.x, kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
     const float4 qv = *(const float4*)(q + (size_t)h * dim + 4 * lane);
     // This warp's slice of the keys, contiguous so the reads of a warp stay in one L2 window: the per-key chain
     // measured better here than the 16-key tile the prefill kernel uses, the opposite of the prefill — at a decode
     // step there is one query row and the loads, not the exponentials, are what has to stay in flight.
-    const int per = (nk + 3) / 4, i0 = wave * per, i1 = min(nk, i0 + per);
+    const int per = (nk + 7) / 8, i0 = wave * per, i1 = min(nk, i0 + per);
     float m = -INFINITY, l = 0.f;
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int i = i0; i < i1; ++i) {
@@ -709,9 +709,9 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, 
     __syncthreads();
     // Merge: the sink rides in as one more split of weight exp(sink - mn) with a zero output.
     float mn = sink ? sink[h] : -INFINITY;
-    for (int w = 0; w < 4; ++w) mn = fmaxf(mn, sm[w]);
+    for (int w = 0; w < 8; ++w) mn = fmaxf(mn, sm[w]);
     float sum = sink ? __expf(sink[h] - mn) : 0.f, o[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int w = 0; w < 4; ++w) {
+    for (int w = 0; w < 8; ++w) {
         const float c = sm[w] == -INFINITY ? 0.f : __expf(sm[w] - mn);
         sum += sl[w] * c;
         o[0] += sa[w][4 * lane] * c;

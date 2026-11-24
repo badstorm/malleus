@@ -2135,7 +2135,7 @@ impl Graph {
                 let k0r = if ring > 0 { k0 % ring } else { k0 };
                 model.k.get("inkling2_attn_dec").launch(
                     (heads as u32, 1, 1),
-                    (128, 1, 1),
+                    (256, 1, 1),
                     0,
                     st,
                     &[
