@@ -143,23 +143,37 @@ def main() -> None:
 
     torch.set_default_dtype(torch.float32)
     torch.manual_seed(0)
-    # The reference builds its linears in bf16 whatever the default dtype says, so widen the module before
-    # loading: the weights then land in f32 exactly, and the comparison is about the graph, not about storage.
-    model = ref.Transformer(args).float()
-
     ck = Checkpoint(a.checkpoint)
-    state = model.state_dict()
-    loaded = 0
-    for name in list(state):
-        if name.startswith(f"layers.{a.layer}.") or (
-            a.layer == 0 and name in ("embed.weight", "norm.weight", "head.weight")
-        ):
-            src = ck.f32(name)
+    if a.layer == 0:
+        # The reference builds its linears in bf16 whatever the default dtype says, so widen the module before
+        # loading: the weights then land in f32 exactly, and the comparison is about the graph, not storage.
+        model = ref.Transformer(args).float()
+        state = model.state_dict()
+        loaded = 0
+        for name in list(state):
+            if name.startswith("layers.0.") or name in ("embed.weight", "norm.weight", "head.weight"):
+                src = ck.f32(name)
+                if tuple(src.shape) != tuple(state[name].shape):
+                    raise SystemExit(f"{name}: checkpoint {src.shape} vs module {tuple(state[name].shape)}")
+                state[name].copy_(torch.from_numpy(src.reshape(state[name].shape)))
+                loaded += 1
+    else:
+        # One block, not the whole stack: the other layers' experts are 54 GB each in f32 and are not needed.
+        ref.default_dtype = torch.float32
+        # `wo_a` is created in bf16 by the reference whatever the default is; widen the block so every weight is
+        # f32 and the copy below is exact.
+        model = ref.Block(a.layer, args, None).float()
+        state = model.state_dict()
+        loaded = 0
+        for name in list(state):
+            full = f"layers.{a.layer}.{name}"
+            src = ck.f32(full)
             if tuple(src.shape) != tuple(state[name].shape):
-                raise SystemExit(f"{name}: checkpoint {src.shape} vs module {tuple(state[name].shape)}")
+                raise SystemExit(f"{full}: checkpoint {src.shape} vs module {tuple(state[name].shape)}")
             state[name].copy_(torch.from_numpy(src.reshape(state[name].shape)))
             loaded += 1
-    print(f"loaded {loaded} of {len(state)} tensors, {sum(p.numel() for p in model.parameters())/1e9:.1f}B parameters", file=sys.stderr)
+    print(f"loaded {loaded} tensors, {sum(p.numel() for p in model.parameters())/1e9:.1f}B parameters", file=sys.stderr)
+
 
     dumps = {}
 
@@ -175,7 +189,7 @@ def main() -> None:
         # it zeros. A deterministic input is enough to compare compressors, indexers and attention.
         g = torch.Generator().manual_seed(1234)
         x = torch.randn(1, a.tokens, hc, dim, generator=g)
-        layer = model.layers[a.layer]
+        layer = model
         layer.attn.register_forward_hook(hook(f"attn{a.layer}"))
         layer.register_forward_hook(hook(f"block{a.layer}", lambda o: o[0]))
         with torch.inference_mode():
@@ -230,7 +244,7 @@ def main() -> None:
         )
         + "\n"
     )
-    print(json.dumps({"ids": ids, "logits": list(dumps["logits_all"].shape)}))
+    print(json.dumps({"layer": a.layer, "dumps": sorted(dumps), "ids": ids if a.layer == 0 else None}))
 
 
 if __name__ == "__main__":
