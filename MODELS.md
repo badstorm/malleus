@@ -35,7 +35,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Hy4-flash (text + images) | `hy4-flash-mls4-mls8-dense.malleus` | 121.9 GB | **dense only** (406 tensors) | The 1M-window model. 90.5 GB on the device; golden 18/21, 89.95 % all-position, worst KL 1.247. The routed experts have no MLS8 copy: they do not fit. `MALLEUS_PREFILL_WEIGHTS=none` leaves the copies on the host. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
-| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | **Production model since 2026-11-24**, at `MALLEUS_CTX=65536`: 21.7 GiB live after the warm-up (measured), decode 18.9 tok/s on a fresh session, 11.2 at 32K and 7.6 at 64K. The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring and the keys and values are fp16. The vision tower runs (issue #74); the MTP head is not wired yet. 256K does not fit this host: see “What a session really costs” below (issue #106). |
+| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | **Production model since 2026-11-24**, at `MALLEUS_CTX=65536`: 16.7 GiB live after the warm-up (measured), decode 18.9 tok/s on a fresh session, 11.2 at 32K and 7.6 at 64K. The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring and the keys and values are fp16. The vision tower runs (issue #74); the MTP head is not wired yet. 256K fits the memory since issue #110 (22.7 GiB live) but not the clock: the fill is still ~2 h. |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
@@ -197,12 +197,24 @@ worst KL 0.305 (prefill) and 491/727, KL 0.353 (`--decode`), `spec-exact` **ever
 +12.32 % of perplexity (the chat documents, +81.7 % and +15.9 %, are the open quality question of issue #103/#74) —
 and both the chat surface and the tool calls answer end to end.
 
-The context is **65536 and not 262144** because of what a session really costs (issue #106). Measured on this host,
-fitting the three points 65536 → 21.7 GiB, 131072 → 28.8 GiB and 262144 → 42.9 GiB live after the warm-up, the
-state is **~115 KiB per position**, not the 34.5 KiB the ring-and-fp16 arithmetic gives: at 262144 the process
-commits 42.9 GiB on a host with 32 GiB of RAM, so a full 256K prompt would have to free or swap ~10 GiB of it.
-Until that 3.4x is explained and the state is cut (8-bit K/V halves it), 256K is not a context this machine can
-fill — `pp512` at that depth also extrapolates to ~22 tok/s, i.e. a ~2 h fill.
+The context is **65536 and not 262144** because of the fill (a 256K prompt is ~2 h, `pp512` ~22 tok/s at that
+depth) and not because of the memory any more. What a session costs was measured on this host as ~115 KiB a
+position — 65536 → 21.7 GiB, 131072 → 28.8, 262144 → 42.9 GiB live after the warm-up against the 34.5 KiB the
+ring-and-fp16 arithmetic gives. The missing 80 KiB was the flat stack's per-layer state: `Model::new_session`
+allocated `kv`/`conv`/`rec` for the 20 sliding layers of the looped model, and the looped graph never read a byte of
+it (20 layers x 4 KiB of K and V a position, 5.0 GiB at 65536 and 20.5 GiB at 262144). The family now builds its
+session in `inkling2::new_session`, which is the cache and nothing else, and `memplan::session_bytes` prices that
+same `slot_shape` (issue #110):
+
+| context | live after the warm-up | of which state |
+|---|---|---|
+| 65 536 | 21.7 → **16.7 GiB** | 2.2 GiB |
+| 131 072 | 28.8 → **18.7 GiB** | 4.3 GiB |
+| 262 144 | 42.9 → **22.7 GiB** | 8.3 GiB |
+
+`MALLEUS_ALLOC_LEDGER=1` prints the session's allocation by call site and the number the pre-flight priced it with,
+so the estimate and the allocator are compared on every run rather than argued about. 8-bit K/V is still worth
+another 4 GiB at 256K (issue #106).
 
 The depth curve behind that decision (`bench --depth 32768,65536,131072 --chunk 512`, 2026-11-24, single runs):
 

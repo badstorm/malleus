@@ -254,32 +254,10 @@ fn uploaded(name: &str, prefill_int8: bool) -> bool {
 ///
 /// This mirrors `Model::new_session`: if that allocation changes, this has to change with it.
 pub fn session_bytes(cfg: &Config, ctx: usize, mtp: bool) -> u64 {
-    if let Some(i) = &cfg.inkling2 {
-        // The loop runs the core layers more than once, so the 24 physical layers are 48 attention streams. A sliding
-        // stream only ever reads its window back: its keys and values are a ring of `window + DRAFT_ROWS + 1` rows,
-        // and a full stream keeps the whole context.
-        let core = i.loop_end - i.loop_start;
-        let kvd = (i.kv_heads * i.head_dim) as u64;
-        let hist = 2 * (3 * kvd * 4) + 2 * (3 * cfg.hidden as u64 * 4);
-        let ring = (i.window + crate::inkling2::PREFILL_CHUNK + crate::inkling2::DRAFT_ROWS + 1).min(ctx) as u64;
-        let mut t = 0u64;
-        for s in 0..cfg.n_layers + (i.loop_passes.max(1) - 1) * core {
-            let l = if s < cfg.n_layers {
-                s
-            } else {
-                i.loop_start + (s - cfg.n_layers) % core
-            };
-            let rows = if cfg.kind[l] == MixerKind::AttnFull {
-                ctx as u64
-            } else {
-                ring
-            };
-            // Keys and values are fp16 in the cache; the histories are fp32.
-            t += rows * kvd * 2 * 2 + hist;
-        }
-        t += (i.heads * ctx * 4) as u64;
-        t += (4 * crate::inkling2::DRAFT_ROWS * cfg.hidden * 4) as u64;
-        return t;
+    if cfg.inkling2.is_some() {
+        // The loop's passes are 48 KV slots, the sliding ones a ring: `crate::inkling2::session_bytes` prices the
+        // same `slot_shape` the allocator asks for, so this is the state and not an estimate of it.
+        return crate::inkling2::session_bytes(cfg, ctx);
     }
     if cfg.family == crate::config::Family::Hy4 {
         // The latent and the 64 rotated dims per layer, plus a split buffer for the indexed layers' decode.

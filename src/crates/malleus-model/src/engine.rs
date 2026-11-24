@@ -537,6 +537,11 @@ impl Model {
         if self.hy4.is_some() {
             return crate::hy4::new_session(self, max_ctx);
         }
+        // Inkling-2 keeps its keys in its own cache, so the generic per-layer state below is not allocated for it:
+        // 20 sliding layers of `kv` that the looped graph never read, at 80 KiB a position (issue #110).
+        if self.inkling2.is_some() {
+            return crate::inkling2::new_session(self, max_ctx);
+        }
         let c = &self.cfg;
         let mut s = Session {
             max_ctx,
@@ -646,9 +651,6 @@ impl Model {
                 .push((DeviceBuffer::zeroed(kv_bytes)?, DeviceBuffer::zeroed(v_bytes)?));
             s.mtp_h = Some(f32s(GEMV_MAX_T * c.stream_dim())?);
             s.mtp_out = Some(f32s(c.stream_dim())?);
-        }
-        if self.inkling2.is_some() {
-            s.inkling2 = Some(Box::new(crate::inkling2::Cache::new(self, max_ctx)?));
         }
         Ok(s)
     }

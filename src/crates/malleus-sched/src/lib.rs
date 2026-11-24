@@ -1322,6 +1322,7 @@ fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Resu
     if slots > 1 {
         eprintln!("slots: {slots} sessions of {per_slot} tokens ({ctx} in all)");
     }
+    malleus_hip::print_alloc_ledger("sessions built, nothing warmed up");
     let chunk = prefill_chunk(&model).min(per_slot.saturating_sub(1)).max(1);
     if std::env::var("MALLEUS_WARMUP").map_or(true, |v| v != "0") {
         let n = chunk;
@@ -1336,6 +1337,7 @@ fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Resu
             "memory: {:.1} GiB live on the device after the warm-up",
             malleus_hip::device_bytes_live() as f64 / (1u64 << 30) as f64
         );
+        malleus_hip::print_alloc_ledger("after the warm-up");
     }
     // Prompt tokens per step: with one slot the whole chunk, exactly as before, because nobody waits for it; with
     // several, a slice of it, because one piece is what the sessions decoding next to it wait for.
