@@ -6,10 +6,40 @@
 //! The addressing is fixed for a model and does not depend on the prompt: a compressed token map (tokens that
 //! normalise alike share an id), one prime per (layer, order, head), one multiplier per (layer, lookback), and an
 //! offset per bucket. `scripts/deepseek_engram_state.py` computes them once with the reference's own code, so this
-//! module only has to reproduce the arithmetic.
+//! module only has to reproduce the arithmetic. The rows themselves stay in the companion file and are read one at
+//! a time (`read_rows`): the two tables are 183 GB and are never a matrix the forward multiplies.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
+use malleus_gguf::{DType, TensorSource};
 use serde_json::Value;
+
+/// Reads rows `rows[i]` of a `RowI4` table as f32: `k / 2` bytes of nibbles per row (LSB first, stored as
+/// `value + 8`) and one f16 scale per row. A table is 98.31B rows, so it is never materialised: every row is a
+/// read of `k / 2 + 2` bytes from the file, which is what makes it a lookup and not a matmul.
+pub fn read_rows(src: &dyn TensorSource, name: &str, rows: &[u64], k: usize) -> Result<Vec<f32>> {
+    let info = src.info(name).with_context(|| format!("missing tensor {name}"))?;
+    ensure!(
+        info.dtype == DType::RowI4 && info.shape.len() == 2,
+        "{name}: expected a RowI4 [rows, k] table, not {:?} {:?}",
+        info.dtype,
+        info.shape
+    );
+    let (n, width) = (info.shape[0], info.shape[1]);
+    ensure!(width == k, "{name}: rows are {width} wide, the graph reads {k}");
+    let packed = k.div_ceil(2);
+    let scales = format!("{name}.scales");
+    let mut out = vec![0f32; rows.len() * k];
+    let mut codes = vec![0u8; packed];
+    let mut scale = [0u8; 2];
+    for (i, &r) in rows.iter().enumerate() {
+        ensure!((r as usize) < n, "{name}: row {r} outside the table's {n}");
+        src.read(name, r as usize * packed, &mut codes)?;
+        src.read(&scales, r as usize * 2, &mut scale)?;
+        let s = half::f16::from_le_bytes(scale).to_f32();
+        malleus_gguf::quant::dequant_int4(&codes, s, &mut out[i * k..(i + 1) * k]);
+    }
+    Ok(out)
+}
 
 /// The hash state of one checkpoint, read from the file's metadata.
 pub struct EngramState {
