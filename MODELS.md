@@ -30,12 +30,12 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 |---|---|---|---|---|
 | Qwen3.8-27B (dense, text + images) | `qwen38-27b-mls4.malleus` | 17.6 GB | no | The reference model for the quality gates (`golden/qwen38-27b`). |
 | Qwen3.6-35B-A3B (text + images) | `qwen36-35b-a3b-mls4.malleus` | 54.8 GB | **yes** (680 tensors) | Converted before `--prefill-int8` became opt-in: the name says `-mls4` but the file holds both copies. `malleus slim` rewrites it as 4-bit only. |
-| Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
+| Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model until 2026-11-24; still served from the same `/models` as the fallback: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
 | Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Hy4-flash (text + images) | `hy4-flash-mls4-mls8-dense.malleus` | 121.9 GB | **dense only** (406 tensors) | The 1M-window model. 90.5 GB on the device; golden 18/21, 89.95 % all-position, worst KL 1.247. The routed experts have no MLS8 copy: they do not fit. `MALLEUS_PREFILL_WEIGHTS=none` leaves the copies on the host. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
-| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring of 1 032 rows and the keys and values are fp16, so a session is 1.25 GB at 32K. The vision tower runs (issue #74); the MTP head is not wired yet. |
+| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | **Production model since 2026-11-24**, at `MALLEUS_CTX=65536`: 21.7 GiB live after the warm-up (measured), decode 18.9 tok/s on a fresh session, 11.2 at 32K and 7.6 at 64K. The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring and the keys and values are fp16. The vision tower runs (issue #74); the MTP head is not wired yet. 256K does not fit this host: see “What a session really costs” below (issue #106). |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
@@ -188,6 +188,33 @@ over the reference top-10 (the rest charged at the floor of what the engine retu
 construction. Compare the top-1 and the greedy tokens, not the KL.
 
 ## Inkling-2-Mini — the looped transformer (2026-11-21)
+
+**In production since 2026-11-24**, out of the same `/models` as Ornith (which stays as the fallback, and as the
+`MALLEUS_DEFAULT_MODEL` of a rollback): image `localhost/malleus:inkling2` (built from `main` at `221a8d4`, i.e.
+#105 merged, plus the two pre-flight fixes still in review, #107 and #108), `MALLEUS_CTX=65536`, decode 18.9 tok/s
+on a fresh session. The gates are green on that build — `golden` **20/20** last-token top-1, 514/727 argmax,
+worst KL 0.305 (prefill) and 491/727, KL 0.353 (`--decode`), `spec-exact` **every row identical**, `eval`
++12.32 % of perplexity (the chat documents, +81.7 % and +15.9 %, are the open quality question of issue #103/#74) —
+and both the chat surface and the tool calls answer end to end.
+
+The context is **65536 and not 262144** because of what a session really costs (issue #106). Measured on this host,
+fitting the three points 65536 → 21.7 GiB, 131072 → 28.8 GiB and 262144 → 42.9 GiB live after the warm-up, the
+state is **~115 KiB per position**, not the 34.5 KiB the ring-and-fp16 arithmetic gives: at 262144 the process
+commits 42.9 GiB on a host with 32 GiB of RAM, so a full 256K prompt would have to free or swap ~10 GiB of it.
+Until that 3.4x is explained and the state is cut (8-bit K/V halves it), 256K is not a context this machine can
+fill — `pp512` at that depth also extrapolates to ~22 tok/s, i.e. a ~2 h fill.
+
+The depth curve behind that decision (`bench --depth 32768,65536,131072 --chunk 512`, 2026-11-24, single runs):
+
+| depth | `pp512` | `tg4` | fill |
+|---|---|---|---|
+| 32 768 | 116.4 | 11.19 | 165 tok/s |
+| 65 536 | 65.2 | 7.62 | 64.7 |
+| 131 072 | 39.0 | 5.70 | 49.4 |
+
+A decode step at depth costs `~45 ms + 1.34 µs per position`, i.e. the eight full streams read 32 KiB a position at
+~24 GB/s of effective traffic. `rocprofv3` on a step at 32K: attention **40 %**, the grouped experts 26 %, the dense
+GEMVs 14 %, the head 9 % — and **19 % of the step is host/launch gap** over ~2 400 launches (issue #104).
 
 A 15.3 GB MLS4 file of a **looped** model: 24 physical layers of which the middle 12 (`6..18`) run three passes,
 so a token costs 48 layer visits — three times the expert traffic of a stack of the same depth. Attention residuals
