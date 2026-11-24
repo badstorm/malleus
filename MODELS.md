@@ -30,12 +30,12 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 |---|---|---|---|---|
 | Qwen3.8-27B (dense, text + images) | `qwen38-27b-mls4.malleus` | 17.6 GB | no | The reference model for the quality gates (`golden/qwen38-27b`). |
 | Qwen3.6-35B-A3B (text + images) | `qwen36-35b-a3b-mls4.malleus` | 54.8 GB | **yes** (680 tensors) | Converted before `--prefill-int8` became opt-in: the name says `-mls4` but the file holds both copies. `malleus slim` rewrites it as 4-bit only. |
-| Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
+| Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model until 2026-11-24; still served from the same `/models` as the fallback: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
 | Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Hy4-flash (text + images) | `hy4-flash-mls4-mls8-dense.malleus` | 121.9 GB | **dense only** (406 tensors) | The 1M-window model. 90.5 GB on the device; golden 18/21, 89.95 % all-position, worst KL 1.247. The routed experts have no MLS8 copy: they do not fit. `MALLEUS_PREFILL_WEIGHTS=none` leaves the copies on the host. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
-| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring of 1 032 rows and the keys and values are fp16, so a session is 1.25 GB at 32K. The vision tower runs (issue #74); the MTP head is not wired yet. |
+| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | **Production model since 2026-11-24**, at `MALLEUS_CTX=65536`: 21.7 GiB live after the warm-up (measured), decode 18.9 tok/s on a fresh session, 11.2 at 32K and 7.6 at 64K. The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring and the keys and values are fp16. The vision tower runs (issue #74); the MTP head is not wired yet. 256K does not fit this host: see “What a session really costs” below (issue #106). |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
@@ -189,6 +189,33 @@ construction. Compare the top-1 and the greedy tokens, not the KL.
 
 ## Inkling-2-Mini — the looped transformer (2026-11-21)
 
+**In production since 2026-11-24**, out of the same `/models` as Ornith (which stays as the fallback, and as the
+`MALLEUS_DEFAULT_MODEL` of a rollback): image `localhost/malleus:inkling2` (built from `main` at `221a8d4`, i.e.
+#105 merged, plus the two pre-flight fixes still in review, #107 and #108), `MALLEUS_CTX=65536`, decode 18.9 tok/s
+on a fresh session. The gates are green on that build — `golden` **20/20** last-token top-1, 514/727 argmax,
+worst KL 0.305 (prefill) and 491/727, KL 0.353 (`--decode`), `spec-exact` **every row identical**, `eval`
++12.32 % of perplexity (the chat documents, +81.7 % and +15.9 %, are the open quality question of issue #103/#74) —
+and both the chat surface and the tool calls answer end to end.
+
+The context is **65536 and not 262144** because of what a session really costs (issue #106). Measured on this host,
+fitting the three points 65536 → 21.7 GiB, 131072 → 28.8 GiB and 262144 → 42.9 GiB live after the warm-up, the
+state is **~115 KiB per position**, not the 34.5 KiB the ring-and-fp16 arithmetic gives: at 262144 the process
+commits 42.9 GiB on a host with 32 GiB of RAM, so a full 256K prompt would have to free or swap ~10 GiB of it.
+Until that 3.4x is explained and the state is cut (8-bit K/V halves it), 256K is not a context this machine can
+fill — `pp512` at that depth also extrapolates to ~22 tok/s, i.e. a ~2 h fill.
+
+The depth curve behind that decision (`bench --depth 32768,65536,131072 --chunk 512`, 2026-11-24, single runs):
+
+| depth | `pp512` | `tg4` | fill |
+|---|---|---|---|
+| 32 768 | 116.4 | 11.19 | 165 tok/s |
+| 65 536 | 65.2 | 7.62 | 64.7 |
+| 131 072 | 39.0 | 5.70 | 49.4 |
+
+A decode step at depth costs `~45 ms + 1.34 µs per position`, i.e. the eight full streams read 32 KiB a position at
+~24 GB/s of effective traffic. `rocprofv3` on a step at 32K: attention **40 %**, the grouped experts 26 %, the dense
+GEMVs 14 %, the head 9 % — and **19 % of the step is host/launch gap** over ~2 400 launches (issue #104).
+
 A 15.3 GB MLS4 file of a **looped** model: 24 physical layers of which the middle 12 (`6..18`) run three passes,
 so a token costs 48 layer visits — three times the expert traffic of a stack of the same depth. Attention residuals
 over a running block stack, a kernel-4 short convolution on every layer input and output, a relative-position bias
@@ -291,12 +318,27 @@ slots. The block now holds four query rows, one per warp, and stages the keys in
 four times less traffic and eight times fewer barriers. What is left of the slope is the 8 full-attention slots, which
 really do read the whole context.
 
-The 16x16x16 WMMA tile of that kernel is in, and it is **1.3-1.5x on the kernel and +10 % on a 512-token prompt, and
-nothing at depth**: 414.7 -> 284.4 ms at T=4096, 5262 -> 4142 at T=16384, `pp512` 304.5/309.2 -> 342.3/333.7 tok/s,
-`pp2048`/`pp8192` unchanged, and at 32K 27.6/10.79/44.4 -> 27.8/11.09/46.3 (pp512/tg4/fill, inside the noise). The
-reason is that at depth this kernel does not run: a chunk that continues a cache reads the cache one row at a time
-(`inkling2_attn_dec`), so the tile only ever sees a prompt that starts at position 0. The next step is the tiled
-kernel reading the cache, which is also what makes chunked prefill pay.
+The 16x16x16 WMMA tile of that kernel is in: 1.3-1.5x on the kernel (414.7 -> 284.4 ms at T=4096, 5262 -> 4142 at
+T=16384) and +10 % on a 512-token prompt. Alone it bought nothing at depth, because at depth that kernel did not run —
+a chunk that continues a cache read the cache one row at a time.
+
+**The same tile now reads the cache** (`inkling2_attn_wmma_cached`: the keys and values come from the session's fp16
+cache, position `p` at row `p % ring` on a sliding layer), and the scheduler feeds the prompt in pieces of **512**
+tokens (`inkling2::PREFILL_CHUNK`). That is what the issue was after, and it is worth 4x at depth (`malleus bench
+--depth 32768 --prompt 512 --decode 4`, gfx1150):
+
+| at 32K | per-row cache attention | tiled, reading the cache |
+|---|---|---|
+| `pp512` | 27.7 tok/s | **116.4** |
+| fill (32 768 tokens) | 46.4 tok/s | **166.6** |
+| `tg4` | 11.14 tok/s | 11.19 |
+| elapsed | 725 s | **201 s** |
+
+The ring grows with the chunk (`window + 512 + 8`, 1 544 rows instead of 1 032): a chunk writes all its keys before it
+attends, so a smaller ring would clobber keys the chunk's own first rows still see. That costs 80 MB of session state
+at 32K (1.25 -> 1.33 GB) and nothing measurable. The gates are the prefill ones: `golden` unchanged (20/20,
+514/727, KL 0.305) also with `--chunk 512`, and `golden --pad 4096` — the chunked run against the same prompt in one
+forward, past the point where the ring wraps — agrees on **4096/4096** argmax with a last-row KL of 0.
 
 Decode has the same shape of problem from the other side: 78 ms per token at a 512-token context, of which 28 is the
 2.24 GB of weights at the bandwidth wall, ~4 the sliding layers' 1024-key window and the rest the decode attention
@@ -335,19 +377,26 @@ path.
 
 | document | ppl (ref) | top-1 | KL |
 |---|---|---|---|
-| it-pg56775 | 13.040 (12.723) | 90.53 % | 0.0273 |
-| it-pg18456 | 9.093 (8.979) | 91.60 % | 0.0259 |
-| en-pg48320 | 7.302 (6.949) | 91.80 % | 0.0485 |
-| en-pg11 | 5.432 (5.257) | 91.99 % | 0.0266 |
-| code-utils | 1.983 (1.912) | 96.00 % | 0.0278 |
-| code-module | 2.242 (2.182) | 96.00 % | 0.0217 |
-| chat-it | 53.712 (29.000) | 78.52 % | 0.3485 |
-| chat-en | 45.852 (40.006) | 83.20 % | 0.1799 |
-| **total** | **9.209 (8.188, +12.47 %)** | **89.92 %** | **0.0884** |
+| it-pg56775 | 13.055 (12.723) | 90.82 % | 0.0276 |
+| it-pg18456 | 9.097 (8.979) | 91.21 % | 0.0264 |
+| en-pg48320 | 7.296 (6.949) | 91.70 % | 0.0482 |
+| en-pg11 | 5.452 (5.257) | 91.99 % | 0.0272 |
+| code-utils | 1.977 (1.912) | 96.00 % | 0.0267 |
+| code-module | 2.242 (2.182) | 95.61 % | 0.0225 |
+| chat-it | 52.693 (29.000) | 78.32 % | 0.3557 |
+| chat-en | 46.362 (40.006) | 83.20 % | 0.1836 |
+| **total** | **9.197 (8.188, +12.32 %)** | **89.86 %** | **0.0897** |
 
-The two chat documents are the outliers (+90 % and +14 % perplexity against +1.7…+5.3 % for the six plain ones) and
-they are the only documents over 1 000 tokens whose tokens are *not* plain prose: they open with the reasoning-effort
-system line of the chat template. Open question, tracked in issue #70.
+The two chat documents are the outliers (+82 % and +16 % perplexity against +1.3…+5.0 % for the six plain ones) and
+they are the only documents whose tokens are *not* plain prose: they open with the two system messages of the chat
+template and the reasoning-effort line. `MALLEUS_EVAL_WORST=1` prints the positions the damage sits on, and the answer
+is two things: the preamble spikes (position 9 of both chat documents predicts `<|content_text|>` and costs a KL of
+19.7 on its own, because the reference is a spike there and this file is not) and a broad elevation over the rest
+(top-1 78 % against 91 % for the prose). It is not the step's kernels (the eval runs one forward), not the int8
+activations of the chunk MoE (`MALLEUS_INKLING2_MOE_PAIRS=1` gives the same +80 %), and not any of the bugs fixed in
+this round: it is the 4-bit file on that distribution. What generation is judged on does not move — the last-token
+top-1 of the 20 golden prompts is 20/20 on both paths — so the lever is a better file (calibration, or 8-bit for the
+experts), not a kernel. Open question, tracked in issue #70 and #74.
 
 ### Quality: the vision tower (issue #74)
 

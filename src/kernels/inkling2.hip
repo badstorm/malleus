@@ -219,11 +219,15 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn(float* out, cons
 typedef _Float16 ik_h16 __attribute__((ext_vector_type(16)));
 typedef float ik_f8 __attribute__((ext_vector_type(8)));
 
-extern "C" __global__ void __launch_bounds__(128) inkling2_attn_wmma(float* out, const float* q, const float* k,
-                                                                    const float* v, const float* rel, const float* proj,
-                                                                    const float* sink, const float* gate, int T,
-                                                                    int heads, int nkv, int dim, int d_rel, int extent,
-                                                                    int window, float scale) {
+// The same tile for a chunk that continues a session: the keys and values come from the cache (fp16, `rows` deep,
+// position `p` at row `p % ring` when the layer slides) instead of the chunk's own buffers, and every position in the
+// masks and in the bias is the session's, not the chunk's.
+template <bool CACHED>
+__device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const float* k, const float* v,
+                                               const __half* ck, const __half* cv, int rows, int ring, int pos,
+                                               const float* rel, const float* proj, const float* sink,
+                                               const float* gate, int T, int heads, int nkv, int dim, int d_rel,
+                                               int extent, int window, float scale) {
     __shared__ __attribute__((aligned(16))) _Float16 qs[IKA_TQ][128];
     __shared__ __attribute__((aligned(16))) _Float16 ks[IKA_KB][128];
     __shared__ __attribute__((aligned(16))) _Float16 vt[128][IKA_KB];
@@ -234,8 +238,12 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_wmma(float* out,
     const int h = blockIdx.x % heads, q0 = (blockIdx.x / heads) * IKA_TQ;
     const int kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int qlast = min(T - 1, q0 + IKA_TQ - 1);
-    const int k0 = window > 0 ? max(0, q0 - window + 1) : 0;
+    // `q0` is a row of this call (its buffers are [T] long); `base` is the same row in the session's positions, and
+    // the keys, the masks and the bias are all in that frame.
+    const int base = CACHED ? pos : 0;
+    const int qlast = base + min(T - 1, q0 + IKA_TQ - 1);
+    const int k0 = window > 0 ? max(0, base + q0 - window + 1) : 0;
+    const int kend = base + T;
     // The row of the score tile this lane's element `i` belongs to, and the key it holds.
     const int half = lane / 16, col = lane % 16;
     // Q, scaled once: the fragment is read straight out of shared, so the scale has to be in it.
@@ -243,9 +251,11 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_wmma(float* out,
         const int t = q0 + e / dim, d = e % dim;
         qs[e / dim][d] = t < T ? (_Float16)(q[((size_t)t * heads + h) * dim + d] * scale) : (_Float16)0.f;
     }
+    // The rel row is a row of this call, so it is bounded by `T` and not by `qlast` (which is a session position).
     for (int e = threadIdx.x; e < IKA_TQ * d_rel; e += 128) {
-        rs[e / d_rel][e % d_rel] = q0 + e / d_rel <= qlast ? rel[((size_t)(q0 + e / d_rel) * heads + h) * d_rel + e % d_rel]
-                                                           : 0.f;
+        rs[e / d_rel][e % d_rel] = q0 + e / d_rel < T
+                                       ? rel[((size_t)(q0 + e / d_rel) * heads + h) * d_rel + e % d_rel]
+                                       : 0.f;
     }
     // The running max and sum of this lane's eight rows, and the sink as the score of a virtual key with no value.
     float m[8], l[8];
@@ -264,18 +274,28 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_wmma(float* out,
         // score's is a key's sixteen dims (K as it is), the output's is a dim's sixteen keys (V transposed).
         for (int e = threadIdx.x; e < IKA_KB * dim; e += 128) {
             const int j = e / dim, d = e % dim, s = kc + j;
-            const float kv = s <= qlast ? k[((size_t)s * nkv + kh) * dim + d] : 0.f;
-            const float vv = s <= qlast ? v[((size_t)s * nkv + kh) * dim + d] : 0.f;
-            ks[j][d] = (_Float16)kv;
-            vt[d][j] = (_Float16)vv;
+            const bool live = s <= qlast;
+            _Float16 kv = (_Float16)0.f, vv = (_Float16)0.f;
+            if (CACHED) {
+                const int row = live ? (ring > 0 ? s % ring : s) : 0;
+                if (live) {
+                    kv = ck[((size_t)row * nkv + kh) * dim + d];
+                    vv = cv[((size_t)row * nkv + kh) * dim + d];
+                }
+            } else if (live) {
+                kv = (_Float16)k[((size_t)s * nkv + kh) * dim + d];
+                vv = (_Float16)v[((size_t)s * nkv + kh) * dim + d];
+            }
+            ks[j][d] = kv;
+            vt[d][j] = vv;
         }
         // The bias tile, as in the fp32 kernel: rel[q0+iq] . proj[:, (q0+iq) - (kc+j)], zero outside the extent or
         // the causal window of that row.
         for (int e = threadIdx.x; e < IKA_TQ * IKA_KB; e += 128) {
-            const int iq = e / IKA_KB, j = e % IKA_KB, s = kc + j, t = q0 + iq;
+            const int iq = e / IKA_KB, j = e % IKA_KB, s = kc + j, t = base + q0 + iq;
             float acc_b = 0.f;
             const int d = t - s;
-            if (d >= 0 && d < extent && s <= t && t < T && (window == 0 || s >= t - window + 1)) {
+            if (d >= 0 && d < extent && s <= t && t < kend && (window == 0 || s >= t - window + 1)) {
                 for (int i = 0; i < d_rel; ++i) acc_b += rs[iq][i] * proj[(size_t)i * extent + d];
             }
             bt[iq][j] = acc_b;
@@ -297,10 +317,10 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_wmma(float* out,
         float p[8], alpha[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int row = 2 * i + half, t = q0 + row, s = kc + col;
+            const int row = 2 * i + half, t = base + q0 + row, s = kc + col;
             float sc = sp[0][row][col] + sp[1][row][col] + sp[2][row][col] + sp[3][row][col] + bt[row][col];
             const int w0 = window > 0 ? max(0, t - window + 1) : 0;
-            if (s > t || s < w0 || t >= T) sc = -INFINITY;
+            if (s > t || s < w0 || t >= kend) sc = -INFINITY;
             float mx = sc;
 #pragma unroll
             for (int o2 = 1; o2 < 16; o2 <<= 1) mx = fmaxf(mx, __shfl_xor(mx, o2, 32));
@@ -346,6 +366,17 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_attn_wmma(float* out,
         }
     }
 }
+
+#define IK_ATTN_WMMA(NAME, CACHED)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(128) NAME(                                                           \
+        float* out, const float* q, const float* k, const float* v, const __half* ck, const __half* cv, int rows,      \
+        int ring, int pos, const float* rel, const float* proj, const float* sink, const float* gate, int T, int heads, \
+        int nkv, int dim, int d_rel, int extent, int window, float scale) {                                            \
+        attn_wmma_core<CACHED>(out, q, k, v, ck, cv, rows, ring, pos, rel, proj, sink, gate, T, heads, nkv, dim, d_rel, \
+                               extent, window, scale);                                                                \
+    }
+IK_ATTN_WMMA(inkling2_attn_wmma, false)
+IK_ATTN_WMMA(inkling2_attn_wmma_cached, true)
 
 // The relative bias of one query row against `nk` cached keys, for the decode path: bias is [heads, nk], `rel` is
 // [heads, d_rel] of the single query row. One thread per (head, key).
@@ -497,15 +528,14 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_moe_act(float* out, c
 //   forget = tanh(forget_w . gate)                      [hidden]
 //   out    = cur - forget * cur + gain * message
 // One block per token; the weights are bf16 like the checkpoint's, the arithmetic is fp32.
-extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, const float* cur, const float* msg,
-                                                                  const ik_bf16* down, const ik_bf16* gain_w,
-                                                                  const ik_bf16* forget_w, int hidden, int rank,
-                                                                  float eps) {
+__device__ __forceinline__ void control_body(float* out, const float* cur, const float* msg, const ik_bf16* down,
+                                             const ik_bf16* gain_w, const ik_bf16* forget_w, int hidden, int rank,
+                                             float eps, int t) {
     __shared__ float red[256];
     __shared__ float gate[128];
     __shared__ float nc[4096];
     __shared__ float nm[4096];
-    const int t = blockIdx.x, r = threadIdx.x;
+    const int r = threadIdx.x;
     const float* cp = cur + (size_t)t * hidden;
     const float* mp = msg + (size_t)t * hidden;
     // rms of both inputs, then the concatenated normed pair.
@@ -544,6 +574,29 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, c
             f += ik_bf2f(forget_w[(size_t)i * rank + j]) * gate[j];
         }
         out[(size_t)t * hidden + i] = cp[i] * (1.f - tanhf(f)) + tanhf(g) * mp[i];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, const float* cur, const float* msg,
+                                                                  const ik_bf16* down, const ik_bf16* gain_w,
+                                                                  const ik_bf16* forget_w, int hidden, int rank,
+                                                                  float eps) {
+    control_body(out, cur, msg, down, gain_w, forget_w, hidden, rank, eps, blockIdx.x);
+}
+
+// The three attention gates of an extra pass in one launch: they share the shapes and the rank, and each was one block
+// on one compute unit, so three launches with a block each were three serialised latencies. `blockIdx.y` picks the
+// gate; every gate's arithmetic is `control_body`'s, unchanged, so the result is bit-identical.
+extern "C" __global__ void __launch_bounds__(256) inkling2_control3(
+    float* o0, const float* c0, const float* m0, const ik_bf16* d0, const ik_bf16* g0, const ik_bf16* f0, float* o1,
+    const float* c1, const float* m1, const ik_bf16* d1, const ik_bf16* g1, const ik_bf16* f1, float* o2,
+    const float* c2, const float* m2, const ik_bf16* d2, const ik_bf16* g2, const ik_bf16* f2, int hidden, int rank,
+    float eps) {
+    const int t = blockIdx.x;
+    switch (blockIdx.y) {
+        case 1: control_body(o1, c1, m1, d1, g1, f1, hidden, rank, eps, t); break;
+        case 2: control_body(o2, c2, m2, d2, g2, f2, hidden, rank, eps, t); break;
+        default: control_body(o0, c0, m0, d0, g0, f0, hidden, rank, eps, t); break;
     }
 }
 
