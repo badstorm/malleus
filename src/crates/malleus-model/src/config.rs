@@ -8,6 +8,7 @@ use crate::ling3;
 use crate::qwen4exp;
 use crate::qwen35;
 
+#[derive(Clone)]
 pub struct Config {
     pub hidden: usize,
     pub n_layers: usize,

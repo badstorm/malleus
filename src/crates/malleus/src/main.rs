@@ -301,6 +301,35 @@ enum Cmd {
         #[arg(long)]
         dump_logits: Option<PathBuf>,
     },
+    /// Run the DeepSeek-V4.1 host graph: the backbone is read block by block from the file, the prompt is one full
+    /// prefill, and the reply is generated greedily. There is no KV cache yet, so every token is another pass over
+    /// the whole prefix — this is the run that tells whether the model talks, not a decode measurement.
+    DeepseekRun {
+        /// The backbone `.malleus` file (162.45 GB for the 2-bit build)
+        #[arg(long)]
+        model: PathBuf,
+        /// The companion file that holds the two Engram tables
+        #[arg(long)]
+        engram: PathBuf,
+        /// Prefix of the Engram state: reads `<prefix>-state.json` and `<prefix>-token-map.i32`
+        #[arg(long)]
+        engram_state: PathBuf,
+        #[arg(long, short)]
+        prompt: String,
+        /// Tokens to generate
+        #[arg(long, default_value_t = 8)]
+        tokens: usize,
+        /// Routed experts of one block to hold at once
+        #[arg(long, default_value_t = 8)]
+        experts: usize,
+        /// Also report this many best next tokens of every step, with their logits
+        #[arg(long, default_value_t = 0)]
+        top: usize,
+        /// Feed the prompt as it is instead of rendering it through the chat template (the model is an instruct one:
+        /// a bare continuation is not the prompt it was trained on)
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 /// A file is a converted Malleus model; a directory is an upstream safetensors model.
@@ -550,6 +579,128 @@ fn draft_vocab(model: &Path, out: &Path) -> Result<()> {
     }
     std::fs::write(out, text)?;
     eprintln!("{} Latin-script tokens -> {}", ids.len(), out.display());
+    Ok(())
+}
+
+/// A source that counts the bytes it serves: a streamed run has to say what it read from disk, because that is the
+/// number that decides whether the design works on this machine.
+struct Counting<'a> {
+    inner: &'a dyn malleus_gguf::TensorSource,
+    bytes: std::cell::Cell<u64>,
+}
+
+impl<'a> Counting<'a> {
+    fn new(inner: &'a dyn malleus_gguf::TensorSource) -> Self {
+        Counting {
+            inner,
+            bytes: std::cell::Cell::new(0),
+        }
+    }
+
+    fn gb(&self) -> f64 {
+        self.bytes.get() as f64 / 1e9
+    }
+}
+
+impl malleus_gguf::TensorSource for Counting<'_> {
+    fn info(&self, name: &str) -> Option<&malleus_gguf::TensorInfo> {
+        self.inner.info(name)
+    }
+
+    fn names(&self) -> Vec<&str> {
+        self.inner.names()
+    }
+
+    fn read(&self, name: &str, start: usize, buf: &mut [u8]) -> std::io::Result<()> {
+        self.bytes.set(self.bytes.get() + buf.len() as u64);
+        self.inner.read(name, start, buf)
+    }
+}
+
+/// The DeepSeek-V4.1 host run: the backbone streams block by block (162.45 GB against 122 GB of memory), the Engram
+/// tables are read from their companion file, and every step says what it read and how long it took.
+#[allow(clippy::too_many_arguments)]
+fn deepseek_run(
+    model: &Path,
+    engram: &Path,
+    state: &Path,
+    prompt: &str,
+    tokens: usize,
+    experts: usize,
+    top: usize,
+    chat_template: bool,
+) -> Result<()> {
+    // A `.malleus` file carries its own config; a checkpoint directory is the release's own storage, which is the
+    // reference this quantized file is measured against.
+    let (c, weights): (Config, Box<dyn malleus_gguf::TensorSource>) = if is_converted(model) {
+        let g = Gguf::open(model)?;
+        let c = Config::from_json(
+            g.meta_str("openmalleus.hf_config")?,
+            g.meta_str("openmalleus.generation_config").ok(),
+        )?;
+        (c, Box::new(g))
+    } else {
+        (Config::from_hf(model)?, Box::new(SafeTensors::open_dir(model)?))
+    };
+    let table = Gguf::open(engram)?;
+    let state = malleus_model::deepseek_engram::EngramState::from_json(
+        &std::fs::read_to_string(format!("{}-state.json", state.display()))?,
+        &std::fs::read(format!("{}-token-map.i32", state.display()))?,
+    )?;
+    let chat = load_chat(model)?;
+    let text = if chat_template {
+        chat.render(
+            &serde_json::json!([{ "role": "user", "content": prompt }]),
+            &malleus_chat::RenderOptions {
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+        )?
+    } else {
+        prompt.to_string()
+    };
+    let ids = chat.encode(&text)?;
+    eprintln!("{text:?}\n{} prompt tokens: {ids:?}", ids.len());
+    let backbone = Counting::new(weights.as_ref());
+    let tables = Counting::new(&table);
+    let mut s = malleus_model::deepseek_text::Streamer::open(&backbone, &c)?
+        .with_engram(&tables, state)
+        .with_experts_held(experts);
+    eprintln!(
+        "resident {:.2} GB, up to {experts} experts of one block held",
+        s.resident_bytes() as f64 / 1e9
+    );
+    let t0 = Instant::now();
+    let out = s.generate(&ids, tokens, |_, out, row| {
+        eprintln!(
+            "  token {}: {:.0}s, {:.2} GB read",
+            out.len(),
+            t0.elapsed().as_secs_f64(),
+            backbone.gb() + tables.gb(),
+        );
+        if top > 0 {
+            let mut best: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+            best.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let shown: Vec<String> = best
+                .iter()
+                .take(top)
+                .map(|(id, v)| {
+                    format!(
+                        "{} {v:.2}",
+                        chat.decode(&[*id as u32]).unwrap_or_default().escape_debug()
+                    )
+                })
+                .collect();
+            eprintln!("    {}", shown.join("  "));
+        }
+    })?;
+    println!("{}", chat.decode(&out)?);
+    eprintln!(
+        "{} experts read, {:.2} GB read, {:.0}s total",
+        s.experts_read,
+        backbone.gb() + tables.gb(),
+        t0.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -3599,6 +3750,16 @@ fn main() -> Result<()> {
             prompt_ids.as_deref(),
             dump_logits.as_deref(),
         )?,
+        Cmd::DeepseekRun {
+            model,
+            engram,
+            engram_state,
+            prompt,
+            tokens,
+            experts,
+            top,
+            raw,
+        } => deepseek_run(&model, &engram, &engram_state, &prompt, tokens, experts, top, !raw)?,
         Cmd::Eval {
             model,
             set,
