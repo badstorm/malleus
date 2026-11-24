@@ -145,6 +145,13 @@ pub fn tables_on_disk(src: &dyn TensorSource) -> u64 {
 /// Prompt tokens per forward call: `MALLEUS_PREFILL_CHUNK`, default 16384 with hyper-connections and 2048
 /// otherwise. Larger chunks read the MoE expert weights fewer times per token, at the cost of the working set.
 pub fn prefill_chunk(cfg: &Config) -> usize {
+    // Inkling-2 pins its own chunk (the sliding cache's ring is sized for it, and the scheduler refuses to go
+    // wider), so the working-set estimate has to use the same number the forward call actually gets: a production
+    // unit that sets MALLEUS_PREFILL_CHUNK=8192 for another family would otherwise reserve 8 KiB of scratch per
+    // token of a chunk that never happens.
+    if cfg.family == crate::config::Family::Inkling2 {
+        return crate::inkling2::PREFILL_CHUNK;
+    }
     let default = if cfg.hc.is_some() { 16384 } else { 2048 };
     std::env::var("MALLEUS_PREFILL_CHUNK")
         .ok()
