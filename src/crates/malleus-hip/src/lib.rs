@@ -219,6 +219,62 @@ pub fn device_bytes_peak() -> usize {
     PEAK_DEVICE_BYTES.load(Ordering::Relaxed)
 }
 
+/// Where the device bytes went, when `MALLEUS_ALLOC_LEDGER=1`: every `DeviceBuffer::alloc` request, grouped by call
+/// site, as (bytes, requests).
+///
+/// The pre-flight sizes a session from the config (`memplan::session_bytes`), and that estimate is only right if it
+/// mirrors the allocator: this is what the allocator was actually asked for, so the two can be compared slot by slot
+/// (issue #110: an Inkling-2 session measured ~3x its estimate at depth). Only the request is recorded, not where it
+/// came from in the pool, so the ledger reads the same with `MALLEUS_BUF_POOL=0`.
+/// Call site (`file:line`) to the (bytes, requests) it has asked for.
+type Ledger = std::collections::HashMap<String, (u64, u64)>;
+
+static LEDGER: std::sync::LazyLock<Option<std::sync::Mutex<Ledger>>> =
+    std::sync::LazyLock::new(|| std::env::var_os("MALLEUS_ALLOC_LEDGER").map(|_| std::sync::Mutex::new(Ledger::new())));
+
+fn ledger_note(bytes: usize, caller: &std::panic::Location<'_>) {
+    let Some(l) = LEDGER.as_ref() else {
+        return;
+    };
+    let key = format!("{}:{}", caller.file(), caller.line());
+    let mut m = l.lock().unwrap();
+    let e = m.entry(key).or_insert((0, 0));
+    e.0 += bytes as u64;
+    e.1 += 1;
+}
+
+/// The `MALLEUS_ALLOC_LEDGER` table so far: (call site, bytes, requests) by bytes, largest first.
+pub fn alloc_ledger() -> Vec<(String, u64, u64)> {
+    let Some(l) = LEDGER.as_ref() else {
+        return Vec::new();
+    };
+    let m = l.lock().unwrap();
+    let mut v: Vec<(String, u64, u64)> = m.iter().map(|(k, (b, n))| (k.clone(), *b, *n)).collect();
+    v.sort_by_key(|(_, bytes, _)| std::cmp::Reverse(*bytes));
+    v
+}
+
+/// Total bytes the ledger has recorded (0 when `MALLEUS_ALLOC_LEDGER` is unset): the difference between two calls is
+/// what one stage of the run asked the allocator for.
+pub fn alloc_ledger_bytes() -> u64 {
+    alloc_ledger().iter().map(|(_, bytes, _)| *bytes).sum()
+}
+
+/// Prints [`alloc_ledger`] under a label, with the live device bytes: the pre-flight's estimate and this table are
+/// the two halves of the same question.
+pub fn print_alloc_ledger(label: &str) {
+    if LEDGER.is_none() {
+        return;
+    }
+    eprintln!(
+        "alloc ledger ({label}): {:.2} GiB live on the device",
+        device_bytes_live() as f64 / (1u64 << 30) as f64
+    );
+    for (site, bytes, n) in alloc_ledger() {
+        eprintln!("  {:>10.2} MiB {:>7} x  {site}", bytes as f64 / (1u64 << 20) as f64, n);
+    }
+}
+
 /// `hipMemGetInfo`: (free, total) of the device's allocatable memory, which on an APU is the GTT pool.
 pub fn mem_get_info() -> Result<(usize, usize)> {
     let (mut free, mut total) = (0usize, 0usize);
@@ -321,7 +377,9 @@ fn free_all(list: Vec<(usize, usize)>) {
 }
 
 impl DeviceBuffer {
+    #[track_caller]
     pub fn alloc(bytes: usize) -> Result<Self> {
+        ledger_note(bytes, std::panic::Location::caller());
         let size = bytes.max(4);
         if let Some(ptr) = pool_take(size) {
             return Ok(DeviceBuffer {
@@ -363,6 +421,7 @@ impl DeviceBuffer {
             .collect()
     }
 
+    #[track_caller]
     pub fn zeroed(bytes: usize) -> Result<Self> {
         let b = Self::alloc(bytes)?;
         b.memset(0, &Stream::null())?;
@@ -370,6 +429,7 @@ impl DeviceBuffer {
         Ok(b)
     }
 
+    #[track_caller]
     pub fn from_slice<T: Copy>(data: &[T]) -> Result<Self> {
         let mut b = Self::alloc(std::mem::size_of_val(data))?;
         b.upload(data)?;

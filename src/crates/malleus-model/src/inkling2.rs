@@ -1351,8 +1351,9 @@ fn argmax(v: &[f32], n: usize) -> u32 {
 /// of its short convolutions (`sconv` reads them for its taps, the decode path shifts them in place).
 ///
 /// The release runs the 12 core layers three times, and every pass has its own attention: 24 physical layers plus
-/// two extra passes over the core (`n_layers + (passes - 1) * core`). Keys and values are fp32 like the rest of the
-/// graph; at 24 heads x 8 KV heads x 128 that is 8 KiB per token per slot (393 KiB per token over the 48 slots).
+/// two extra passes over the core (`n_layers + (passes - 1) * core`), 48 slots for Inkling-2-Mini. Keys and values
+/// are fp16, so at 8 KV heads x 128 that is 4 KiB per token per slot: 34.5 KiB a position over the 8 slots of the
+/// full layers, which are the ones that keep the whole context.
 pub struct Slot {
     /// [`rows`, kv_heads * head_dim] fp16, the keys after the convolution, the clip and the L2 norm: half the bytes
     /// of fp32 and the same rounding the reference uses for its own cache. The convolution histories below stay
@@ -1360,8 +1361,8 @@ pub struct Slot {
     k: DeviceBuffer,
     v: DeviceBuffer,
     /// Rows of `k`/`v`, and the ring they are indexed with: a sliding layer only ever reads the last `window` keys,
-    /// so its cache is a ring of `window + DRAFT_ROWS + 1` rows and position `p` lives at `p % ring`. A full-attention
-    /// layer has no ring (0) and position `p` is row `p`, with `rows == max`.
+    /// so its cache is a ring of `slot_shape` rows and position `p` lives at `p % ring`. A full-attention layer has no
+    /// ring (0) and position `p` is row `p`, with `rows == max`.
     rows: usize,
     ring: usize,
     /// [3, kv_heads * head_dim] the convolution input of the last three positions, oldest first.
@@ -1395,42 +1396,71 @@ pub const DRAFT_ROWS: usize = crate::weights::GEMV_MAX_T + 1;
 /// sliding cache's ring is sized for one (`window + PREFILL_CHUNK + DRAFT_ROWS + 1`).
 pub const PREFILL_CHUNK: usize = 512;
 
+/// Slots the cache of a session holds: one per physical layer, plus one per core layer for each extra pass of the
+/// loop (`loop_passes`).
+pub fn n_slots(i: &Inkling2Config, n_layers: usize) -> usize {
+    n_layers + (i.loop_passes.max(1) - 1) * (i.loop_end - i.loop_start)
+}
+
+/// The physical layer a slot's keys belong to: the inverse of `slot_of`, because the extra slots are the core layers
+/// of the loop's later passes.
+fn slot_layer(i: &Inkling2Config, n_layers: usize, s: usize) -> usize {
+    if s < n_layers {
+        s
+    } else {
+        i.loop_start + (s - n_layers) % (i.loop_end - i.loop_start)
+    }
+}
+
+/// Rows and ring of one slot: `(rows, 0)` for a full-attention layer, which keeps the whole context, and a ring
+/// otherwise. A sliding layer reads at most its window back, so the rest of the cache would never be read again; the
+/// ring holds a whole prefill chunk on top of the window, because a chunk writes all its keys before it attends and a
+/// smaller ring would clobber keys the chunk's own first rows still see.
+fn slot_shape(i: &Inkling2Config, full: bool, ctx: usize) -> (usize, usize) {
+    if full {
+        return (ctx, 0);
+    }
+    let rows = (i.window + PREFILL_CHUNK + DRAFT_ROWS + 1).min(ctx);
+    (rows, if rows == ctx { 0 } else { rows })
+}
+
+/// Bytes the cache of a session of `ctx` tokens asks the device for: the keys and values of every slot, the four
+/// three-row convolution histories, the bias row of the decode query, `tau` and the MTP rows.
+///
+/// This is `Cache::new` priced, not an estimate: both go through `slot_shape`, so the pre-flight and the allocator
+/// cannot drift (`memplan::session_bytes` returns this for the family).
+pub fn session_bytes(cfg: &Config, ctx: usize) -> u64 {
+    let Some(i) = cfg.inkling2.as_ref() else {
+        return 0;
+    };
+    let kvd = (i.kv_heads * i.head_dim) as u64;
+    // The histories are fp32: inputs of the short convolutions, not the cache.
+    let hist = 2 * (3 * kvd * 4) + 2 * (3 * cfg.hidden as u64 * 4);
+    let mut t = 0u64;
+    for s in 0..n_slots(i, cfg.n_layers) {
+        let (rows, _) = slot_shape(i, cfg.kind[slot_layer(i, cfg.n_layers, s)] == MixerKind::AttnFull, ctx);
+        t += rows as u64 * kvd * 2 * 2 + hist;
+    }
+    t += (i.heads * ctx * 4) as u64;
+    t += 4;
+    t += (4 * DRAFT_ROWS * cfg.hidden * 4) as u64;
+    t
+}
+
 impl Cache {
     pub fn new(model: &Model, max_ctx: usize) -> Result<Self> {
         let c = &model.cfg;
         let i = c.inkling2.as_ref().context("no inkling2 config")?;
-        let core = i.loop_end - i.loop_start;
-        let slots = c.n_layers + (i.loop_passes.max(1) - 1) * core;
         let kvd = i.kv_heads * i.head_dim;
-        // The physical layer of a slot says whether it slides: the loop's passes rerun the same layers.
-        let w = model.inkling2.as_ref().context("no inkling2 weights")?;
-        let full: Vec<bool> = (0..slots)
-            .map(|s| {
-                // The inverse of `slot_of`: the extra slots are the core layers of the loop's later passes.
-                let l = if s < c.n_layers {
-                    s
-                } else {
-                    i.loop_start + (s - c.n_layers) % core
-                };
-                w.layers[l].full
-            })
-            .collect();
-        let mut out = Vec::with_capacity(slots);
-        for &is_full in full.iter() {
-            // A sliding layer reads at most its window back, so the rest of the cache would never be read again. The
-            // ring holds a whole prefill chunk on top of the window: a chunk writes all its keys before it attends,
-            // so a smaller ring would clobber keys the chunk's own first rows still see.
-            let ring = if is_full {
-                0
-            } else {
-                i.window + PREFILL_CHUNK + DRAFT_ROWS + 1
-            };
-            let rows = if ring > 0 { ring.min(max_ctx) } else { max_ctx };
+        let mut out = Vec::with_capacity(n_slots(i, c.n_layers));
+        for s in 0..n_slots(i, c.n_layers) {
+            let full = c.kind[slot_layer(i, c.n_layers, s)] == MixerKind::AttnFull;
+            let (rows, ring) = slot_shape(i, full, max_ctx);
             out.push(Slot {
                 k: DeviceBuffer::alloc(rows * kvd * 2)?,
                 v: DeviceBuffer::alloc(rows * kvd * 2)?,
                 rows,
-                ring: if rows == max_ctx { 0 } else { rows },
+                ring,
                 // Zeroed: the taps before the first token are the reference's left padding.
                 past_k: DeviceBuffer::zeroed(3 * kvd * 4)?,
                 past_v: DeviceBuffer::zeroed(3 * kvd * 4)?,
@@ -1469,6 +1499,71 @@ impl Cache {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+}
+
+/// Inkling-2's session: the cache of its own graph and **none** of the generic per-layer state.
+///
+/// `Model::new_session` allocates `kv`, `conv`, `rec`, `attn_part` and the MTP buffers for every stack it carries,
+/// and nothing in the looped graph reads them: the session keeps its keys in `Cache`. That was 20.5 GiB at 256K of
+/// state the model never touched (20 sliding layers x 2 x 128 MiB at 65536 = 80 KiB a position on top of the 34.5 the
+/// full slots account for), the state the pre-flight could not see (issue #110). The 4-byte `attn_part` placeholder
+/// is what `crate::hy4::new_session` leaves for the same reason: the field is not optional and the batching paths that
+/// read it are the ones this family does not take (`Model::can_batch` is false for a looped stack).
+pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Result<crate::session::Session> {
+    let asked = malleus_hip::alloc_ledger_bytes;
+    let before = asked();
+    let cache = Cache::new(model, max_ctx)?;
+    if before > 0 {
+        // `MALLEUS_ALLOC_LEDGER=1`: the pre-flight sizes this session with `session_bytes`, and this is the number to
+        // check it against. The `attn_part` placeholder below comes after it.
+        let got = asked() - before;
+        let planned = session_bytes(&model.cfg, max_ctx);
+        if got != planned {
+            eprintln!("inkling2: the session of {max_ctx} tokens asked {got} bytes, the plan says {planned}");
+        }
+    }
+    Ok(crate::session::Session {
+        max_ctx,
+        len: 0,
+        next_pos: 0,
+        kv: Vec::new(),
+        conv: Vec::new(),
+        rec: Vec::new(),
+        attn_part: crate::session::f32s(1)?,
+        mla_part: None,
+        conv_snap: Vec::new(),
+        dn_rec: Vec::new(),
+        dn_np: 0,
+        dn_par: 0,
+        snap_t: 0,
+        mtp_kv: Vec::new(),
+        mtp_len: 0,
+        mtp_h: None,
+        mtp_pos: Vec::new(),
+        mtp_out: None,
+        mtp_out_pos: [0; 3],
+        mtp_chain: 0,
+        ple_state: None,
+        ngram_ctx: Vec::new(),
+        idx_kb: Vec::new(),
+        idx_tk: Vec::new(),
+        idx_tp: Vec::new(),
+        idx_scores: None,
+        idx_sel: None,
+        idx_sel_cache: Vec::new(),
+        idx_cache_len: 0,
+        mtp_idx: None,
+        idx_list: None,
+        ple_snap: None,
+        ngram_prev: Vec::new(),
+        inkling2: Some(Box::new(cache)),
+        hy4_spec: None,
+        hy4_draft: Default::default(),
+        ix_tk: Vec::new(),
+        ix_gk: Vec::new(),
+        ix_pooled: Vec::new(),
+        ix_pos: None,
+    })
 }
 
 /// The slot a layer's attention writes to: the physical layer in the first pass, then one of the extra passes'
@@ -3369,5 +3464,54 @@ mod tests {
         }
         assert!(lines[0].starts_with("1384 of 1384"), "{}", lines[0]);
         assert_eq!(lines.len(), 4, "{lines:?}");
+    }
+
+    /// A three-layer stack whose loop repeats two of them: the slot plan is what `session_bytes` prices and what
+    /// `Cache::new` allocates (issue #110).
+    const TINY: &str = r#"{
+        "model_type": "inkling2",
+        "text_config": {
+            "model_type": "inkling2", "hidden_size": 128, "num_hidden_layers": 3,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
+            "d_rel": 2, "rel_extent": 4, "log_scaling_n_floor": 8, "log_scaling_alpha": 0.1,
+            "qk_l2_clip_threshold": 1.0, "rel_l2_clip_threshold": 1.0,
+            "n_layers_per_attn_res_block": 1, "sconv_kernel_size": 4, "sliding_window_size": 4,
+            "n_routed_experts": 4, "num_experts_per_tok": 1, "n_shared_experts": 0,
+            "intermediate_size": 128, "route_scale": 1.0, "mlp_gate_softcap": 1.0,
+            "mlp_up_softcap": 1.0, "final_logit_softcapping": 1.0,
+            "unpadded_vocab_size": 64, "vocab_size": 64, "rms_norm_eps": 1e-6,
+            "local_layer_ids": [0, 1], "scoring_func": "sigmoid", "use_gate_bias": false,
+            "loop_config": {"core_start": 1, "core_end": 3, "num_passes": 2, "gate_rank": 8}
+        }
+    }"#;
+
+    #[test]
+    fn the_slot_plan_is_what_a_session_is_priced_with() {
+        let c = Config::from_json(TINY, None).unwrap();
+        let i = c.inkling2.as_ref().unwrap();
+        // Two physical layers (1 and 2) in the loop, run twice: 3 + 2 slots, the extra ones being the loop's second
+        // pass over layer 1 (sliding) and layer 2 (full).
+        assert_eq!(n_slots(i, c.n_layers), 5);
+        assert_eq!(
+            (0..5).map(|s| slot_layer(i, c.n_layers, s)).collect::<Vec<_>>(),
+            [0, 1, 2, 1, 2]
+        );
+        // A sliding slot is a ring of window + PREFILL_CHUNK + DRAFT_ROWS + 1 rows, a full one the whole context; a
+        // context shorter than the ring makes the ring the whole context, and then it is not a ring at all.
+        let ring = 4 + PREFILL_CHUNK + DRAFT_ROWS + 1;
+        assert_eq!(slot_shape(i, false, 1024), (ring, ring));
+        assert_eq!(slot_shape(i, true, 1024), (1024, 0));
+        assert_eq!(slot_shape(i, false, 128), (128, 0));
+        // Priced by hand: 3 rings and 2 whole contexts of keys and values (kvd = 4, fp16, K and V), the four
+        // three-row histories of each slot, the bias row, tau and the MTP rows.
+        let kvd = 4u64;
+        let hist = 2 * (3 * kvd * 4) + 2 * (3 * 128 * 4);
+        let want = 3 * ring as u64 * kvd * 2 * 2
+            + 2 * 1024 * kvd * 2 * 2
+            + 5 * hist
+            + 2 * 1024 * 4
+            + 4
+            + 4 * DRAFT_ROWS as u64 * 128 * 4;
+        assert_eq!(session_bytes(&c, 1024), want);
     }
 }
