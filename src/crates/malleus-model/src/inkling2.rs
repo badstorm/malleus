@@ -1423,6 +1423,12 @@ pub struct Draft {
     len: usize,
     base_pos: usize,
     bias: DeviceBuffer,
+    /// `unembed @ hidden_out` as `[rank, vocab]` bf16 and `unembed @ hidden_out.bias` as `[vocab]` f32, built at the
+    /// first draft (118 GFLOP once, 103 MB): the folded Markov bias, read once per draft row.
+    fold: Option<(DeviceBuffer, DeviceBuffer)>,
+    /// The walk's carrier and its latent state, `[rank]`.
+    state: DeviceBuffer,
+    latent: DeviceBuffer,
 }
 
 /// The state a verify has to put back: `hist[slot][stream]` is the three-row history after every row of the step,
@@ -1539,6 +1545,9 @@ impl Cache {
                     len: 0,
                     base_pos: 0,
                     bias: DeviceBuffer::zeroed(m.heads * rows * 4)?,
+                    fold: None,
+                    state: f32s(m.markov_rank)?,
+                    latent: f32s(m.markov_rank)?,
                 })
             }
             None => None,
@@ -3679,6 +3688,7 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
                 (&alpha).into(),
                 (&l.dflare_norm).into(),
                 rows.into(),
+                0i32.into(),
                 FEAT_ROWS.into(),
                 h.into(),
                 g.eps.into(),
@@ -3724,6 +3734,70 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
     Ok(())
 }
 
+/// The folded Markov bias: `unembed @ hidden_out` as `[rank, vocab]` bf16 and `unembed @ hidden_out.bias` as
+/// `[vocab]` f32. `lin()` computes `X @ W^T`, so the GEMM wants `hidden_out` transposed into the rows of its input;
+/// 118 GFLOP on the quantized unembed, once per session.
+fn markov_fold(model: &Model, d: &mut Draft) -> Result<()> {
+    if d.fold.is_some() {
+        return Ok(());
+    }
+    let c = &model.cfg;
+    let w = model.inkling2.as_ref().context("no inkling2 weights")?;
+    let m = w.mtp.as_ref().context("no MTP head")?;
+    let g = c
+        .inkling2
+        .as_ref()
+        .and_then(|i| i.mtp.as_ref())
+        .context("no MTP config")?;
+    let (h, rank, vocab) = (c.hidden, g.markov_rank, c.vocab);
+    let st = &model.stream;
+    let xt = f32s(rank * h)?;
+    model.k.get("inkling2_bf16_transpose").launch(
+        ((h * rank).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&xt).into(), (&m.markov.hidden_out.0).into(), h.into(), rank.into()],
+    )?;
+    let mut xr = f32s(rank * h)?;
+    let mut xh = f32s(rank * h / 2)?;
+    let mut xsc = f32s(rank * h.div_ceil(128))?;
+    // [rank, vocab] f32, then the bf16 copy the walk reads.
+    let fold32 = f32s(rank * vocab)?;
+    lin(model, st, &mut xr, &mut xh, &mut xsc, &fold32, &xt, &w.unembed, rank)?;
+    let fold = DeviceBuffer::alloc(rank * vocab * 2)?;
+    model.k.get("inkling2_to_bf16").launch(
+        ((rank * vocab).div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&fold).into(), (&fold32).into(), (rank * vocab).into()],
+    )?;
+    // The same projection of `hidden_out.bias`: one row through the unembed.
+    let hb = f32s(h)?;
+    model.k.get("inkling2_bf16_rows").launch(
+        (h.div_ceil(256) as u32, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            (&hb).into(),
+            (&m.markov.hidden_out.1).into(),
+            0i32.into(),
+            0i32.into(),
+            h.into(),
+        ],
+    )?;
+    let mut yr = f32s(h)?;
+    let mut yh = f32s(h / 2)?;
+    let mut ysc = f32s(h.div_ceil(128))?;
+    let fbias = f32s(vocab)?;
+    lin(model, st, &mut yr, &mut yh, &mut ysc, &fbias, &hb, &w.unembed, 1)?;
+    st.synchronize()?;
+    d.fold = Some((fold, fbias));
+    Ok(())
+}
+
 /// The drafts of the block that follows `anchor`: the block's rows are the anchor token's embedding and `mask_embed`
 /// for the proposals, the context is the draft cache, and the head's base logits are the target's `unembed` on the
 /// proposal rows. `n` of them at most (`DRAFT_ROWS - 1`).
@@ -3734,9 +3808,12 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
     let (Some(m), Some(g)) = (w.mtp.as_ref(), i.mtp.as_ref()) else {
         return Ok(Vec::new());
     };
-    let Some(d) = cache.draft.as_mut() else {
+    let feat_rows = cache.feat_rows;
+    let Cache { feats, draft: slot, .. } = cache;
+    let Some(d) = slot.as_mut() else {
         return Ok(Vec::new());
     };
+    let feats = &*feats;
     let (heads, nkv, hd, inter) = (g.heads, g.kv_heads, g.head_dim, g.inter);
     let (kvd, qd) = (nkv * hd, heads * hd);
     let h = c.hidden;
@@ -3763,13 +3840,20 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
         st,
         &[(&x).into(), (&w.embed).into(), (&idb).into(), h.into()],
     )?;
-    for r in 1..rows {
+    let anchor_row = knob("MALLEUS_MTP_ANCHOR", 0) == 0;
+    for r in if anchor_row { 1 } else { 0 }..rows {
         model.k.get("inkling2_bf16_rows").launch(
             (h.div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
             0,
             st,
-            &[(&x).into(), (&m.mask_embed).into(), (r * h).into(), h.into()],
+            &[
+                (&x).into(),
+                (&m.mask_embed).into(),
+                0i32.into(),
+                (r * h).into(),
+                h.into(),
+            ],
         )?;
     }
     let pv: Vec<i32> = (0..rows).map(|r| anchor_pos + r as i32).collect();
@@ -3887,16 +3971,115 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
         add(model, st, &cur, &proj, rows * h)?;
     }
     rms(model, st, &normed, &cur, &m.norm, rows, h, g.eps)?;
-    let r0 = if logit_rows == 0 { 1 } else { 0 };
+    let r0 = if logit_rows == 0 && anchor_row { 1 } else { 0 };
     let head_in = f32s(n * h)?;
     head_in.copy_from_shared(0, &normed, r0 * h * 4, n * h * 4, st)?;
     let logits = f32s(n * c.vocab)?;
     lin(model, st, &mut xr, &mut xh, &mut xsc, &logits, &head_in, &w.unembed, n)?;
-    softcap(model, st, &logits, n * c.vocab, i.logit_softcap)?;
-    let v = logits.download::<f32>(n * c.vocab)?;
-    Ok((0..n)
-        .map(|r| argmax(&v[r * c.vocab..(r + 1) * c.vocab], c.vocab))
-        .collect())
+
+    // The Markov half: the anchor's own mixture (`alpha[-1]` with `markov_head.dflare_norm`) is the walk's context,
+    // and the walk runs over the rows in order because a row's bias conditions on the token before it — the anchor
+    // for the first, the proposal before it after that.
+    let rank = g.markov_rank;
+    let hid_mode = knob("MALLEUS_MTP_HID", 0);
+    let prev_mode = knob("MALLEUS_MTP_PREV", 0);
+    let frnn = f32s(h)?;
+    let alpha_m = DeviceBuffer::from_slice(&m.alpha[12..16])?;
+    let arow = (feat_rows.max(1) - 1) as i32;
+    model.k.get("inkling2_draft_mix").launch(
+        (1, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[
+            (&frnn).into(),
+            feats.into(),
+            (&alpha_m).into(),
+            (&m.markov.dflare_norm).into(),
+            1i32.into(),
+            arow.into(),
+            FEAT_ROWS.into(),
+            h.into(),
+            g.eps.into(),
+        ],
+    )?;
+    markov_fold(model, d)?;
+    let (fold, fbias) = d.fold.as_ref().context("markov fold")?;
+    let walk = f32s(rank + rank + h + h)?;
+    // The walk's context: the anchor's Markov mixture, or its normalized hidden state.
+    if knob("MALLEUS_MTP_FRNN", 0) == 1 {
+        walk.copy_from_shared(2 * rank * 4, &normed, (rows - 1) * h * 4, h * 4, st)?;
+    } else {
+        walk.copy_from_shared(2 * rank * 4, &frnn, 0, h * 4, st)?;
+    }
+    let mut drafts: Vec<u32> = Vec::with_capacity(n);
+    let mut prev = anchor;
+    for r in 0..n {
+        // [state | markov_w1[prev] | hidden | f_rnn]
+        walk.copy_from_shared(0, &d.state, 0, rank * 4, st)?;
+        model.k.get("inkling2_bf16_rows").launch(
+            (rank.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&walk).into(),
+                (&m.markov.w1).into(),
+                ((prev as usize * rank) as i32).into(),
+                (rank as i32).into(),
+                rank.into(),
+            ],
+        )?;
+        let hid = if hid_mode == 1 { &cur } else { &normed };
+        walk.copy_from_shared(2 * rank * 4 + h * 4, hid, (r0 + r) * h * 4, h * 4, st)?;
+        model.k.get("inkling2_markov_step").launch(
+            (1, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&d.state).into(),
+                (&d.latent).into(),
+                (&walk).into(),
+                (&m.markov.rnn_proj.0).into(),
+                (&m.markov.rnn_proj.1).into(),
+                rank.into(),
+                (rank + rank + h + h).into(),
+            ],
+        )?;
+        let row = Arg::U64(logits.addr() + (r * c.vocab * 4) as u64);
+        model.k.get("inkling2_markov_bias").launch(
+            (c.vocab.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                row,
+                fold.into(),
+                (&d.latent).into(),
+                fbias.into(),
+                c.vocab.into(),
+                rank.into(),
+            ],
+        )?;
+        model.k.get("inkling2_softcap").launch(
+            (c.vocab.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[row, row, c.vocab.into(), i.logit_softcap.into()],
+        )?;
+        let out = DeviceBuffer::alloc(4)?;
+        model
+            .k
+            .get("logits_argmax")
+            .launch((1, 1, 1), (1024, 1, 1), 0, st, &[(&out).into(), row, c.vocab.into()])?;
+        st.synchronize()?;
+        let got: Vec<i32> = out.download(1)?;
+        prev = if prev_mode == 1 { anchor } else { got[0] as u32 };
+        drafts.push(prev);
+    }
+    Ok(drafts)
 }
 
 /// Drops the last `n` tokens of the preceding multi-row forward: the session's keys and history, and the draft head's

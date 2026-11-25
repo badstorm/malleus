@@ -238,6 +238,10 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "inkling2_rope_neox",
             "inkling2_bf16_rows",
             "inkling2_hist_snap",
+            "inkling2_markov_step",
+            "inkling2_markov_bias",
+            "inkling2_bf16_transpose",
+            "inkling2_to_bf16",
         ],
     ),
     (
