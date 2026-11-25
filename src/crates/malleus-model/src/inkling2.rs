@@ -92,6 +92,7 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
                 kv_heads: mu("num_key_value_heads")?,
                 head_dim: mu("head_dim")?,
                 rope_theta: v["rope_theta"].as_f64().unwrap_or(1e6) as f32,
+                eps: v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
                 window: mu("sliding_window_size")?,
                 local: v["local_layer_ids"]
                     .as_array()
@@ -900,6 +901,9 @@ fn layernorm(
 /// correction that shapes the proposed logits. The names are the file's; the semantics are the next increment.
 pub struct Mtp {
     pub fuse: DeviceBuffer,
+    /// `softmax(fuse_weight)` per row, on the host: one row per draft stage and the last one for the Markov head.
+    /// The fuse is 4x4, so its softmax is arithmetic on sixteen numbers, not a kernel.
+    pub alpha: Vec<f32>,
     pub mask_embed: DeviceBuffer,
     pub norm: DeviceBuffer,
     pub layers: Vec<MtpLayer>,
@@ -960,8 +964,21 @@ impl Mtp {
                 down: up.linear(src, &p("mlp.down_proj"), h, m.inter)?,
             });
         }
+        let fuse = up.tensor(src, "fuse_weight", &[4, 4])?;
+        let raw = fuse.download::<u16>(16)?;
+        let mut alpha = vec![0f32; 16];
+        for r in 0..4 {
+            let row: Vec<f32> = (0..4).map(|j| half::bf16::from_bits(raw[r * 4 + j]).to_f32()).collect();
+            let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let e: Vec<f32> = row.iter().map(|v| (v - mx).exp()).collect();
+            let sum: f32 = e.iter().sum();
+            for j in 0..4 {
+                alpha[r * 4 + j] = e[j] / sum;
+            }
+        }
         Ok(Some(Mtp {
-            fuse: up.tensor(src, "fuse_weight", &[4, 4])?,
+            fuse,
+            alpha,
             mask_embed: up.tensor(src, "mask_embed", &[h])?,
             norm: up.tensor(src, "norm.weight", &[h])?,
             layers,
@@ -1383,14 +1400,44 @@ pub struct Cache {
     bias: DeviceBuffer,
     tau: DeviceBuffer,
     /// The target states the MTP head reads (`mtp_config.target_layer_ids`): the state entering those visits and the
-    /// final normalized one, for the last rows of the step. `[4, DRAFT_ROWS, hidden]`, see `feat_rows`.
+    /// final normalized one, for the rows of the step. `[4, FEAT_ROWS, hidden]`, see `feat_rows`.
     feats: DeviceBuffer,
-    /// How many of the `DRAFT_ROWS` rows of `feats` this step filled (the last rows of the step).
+    /// How many of the `FEAT_ROWS` rows of `feats` this step filled (the last rows of the step).
     feat_rows: usize,
+    /// The draft head's context and keys: `None` when the model has no MTP head or `MALLEUS_MTP` is off.
+    draft: Option<Draft>,
+    /// The convolution histories after every row of the last multi-row forward, so a verify can be rolled back.
+    snap: Option<Snap>,
+}
+
+/// The MTP head's own state: one K/V row per committed token, per draft layer, fp16 like the target's cache, and the
+/// zeroed relative-bias tile the decode attention demands (this head has no bias, no sink and no output gate, so the
+/// sink and gate pointers are null and the bias row is read from a zero buffer).
+///
+/// Rows are positions `base_pos .. base_pos + len`: a prefill chunk that carries more rows than `FEAT_ROWS` can only
+/// keep the features of its tail, and then the context restarts there instead of being wrong (`reset`).
+pub struct Draft {
+    k: Vec<DeviceBuffer>,
+    v: Vec<DeviceBuffer>,
+    rows: usize,
+    len: usize,
+    base_pos: usize,
+    bias: DeviceBuffer,
+}
+
+/// The state a verify has to put back: `hist[slot][stream]` is the three-row history after every row of the step,
+/// `[t, 3, C]`, with the streams in the order the layer writes them (keys, values, attention output, MLP output).
+struct Snap {
+    rows: usize,
+    hist: Vec<[DeviceBuffer; 4]>,
 }
 
 /// Rows of target state the MTP head keeps: a verify is at most `GEMV_MAX_T` tokens, plus the bonus one.
 pub const DRAFT_ROWS: usize = crate::weights::GEMV_MAX_T + 1;
+
+/// Rows of target state one forward captures: a prefill chunk, so that the draft's context covers the prompt it was
+/// fed instead of only its last seven tokens. `[4, FEAT_ROWS, hidden]` f32 is 19 MB at 512.
+pub const FEAT_ROWS: usize = PREFILL_CHUNK;
 
 /// Tokens a prefill chunk of this model carries: the scheduler feeds the prompt in pieces of this size, and the
 /// sliding cache's ring is sized for one (`window + PREFILL_CHUNK + DRAFT_ROWS + 1`).
@@ -1443,7 +1490,14 @@ pub fn session_bytes(cfg: &Config, ctx: usize) -> u64 {
     }
     t += (i.heads * ctx * 4) as u64;
     t += 4;
-    t += (4 * DRAFT_ROWS * cfg.hidden * 4) as u64;
+    let feat_rows = if draft_enabled() { FEAT_ROWS } else { DRAFT_ROWS };
+    t += (4 * feat_rows * cfg.hidden * 4) as u64;
+    // The draft head's context: one K/V row per committed token per draft layer, plus the block's own rows.
+    if let Some(m) = i.mtp.as_ref() {
+        let d = (m.kv_heads * m.head_dim) as u64;
+        t += m.layers as u64 * 2 * (ctx as u64 + DRAFT_ROWS as u64) * d * 2;
+        t += (m.heads * (ctx + DRAFT_ROWS) * 4) as u64;
+    }
     t
 }
 
@@ -1468,14 +1522,37 @@ impl Cache {
                 past_moe: DeviceBuffer::zeroed(3 * c.hidden * 4)?,
             });
         }
+        let draft = match i.mtp.as_ref().filter(|_| draft_enabled()) {
+            Some(m) => {
+                let d = m.kv_heads * m.head_dim;
+                let rows = max_ctx + DRAFT_ROWS;
+                let mut k = Vec::with_capacity(m.layers);
+                let mut v = Vec::with_capacity(m.layers);
+                for _ in 0..m.layers {
+                    k.push(DeviceBuffer::alloc(rows * d * 2)?);
+                    v.push(DeviceBuffer::alloc(rows * d * 2)?);
+                }
+                Some(Draft {
+                    k,
+                    v,
+                    rows,
+                    len: 0,
+                    base_pos: 0,
+                    bias: DeviceBuffer::zeroed(m.heads * rows * 4)?,
+                })
+            }
+            None => None,
+        };
         Ok(Self {
             max: max_ctx,
             len: 0,
             slots: out,
             bias: f32s(i.heads * max_ctx)?,
             tau: f32s(1)?,
-            feats: f32s(4 * DRAFT_ROWS * c.hidden)?,
+            feats: f32s(4 * if draft.is_some() { FEAT_ROWS } else { DRAFT_ROWS } * c.hidden)?,
             feat_rows: 0,
+            draft,
+            snap: None,
         })
     }
 
@@ -1489,6 +1566,33 @@ impl Cache {
         }
         st.synchronize()?;
         self.len = 0;
+        if let Some(d) = self.draft.as_mut() {
+            d.len = 0;
+            d.base_pos = 0;
+        }
+        self.snap = None;
+        Ok(())
+    }
+
+    /// Keeps the three-row history of every row of a `t`-row forward, so that a verify can be rolled back to any of
+    /// its rows (`rollback`). Allocated once per session and reused while `t` does not grow.
+    fn snapshot(&mut self, t: usize) -> Result<()> {
+        if self.snap.as_ref().is_some_and(|s| s.rows >= t) {
+            return Ok(());
+        }
+        let mut hist = Vec::with_capacity(self.slots.len());
+        for s in &self.slots {
+            // `[3, C]` f32: C is the width of the stream the history belongs to.
+            let kvd = s.past_k.len() / 12;
+            let hd = s.past_y.len() / 12;
+            hist.push([
+                DeviceBuffer::zeroed(t * 3 * kvd * 4)?,
+                DeviceBuffer::zeroed(t * 3 * kvd * 4)?,
+                DeviceBuffer::zeroed(t * 3 * hd * 4)?,
+                DeviceBuffer::zeroed(t * 3 * hd * 4)?,
+            ]);
+        }
+        self.snap = Some(Snap { rows: t, hist });
         Ok(())
     }
 
@@ -1579,6 +1683,9 @@ fn slot_of(i: &Inkling2Config, n_layers: usize, pass: usize, l: usize) -> usize 
 /// the position factor. Taken per layer, so the borrow of the session's cache lasts one layer.
 struct Place<'a> {
     slot: &'a mut Slot,
+    /// The four per-row history snapshots of this slot, or `None` outside a multi-row forward: a verify keeps the
+    /// history of every row so that a rollback of its tail can put one back.
+    snap: Option<&'a [DeviceBuffer; 4]>,
     bias: &'a DeviceBuffer,
     tau: &'a DeviceBuffer,
     /// Position of the first row of this call.
@@ -1590,7 +1697,27 @@ struct Place<'a> {
 
 /// Keeps the last three rows of a convolution's input in `past` ([3, C], oldest first), so the next call convolves
 /// across the boundary. `pos` is the position of the first row of `x`; rows before the sequence stay zero.
-fn keep_last3(st: &Stream, past: &DeviceBuffer, x: &DeviceBuffer, pos: usize, t: usize, c: usize) -> Result<()> {
+fn keep_last3(
+    model: &Model,
+    st: &Stream,
+    past: &DeviceBuffer,
+    x: &DeviceBuffer,
+    pos: usize,
+    t: usize,
+    c: usize,
+    snap: Option<&DeviceBuffer>,
+) -> Result<()> {
+    // A multi-row step also keeps the history of *every* row it saw: a verify that only commits a prefix of its rows
+    // has to put the history of the last committed row back, which no end-of-step buffer can answer.
+    if let Some(sn) = snap.filter(|_| t > 1) {
+        model.k.get("inkling2_hist_snap").launch(
+            ((t * c).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[sn.into(), past.into(), x.into(), pos.into(), t.into(), c.into()],
+        )?;
+    }
     for i in 0..3 {
         // The row of the new history is global position pos + t - 3 + i: from `x` when the call has it, from the old
         // history otherwise. Increasing i keeps every read ahead of the write that would clobber it.
@@ -2014,8 +2141,8 @@ impl Graph {
         if let Some(p) = place.as_mut()
             && !one
         {
-            keep_last3(st, &p.slot.past_k, &self.k, p.pos, t, kvd)?;
-            keep_last3(st, &p.slot.past_v, &self.v, p.pos, t, kvd)?;
+            keep_last3(model, st, &p.slot.past_k, &self.k, p.pos, t, kvd, p.snap.map(|s| &s[0]))?;
+            keep_last3(model, st, &p.slot.past_v, &self.v, p.pos, t, kvd, p.snap.map(|s| &s[1]))?;
         }
         self.k.copy_from_shared(0, &self.kt, 0, t * kvd * 4, st)?;
         self.v.copy_from_shared(0, &self.vt, 0, t * kvd * 4, st)?;
@@ -2210,7 +2337,7 @@ impl Graph {
         if let Some(p) = place.as_mut()
             && !one
         {
-            keep_last3(st, &p.slot.past_y, &self.y, p.pos, t, h)?;
+            keep_last3(model, st, &p.slot.past_y, &self.y, p.pos, t, h, p.snap.map(|s| &s[2]))?;
         }
         self.y.copy_from_shared(0, &self.yt, 0, t * h * 4, st)?;
 
@@ -2309,7 +2436,16 @@ impl Graph {
         if let Some(p) = place.as_mut()
             && !one
         {
-            keep_last3(st, &p.slot.past_moe, &self.moe_out, p.pos, t, h)?;
+            keep_last3(
+                model,
+                st,
+                &p.slot.past_moe,
+                &self.moe_out,
+                p.pos,
+                t,
+                h,
+                p.snap.map(|s| &s[3]),
+            )?;
         }
         self.moe_out.copy_from_shared(0, &self.yt, 0, t * h * 4, st)?;
         add(model, st, &self.x, &self.moe_out, t * h)?;
@@ -2727,6 +2863,11 @@ fn run_mm(
         let tau = 1.0 + i.log_alpha * (((pos + 1) as f32) / i.log_floor as f32).max(1.0).ln();
         k.tau.upload(&[tau])?;
     }
+    if let Some(k) = cache.as_deref_mut()
+        && t > 1
+    {
+        k.snapshot(t)?;
+    }
     let mut g = Graph::new(model, t, pos)?;
 
     let ids32: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
@@ -2778,12 +2919,16 @@ fn run_mm(
         let v = visit_of(l, pass);
         i.mtp.as_ref()?.target_layers.iter().position(|&x| x == v)
     };
-    let nr = t.min(DRAFT_ROWS);
+    // The rows whose four target states the step keeps: the whole step up to one prefill chunk, because the draft's
+    // context wants a K/V row per committed token and not only per row it drafts from (`FEAT_ROWS`).
+    let nr = t.min(FEAT_ROWS);
     let feat = |cache: &mut Option<&mut Cache>, gx: &DeviceBuffer, j: usize| -> Result<()> {
         let Some(k) = cache.as_deref_mut() else { return Ok(()) };
-        // The last `nr` rows of the step, at the head of the slot block: the draft reads the rows it will draft from.
+        if k.draft.is_none() {
+            return Ok(());
+        }
         k.feats
-            .copy_from_shared(j * DRAFT_ROWS * h * 4, gx, (t - nr) * h * 4, nr * h * 4, st)?;
+            .copy_from_shared(j * FEAT_ROWS * h * 4, gx, (t - nr) * h * 4, nr * h * 4, st)?;
         k.feat_rows = nr;
         Ok(())
     };
@@ -2837,8 +2982,15 @@ fn run_mm(
 
     // The final attention residual, the norm and the head, on the last `out_rows` rows only: a generation step
     // wants one row, and the head is 201 024 x 2304 — running it on a whole prompt is a 1.65 GB download at 8K.
+    // With the draft head on, the norm runs on every row the step captured instead (the fourth target state is the
+    // normalized state of each committed token); the head itself still runs on the rows asked for.
     let out_rows = n_logits.clamp(1, t);
-    let row0 = t - out_rows;
+    let draft_rows = match cache.as_ref().and_then(|k| k.draft.as_ref()) {
+        Some(_) => t.min(FEAT_ROWS),
+        None => out_rows,
+    };
+    let norm_rows = draft_rows.max(out_rows);
+    let row0 = t - norm_rows;
     mix(
         model,
         st,
@@ -2853,21 +3005,32 @@ fn run_mm(
         c.eps,
         row0,
     )?;
-    rms(model, st, &g.normed, &g.mix_out, &w.norm, out_rows, h, c.eps)?;
+    rms(model, st, &g.normed, &g.mix_out, &w.norm, norm_rows, h, c.eps)?;
     if let Some(j) = i.mtp.as_ref().and_then(|m| m.target_layers.len().checked_sub(1)) {
-        // The last feature is the final normalized state, which only the rows the head runs on have.
-        let nr = nr.min(out_rows);
+        // The last feature is the final normalized state: the rows the step kept, aligned with the other three.
+        let nr = nr.min(norm_rows);
         if let Some(k) = cache.as_deref_mut() {
             k.feats.copy_from_shared(
-                j * DRAFT_ROWS * h * 4,
+                j * FEAT_ROWS * h * 4,
                 &g.normed,
-                (out_rows - nr) * h * 4,
+                (norm_rows - nr) * h * 4,
                 nr * h * 4,
                 st,
             )?;
         }
     }
     let logits_out = f32s(out_rows * c.vocab)?;
+    // The head reads the last `out_rows` rows of the normalized state, which sit past the first of `norm_rows` once
+    // the draft head has asked for them all: with the draft off they are the same rows and nothing is copied.
+    let head_copy = if norm_rows != out_rows {
+        Some(f32s(out_rows * h)?)
+    } else {
+        None
+    };
+    if let Some(b) = &head_copy {
+        b.copy_from_shared(0, &g.normed, (norm_rows - out_rows) * h * 4, out_rows * h * 4, st)?;
+    }
+    let head_src = head_copy.as_ref().unwrap_or(&g.normed);
     lin(
         model,
         st,
@@ -2875,7 +3038,7 @@ fn run_mm(
         &mut g.xh,
         &mut g.xsc,
         &logits_out,
-        &g.normed,
+        head_src,
         &w.unembed,
         out_rows,
     )?;
@@ -2884,13 +3047,21 @@ fn run_mm(
     // row and a serial step at the same position carry the same bytes (`MALLEUS_INKLING2_MTP_DUMP`).
     if let (Ok(dir), Some(k)) = (std::env::var("MALLEUS_INKLING2_MTP_DUMP"), cache.as_ref()) {
         st.synchronize()?;
-        let v = k.feats.download::<f32>(4 * DRAFT_ROWS * h)?;
+        let v = k.feats.download::<f32>(k.feats.len() / 4)?;
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         std::fs::write(format!("{dir}/mtp_feats_{pos}_{t}.f32"), bytes)?;
         eprintln!(
             "mtp features: pos {pos}, {t} rows, {} of {DRAFT_ROWS} kept",
             k.feat_rows
         );
+    }
+    // The committed rows' draft context, from the features the step kept: one K/V row per token and draft layer.
+    if let Some(k) = cache {
+        let rows = k.feat_rows;
+        if rows > 0 {
+            let start = k.len - rows;
+            draft_commit(model, k, start, rows)?;
+        }
     }
     Ok(logits_out.download(out_rows * c.vocab)?)
 }
@@ -2914,9 +3085,13 @@ pub fn logits_mm(
 /// `Place` for one layer of the session's cache, or `None` without a cache.
 fn place_of(cache: Option<&mut Cache>, slot: usize, pos: usize, one: bool) -> Option<Place<'_>> {
     cache.map(|c| {
-        let Cache { slots, bias, tau, .. } = c;
+        let Cache {
+            slots, bias, tau, snap, ..
+        } = c;
+        let snap = snap.as_ref().filter(|s| s.rows > 1).map(|s| &s.hist[slot]);
         Place {
             slot: &mut slots[slot],
+            snap,
             bias: &*bias,
             tau: &*tau,
             pos,
@@ -3442,6 +3617,315 @@ pub fn generate(model: &Model, tokens: &[u32], n: usize) -> Result<Vec<u32>> {
         next = argmax(&run(model, &[next], Some(&mut cache), 1)?, i.unpadded_vocab);
     }
     Ok(out)
+}
+
+// ---- the MTP head (issue #110, item 6): a block of drafts the verify then checks ----
+
+/// Whether the draft head drafts. Opt-in (`MALLEUS_MTP=1`) until its acceptance is measured in service: a head that
+/// proposes badly pays for the verify without earning it back.
+pub fn draft_enabled() -> bool {
+    std::env::var_os("MALLEUS_MTP").is_some_and(|v| v != "0")
+}
+
+/// The draft head's open questions, as a number each: the block's positions, which rows the head reads, whether the
+/// anchor row is normalized, and the rope. They exist because the head has no reference implementation to compare
+/// against, only its acceptance; `MALLEUS_MTP_*` picks a variant and the default is the one the numbers chose.
+fn knob(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// The draft head's context: for every row of the step just run, the mix of its four target states through the
+/// layer's `k_proj_ctx`/`v_proj_ctx`, the per-head `k_norm_ctx` and the rope. One K/V row per committed token and
+/// draft layer, which is what the block attends to. Called from `run_mm` with the rows the step kept.
+fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result<()> {
+    let c = &model.cfg;
+    let i = c.inkling2.as_ref().context("no inkling2 config")?;
+    let w = model.inkling2.as_ref().context("no inkling2 weights")?;
+    let (Some(m), Some(g)) = (w.mtp.as_ref(), i.mtp.as_ref()) else {
+        return Ok(());
+    };
+    let Some(d) = k.draft.as_mut() else { return Ok(()) };
+    let h = c.hidden;
+    let (nkv, hd) = (g.kv_heads, g.head_dim);
+    let kvd = nkv * hd;
+    let rope_mode = knob("MALLEUS_MTP_ROPE", 0) as i32;
+    if pos != d.base_pos + d.len || d.len + rows > d.rows {
+        // A step that carried more rows than the features hold (a whole prompt in one forward, as `eval` runs it):
+        // the context restarts at the rows it has instead of pretending the missing ones are there.
+        d.len = 0;
+        d.base_pos = pos;
+    }
+    let rows = rows.min(d.rows - d.len);
+    if rows == 0 {
+        return Ok(());
+    }
+    let st = &model.stream;
+    let pv: Vec<i32> = (0..rows).map(|r| (d.base_pos + d.len + r) as i32).collect();
+    let pbuf = DeviceBuffer::from_slice(&pv)?;
+    let mix = f32s(rows * h)?;
+    let kb = f32s(rows * kvd)?;
+    let vb = f32s(rows * kvd)?;
+    for s in 0..g.layers {
+        let l = &m.layers[s];
+        let alpha = DeviceBuffer::from_slice(&m.alpha[s * 4..s * 4 + 4])?;
+        model.k.get("inkling2_draft_mix").launch(
+            (rows.div_ceil(8) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&mix).into(),
+                (&k.feats).into(),
+                (&alpha).into(),
+                (&l.dflare_norm).into(),
+                rows.into(),
+                FEAT_ROWS.into(),
+                h.into(),
+                g.eps.into(),
+            ],
+        )?;
+        raw_gemm(model, st, &kb, &mix, &l.k_ctx, rows, kvd, h)?;
+        rms(model, st, &kb, &kb, &l.k_norm_ctx, rows * nkv, hd, g.eps)?;
+        model.k.get("inkling2_rope_neox").launch(
+            ((rows * nkv * hd / 2).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[
+                (&kb).into(),
+                (&pbuf).into(),
+                rows.into(),
+                nkv.into(),
+                hd.into(),
+                g.rope_theta.into(),
+                rope_mode.into(),
+            ],
+        )?;
+        raw_gemm(model, st, &vb, &mix, &l.v_ctx, rows, kvd, h)?;
+        for (dst, src) in [(&d.k[s], &kb), (&d.v[s], &vb)] {
+            model.k.get("inkling2_kv_store").launch(
+                ((rows * kvd).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    dst.into(),
+                    src.into(),
+                    (d.base_pos + d.len).into(),
+                    rows.into(),
+                    d.rows.into(),
+                    0i32.into(),
+                    kvd.into(),
+                ],
+            )?;
+        }
+    }
+    d.len += rows;
+    Ok(())
+}
+
+/// The drafts of the block that follows `anchor`: the block's rows are the anchor token's embedding and `mask_embed`
+/// for the proposals, the context is the draft cache, and the head's base logits are the target's `unembed` on the
+/// proposal rows. `n` of them at most (`DRAFT_ROWS - 1`).
+pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<Vec<u32>> {
+    let c = &model.cfg;
+    let i = c.inkling2.as_ref().context("no inkling2 config")?;
+    let w = model.inkling2.as_ref().context("no inkling2 weights")?;
+    let (Some(m), Some(g)) = (w.mtp.as_ref(), i.mtp.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    let Some(d) = cache.draft.as_mut() else {
+        return Ok(Vec::new());
+    };
+    let (heads, nkv, hd, inter) = (g.heads, g.kv_heads, g.head_dim, g.inter);
+    let (kvd, qd) = (nkv * hd, heads * hd);
+    let h = c.hidden;
+    let n = n.min(DRAFT_ROWS - 1).min(d.rows.saturating_sub(d.len + 1));
+    if n == 0 || d.len == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = n + 1;
+    let st = &model.stream;
+    let base = d.len;
+    let rope_mode = knob("MALLEUS_MTP_ROPE", 0) as i32;
+    let pos_mode = knob("MALLEUS_MTP_POS", 0);
+    let logit_rows = knob("MALLEUS_MTP_LOGITS", 0);
+    let emb_norm = knob("MALLEUS_MTP_EMB", 1);
+    let anchor_pos = (d.base_pos + base - 1) as i32 + pos_mode as i32;
+    let scale = 1.0 / (hd as f32).sqrt();
+    // Row 0 is the anchor token, at the anchor's own position; the proposals are the mask row, one position each.
+    let x = f32s(rows * h)?;
+    let idb = DeviceBuffer::from_slice(&[anchor as i32])?;
+    model.k.get("embed_bf16").launch(
+        (1, 1, 1),
+        (256, 1, 1),
+        0,
+        st,
+        &[(&x).into(), (&w.embed).into(), (&idb).into(), h.into()],
+    )?;
+    for r in 1..rows {
+        model.k.get("inkling2_bf16_rows").launch(
+            (h.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            st,
+            &[(&x).into(), (&m.mask_embed).into(), (r * h).into(), h.into()],
+        )?;
+    }
+    let pv: Vec<i32> = (0..rows).map(|r| anchor_pos + r as i32).collect();
+    let pbuf = DeviceBuffer::from_slice(&pv)?;
+    let cur = f32s(rows * h)?;
+    cur.copy_from_shared(0, &x, 0, rows * h * 4, st)?;
+    if emb_norm == 1 {
+        // The anchor row normalized with the text stack's embedding norm (the other candidate for "the anchor
+        // token's embedding").
+        let n0 = f32s(h)?;
+        rms(model, st, &n0, &cur, &w.embed_norm, 1, h, c.eps)?;
+        cur.copy_from_shared(0, &n0, 0, h * 4, st)?;
+    }
+    let normed = f32s(rows * h)?;
+    let proj = f32s(rows * h)?;
+    let q = f32s(rows * qd)?;
+    let kb = f32s(rows * kvd)?;
+    let vb = f32s(rows * kvd)?;
+    let attn = f32s(rows * qd)?;
+    let act = f32s(rows * inter)?;
+    let up = f32s(rows * inter)?;
+    // The GEMM input's three forms (`gemm` checks them): the wide one is the down projection's 9216-value input.
+    let kmax = inter.max(h).max(qd);
+    let mut xr = f32s(rows * kmax)?;
+    let mut xh = f32s(rows * kmax / 2)?;
+    let mut xsc = f32s(rows * kmax.div_ceil(128))?;
+    for s in 0..g.layers {
+        let l = &m.layers[s];
+        rms(model, st, &normed, &cur, &l.input_norm, rows, h, g.eps)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &q, &normed, &l.q, rows)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &kb, &normed, &l.k, rows)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &vb, &normed, &l.v, rows)?;
+        rms(model, st, &q, &q, &l.q_norm, rows * heads, hd, g.eps)?;
+        rms(model, st, &kb, &kb, &l.k_norm, rows * nkv, hd, g.eps)?;
+        for (dst, src, nh) in [(&q, &q, heads), (&kb, &kb, nkv)] {
+            let _ = dst;
+            model.k.get("inkling2_rope_neox").launch(
+                ((rows * nh * hd / 2).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    src.into(),
+                    (&pbuf).into(),
+                    rows.into(),
+                    nh.into(),
+                    hd.into(),
+                    g.rope_theta.into(),
+                    rope_mode.into(),
+                ],
+            )?;
+        }
+        // The block's own keys go into the same cache the context lives in, after it: row `r` sees every committed
+        // token and the rows of the block before it.
+        for (dst, src) in [(&d.k[s], &kb), (&d.v[s], &vb)] {
+            model.k.get("inkling2_kv_store").launch(
+                ((rows * kvd).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    dst.into(),
+                    src.into(),
+                    base.into(),
+                    rows.into(),
+                    d.rows.into(),
+                    0i32.into(),
+                    kvd.into(),
+                ],
+            )?;
+        }
+        let local = g.local.contains(&s);
+        for r in 0..rows {
+            let all = base + r + 1;
+            let (k0, nk) = if local && all > g.window {
+                (all - g.window, g.window)
+            } else {
+                (0, all)
+            };
+            model.k.get("inkling2_attn_dec").launch(
+                (heads as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[
+                    Arg::U64(attn.addr() + (r * qd * 4) as u64),
+                    Arg::U64(q.addr() + (r * qd * 4) as u64),
+                    (&d.k[s]).into(),
+                    (&d.v[s]).into(),
+                    (&d.bias).into(),
+                    Arg::Ptr(0),
+                    Arg::Ptr(0),
+                    k0.into(),
+                    nk.into(),
+                    heads.into(),
+                    nkv.into(),
+                    hd.into(),
+                    0i32.into(),
+                    scale.into(),
+                ],
+            )?;
+        }
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &proj, &attn, &l.o, rows)?;
+        add(model, st, &cur, &proj, rows * h)?;
+        rms(model, st, &normed, &cur, &l.post_attention_norm, rows, h, g.eps)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &act, &normed, &l.gate, rows)?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &up, &normed, &l.up, rows)?;
+        model.ew(
+            st,
+            "silu_mul",
+            rows * inter,
+            &[(&act).into(), (&act).into(), (&up).into(), (rows * inter).into()],
+        )?;
+        lin(model, st, &mut xr, &mut xh, &mut xsc, &proj, &act, &l.down, rows)?;
+        add(model, st, &cur, &proj, rows * h)?;
+    }
+    rms(model, st, &normed, &cur, &m.norm, rows, h, g.eps)?;
+    let r0 = if logit_rows == 0 { 1 } else { 0 };
+    let head_in = f32s(n * h)?;
+    head_in.copy_from_shared(0, &normed, r0 * h * 4, n * h * 4, st)?;
+    let logits = f32s(n * c.vocab)?;
+    lin(model, st, &mut xr, &mut xh, &mut xsc, &logits, &head_in, &w.unembed, n)?;
+    softcap(model, st, &logits, n * c.vocab, i.logit_softcap)?;
+    let v = logits.download::<f32>(n * c.vocab)?;
+    Ok((0..n)
+        .map(|r| argmax(&v[r * c.vocab..(r + 1) * c.vocab], c.vocab))
+        .collect())
+}
+
+/// Drops the last `n` tokens of the preceding multi-row forward: the session's keys and history, and the draft head's
+/// context with them.
+pub fn rollback(model: &Model, cache: &mut Cache, n: usize) -> Result<()> {
+    let _ = model;
+    let Some(snap) = cache.snap.take() else {
+        return Ok(());
+    };
+    let t = snap.rows;
+    ensure!(n < t, "rollback of {n} tokens after a {t}-row verify");
+    let keep = t - n;
+    let st = Stream::null();
+    for (s, hist) in cache.slots.iter().zip(&snap.hist) {
+        for (i, past) in [&s.past_k, &s.past_v, &s.past_y, &s.past_moe].into_iter().enumerate() {
+            if keep == 0 {
+                past.memset(0, &st)?;
+            } else {
+                let w = past.len() / 12;
+                past.copy_from_shared(0, &hist[i], (keep - 1) * 3 * w * 4, 3 * w * 4, &st)?;
+            }
+        }
+    }
+    st.synchronize()?;
+    cache.len -= n;
+    if let Some(d) = cache.draft.as_mut() {
+        d.len = d.len.saturating_sub(n);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -234,6 +234,10 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "inkling2_quant_i8",
             "inkling2_copy_nq",
             "inkling2_kv_store",
+            "inkling2_draft_mix",
+            "inkling2_rope_neox",
+            "inkling2_bf16_rows",
+            "inkling2_hist_snap",
         ],
     ),
     (
