@@ -866,7 +866,8 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_hist_snap(float* snap
 // ---- the Markov half of the MTP head: the walk that shapes the proposed logits ----
 
 // One step of the walk: `h = rnn_proj @ in + bias` (5120 -> 768 = 3 x rank), then
-// `gate = sigmoid(h[2r]), state' = gate * state + (1 - gate) * tanh(h[r]), latent = tanh(h[r + rank])`.
+// `gate = sigmoid(h[r]), state' = gate * state + (1 - gate) * tanh(h[r + rank]), latent = tanh(h[2r + rank])`:
+// the published head splits the projection in three blocks, gate first and the latent last.
 // `in` is [state | markov_w1[prev] | hidden | f_rnn], `w` is [3 * rank, 5120] bf16, one warp an output row.
 extern "C" __global__ void __launch_bounds__(256) inkling2_markov_step(float* state, float* latent, const float* in,
                                                                      const ik_bf16* w, const ik_bf16* bias, int rank,
@@ -883,9 +884,9 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_markov_step(float* st
     __syncthreads();
     if (threadIdx.x < rank) {
         const int r = threadIdx.x;
-        const float gate = 1.f / (1.f + expf(-sh[2 * rank + r]));
-        state[r] = gate * state[r] + (1.f - gate) * tanhf(sh[r]);
-        latent[r] = tanhf(sh[rank + r]);
+        const float gate = 1.f / (1.f + expf(-sh[r]));
+        state[r] = gate * state[r] + (1.f - gate) * tanhf(sh[rank + r]);
+        latent[r] = tanhf(sh[2 * rank + r]);
     }
 }
 

@@ -3018,7 +3018,11 @@ fn run_mm(
     if let Some(j) = i.mtp.as_ref().and_then(|m| m.target_layers.len().checked_sub(1)) {
         // The last feature is the final normalized state: the rows the step kept, aligned with the other three.
         let nr = nr.min(norm_rows);
-        if let Some(k) = cache.as_deref_mut() {
+        // The planner only gives the features a prefill chunk's worth of rows when the head is on; with it off the
+        // buffer holds `DRAFT_ROWS` and nothing reads them.
+        if let Some(k) = cache.as_deref_mut()
+            && k.draft.is_some()
+        {
             k.feats.copy_from_shared(
                 j * FEAT_ROWS * h * 4,
                 &g.normed,
@@ -3694,7 +3698,14 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
                 g.eps.into(),
             ],
         )?;
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("commit_mix{s}"), st, &mix, rows, h)?;
+            draft_dump(&dir, &format!("alpha{s}"), st, &alpha, 4, 1)?;
+        }
         raw_gemm(model, st, &kb, &mix, &l.k_ctx, rows, kvd, h)?;
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("commit_kraw{s}"), st, &kb, rows, kvd)?;
+        }
         rms(model, st, &kb, &kb, &l.k_norm_ctx, rows * nkv, hd, g.eps)?;
         model.k.get("inkling2_rope_neox").launch(
             ((rows * nkv * hd / 2).div_ceil(256) as u32, 1, 1),
@@ -3798,6 +3809,30 @@ fn markov_fold(model: &Model, d: &mut Draft) -> Result<()> {
     Ok(())
 }
 
+/// Debug: the draft head's stages as files, so a reference implementation can be diffed against the engine stage by
+/// stage instead of only through the acceptance (`MALLEUS_MTP_DUMP=<dir>`, see `scripts/inkling2_mtp_ref.py`): the
+/// anchor's four target states, the draft cache, each layer's input norm, keys, values and attention output, the
+/// block's hidden after every layer, its normalized form, the Markov walk's inputs and latent.
+///
+/// Every file is rewritten on every call, and a draft call is the only place they are all written: read them after a
+/// run that ends with a draft, and never mix them with the commit-time dumps (`commit_*`), which come from the
+/// forward *before* the draft and therefore carry different features.
+fn draft_dump_half(dir: &str, name: &str, st: &Stream, buf: &DeviceBuffer, n: usize) -> Result<()> {
+    st.synchronize()?;
+    let v: Vec<u16> = buf.download::<u16>(n)?;
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    std::fs::write(format!("{dir}/{name}.f16"), bytes)?;
+    Ok(())
+}
+
+fn draft_dump(dir: &str, name: &str, st: &Stream, buf: &DeviceBuffer, n: usize, h: usize) -> Result<()> {
+    st.synchronize()?;
+    let v = buf.download::<f32>(n * h)?;
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    std::fs::write(format!("{dir}/{name}.f32"), bytes)?;
+    Ok(())
+}
+
 /// The drafts of the block that follows `anchor`: the block's rows are the anchor token's embedding and `mask_embed`
 /// for the proposals, the context is the draft cache, and the head's base logits are the target's `unembed` on the
 /// proposal rows. `n` of them at most (`DRAFT_ROWS - 1`).
@@ -3882,7 +3917,13 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
     let mut xsc = f32s(rows * kmax.div_ceil(128))?;
     for s in 0..g.layers {
         let l = &m.layers[s];
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("layer_in{s}"), st, &cur, rows, h)?;
+        }
         rms(model, st, &normed, &cur, &l.input_norm, rows, h, g.eps)?;
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("layer_xn{s}"), st, &normed, rows, h)?;
+        }
         lin(model, st, &mut xr, &mut xh, &mut xsc, &q, &normed, &l.q, rows)?;
         lin(model, st, &mut xr, &mut xh, &mut xsc, &kb, &normed, &l.k, rows)?;
         lin(model, st, &mut xr, &mut xh, &mut xsc, &vb, &normed, &l.v, rows)?;
@@ -3956,7 +3997,16 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                 ],
             )?;
         }
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("blk_attn{s}"), st, &attn, rows, qd)?;
+            draft_dump(&dir, &format!("blk_q{s}"), st, &q, rows, qd)?;
+            draft_dump(&dir, &format!("blk_k{s}"), st, &kb, rows, kvd)?;
+            draft_dump(&dir, &format!("blk_v{s}"), st, &vb, rows, kvd)?;
+        }
         lin(model, st, &mut xr, &mut xh, &mut xsc, &proj, &attn, &l.o, rows)?;
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("blk_o{s}"), st, &proj, rows, h)?;
+        }
         add(model, st, &cur, &proj, rows * h)?;
         rms(model, st, &normed, &cur, &l.post_attention_norm, rows, h, g.eps)?;
         lin(model, st, &mut xr, &mut xh, &mut xsc, &act, &normed, &l.gate, rows)?;
@@ -3969,8 +4019,16 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
         )?;
         lin(model, st, &mut xr, &mut xh, &mut xsc, &proj, &act, &l.down, rows)?;
         add(model, st, &cur, &proj, rows * h)?;
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("block_h{s}"), st, &cur, rows, h)?;
+            draft_dump(&dir, &format!("ctx_k{s}"), st, &kb, rows, kvd)?;
+            draft_dump(&dir, &format!("ctx_v{s}"), st, &vb, rows, kvd)?;
+        }
     }
     rms(model, st, &normed, &cur, &m.norm, rows, h, g.eps)?;
+    if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+        draft_dump(&dir, "normed", st, &normed, rows, h)?;
+    }
     let r0 = if logit_rows == 0 && anchor_row { 1 } else { 0 };
     let head_in = f32s(n * h)?;
     head_in.copy_from_shared(0, &normed, r0 * h * 4, n * h * 4, st)?;
@@ -3980,6 +4038,36 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
     // The Markov half: the anchor's own mixture (`alpha[-1]` with `markov_head.dflare_norm`) is the walk's context,
     // and the walk runs over the rows in order because a row's bias conditions on the token before it — the anchor
     // for the first, the proposal before it after that.
+    if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+        let anchor_feats = f32s(4 * h)?;
+        for j in 0..4 {
+            anchor_feats.copy_from_shared(
+                (j * h) * 4,
+                feats,
+                (j * FEAT_ROWS * h + (feat_rows.max(1) - 1) * h) * 4,
+                h * 4,
+                st,
+            )?;
+        }
+        draft_dump(&dir, "anchor_feats", st, &anchor_feats, 4, h)?;
+        draft_dump(&dir, "feats_planes", st, feats, 4 * FEAT_ROWS, h)?;
+        for s in 0..g.layers {
+            draft_dump_half(&dir, &format!("ctx_cache_k{s}"), st, &d.k[s], base * kvd)?;
+            draft_dump_half(&dir, &format!("ctx_cache_v{s}"), st, &d.v[s], base * kvd)?;
+        }
+        let meta = format!(
+            "{{\"anchor\": {anchor}, \"pos\": {}, \"rows\": {rows}, \"feat_rows\": {feat_rows}, \"h\": {h}, \
+             \"heads\": {heads}, \"kv_heads\": {nkv}, \"head_dim\": {hd}, \"inter\": {inter}, \"vocab\": {},\
+             \"rank\": {}, \"theta\": {}, \"eps\": {}, \"window\": {}}}",
+            d.base_pos + base - 1,
+            c.vocab,
+            g.markov_rank,
+            g.rope_theta,
+            g.eps,
+            g.window
+        );
+        std::fs::write(format!("{dir}/mtp.json"), meta)?;
+    }
     let rank = g.markov_rank;
     let hid_mode = knob("MALLEUS_MTP_HID", 0);
     let prev_mode = knob("MALLEUS_MTP_PREV", 0);
@@ -4008,11 +4096,14 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
     markov_fold(model, d)?;
     let (fold, fbias) = d.fold.as_ref().context("markov fold")?;
     let walk = f32s(rank + rank + h + h)?;
+    if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+        draft_dump(&dir, "frnn", st, &frnn, 1, h)?;
+    }
     // The walk's context: the anchor's Markov mixture, or its normalized hidden state.
     if knob("MALLEUS_MTP_FRNN", 0) == 1 {
-        walk.copy_from_shared(2 * rank * 4, &normed, (rows - 1) * h * 4, h * 4, st)?;
+        walk.copy_from_shared((2 * rank + h) * 4, &normed, (rows - 1) * h * 4, h * 4, st)?;
     } else {
-        walk.copy_from_shared(2 * rank * 4, &frnn, 0, h * 4, st)?;
+        walk.copy_from_shared((2 * rank + h) * 4, &frnn, 0, h * 4, st)?;
     }
     let markov = knob("MALLEUS_MTP_MARKOV", 1) == 1;
     let mut drafts: Vec<u32> = Vec::with_capacity(n);
@@ -4057,7 +4148,10 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
             ],
         )?;
         let hid = if hid_mode == 1 { &cur } else { &normed };
-        walk.copy_from_shared(2 * rank * 4 + h * 4, hid, (r0 + r) * h * 4, h * 4, st)?;
+        walk.copy_from_shared(2 * rank * 4, hid, (r0 + r) * h * 4, h * 4, st)?;
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("walk{r}"), st, &walk, rank + rank + h + h, 1)?;
+        }
         model.k.get("inkling2_markov_step").launch(
             (1, 1, 1),
             (256, 1, 1),
@@ -4073,6 +4167,10 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                 (rank + rank + h + h).into(),
             ],
         )?;
+        if let Ok(dir) = std::env::var("MALLEUS_MTP_DUMP") {
+            draft_dump(&dir, &format!("latent{r}"), st, &d.latent, rank, 1)?;
+            draft_dump(&dir, &format!("state{r}"), st, &d.state, rank, 1)?;
+        }
         let row = Arg::U64(logits.addr() + (r * c.vocab * 4) as u64);
         model.k.get("inkling2_markov_bias").launch(
             (c.vocab.div_ceil(256) as u32, 1, 1),
@@ -4131,6 +4229,10 @@ pub fn rollback(model: &Model, cache: &mut Cache, n: usize) -> Result<()> {
     }
     st.synchronize()?;
     cache.len -= n;
+    // The rows of the last step that were *not* committed stop being features: the draft head reads the anchor as
+    // `feats[feat_rows - 1]`, and after a partly accepted verify that is the last committed row, not the last row of
+    // the verify. This is the bug the stage-by-stage diff found.
+    cache.feat_rows = cache.feat_rows.saturating_sub(n);
     if let Some(d) = cache.draft.as_mut() {
         d.len = d.len.saturating_sub(n);
     }

@@ -223,6 +223,12 @@ impl Family {
         if !key_proj && !mls4.iter().any(|s| name.ends_with(s)) {
             return Kind::Raw;
         }
+        // Inkling-2's MTP head keeps its own layers at bf16. The implementation the head is checked against refuses
+        // anything else there, and 4 bits cost it ~4 % of the hidden state its argmax is made of (issue #110): the
+        // block is 60M parameters, 0.13 GB of a 15 GB file, bought back by the tokens the draft has to earn.
+        if self == Family::Inkling2 && name.starts_with("mtp.") && shape.len() == 2 {
+            return Kind::Raw;
+        }
         // The MLA output gate of Ling is [num_heads, hidden]: a gate, never quantized. The KDA one is [4096, 2560].
         if self == Family::Ling3 && name.ends_with("attention.g_proj.weight") && shape.first().is_some_and(|&n| n <= 64)
         {
@@ -1402,6 +1408,31 @@ mod tests {
         assert!(Family::Qwen35.prefill_copy(true) && !Family::Ling3.prefill_copy(true));
         assert!(Family::Qwen4Exp.prefill_copy(false) && !Family::Qwen4Exp.prefill_copy(true));
         assert!(Family::from_model_type("llama").is_err());
+    }
+
+    /// Inkling-2: the text stack's linears go to 4 bits, the MTP head's own layers stay bf16 (it is the draft, and
+    /// 4 bits cost it 4 % of the hidden state its argmax is made of), and its context projections were never in the
+    /// 4-bit list.
+    #[test]
+    fn inkling2_mtp_head_stays_bf16() {
+        let o = opts();
+        let c = |name: &str, shape: &[usize]| Family::Inkling2.classify(name, shape, &o, None, None);
+        assert_eq!(c("model.layers.0.attn.wq_du.weight", &[3072, 2304]), Kind::Mls4);
+        for l in 0..3 {
+            let p = format!("mtp.layers.{l}.");
+            for (name, shape) in [
+                ("self_attn.q_proj.weight", vec![3072, 2304]),
+                ("self_attn.k_proj.weight", vec![1024, 2304]),
+                ("self_attn.o_proj.weight", vec![2304, 3072]),
+                ("mlp.gate_proj.weight", vec![9216, 2304]),
+                ("mlp.down_proj.weight", vec![2304, 9216]),
+            ] {
+                assert_eq!(c(&format!("{p}{name}"), &shape), Kind::Raw, "{p}{name}");
+            }
+            assert_eq!(c(&format!("{p}self_attn.k_proj_ctx.weight"), &[1024, 2304]), Kind::Raw);
+            assert_eq!(c(&format!("{p}self_attn.q_norm.weight"), &[128]), Kind::Raw);
+        }
+        assert_eq!(c("mtp.markov_head.markov_w1.weight", &[201024, 256]), Kind::Raw);
     }
 
     /// Hy4-flash: the linears go to 4 bits, the learned sinks, the iHC parameters in fp32, the indexer's fp32 pooling
