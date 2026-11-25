@@ -668,29 +668,42 @@ impl Weights {
 
     /// Bytes held on the host.
     pub fn bytes(&self) -> usize {
-        fn lin(l: &Lin) -> usize {
-            l.w.len() * 4
-        }
-        let engram = |e: &Engram| (lin(&e.wkv) + e.q_weight.len() + e.k_weight.len()) * 4;
         let mut t = (self.embed.len() + self.head.len() + self.norm.len()) * 4;
         for l in &self.layers {
-            t += lin(&l.attn.wq_a)
-                + lin(&l.attn.wq_b)
-                + lin(&l.attn.wkv)
-                + lin(&l.attn.wo_a)
-                + lin(&l.attn.wo_b)
-                + lin(&l.moe.gate)
-                + lin(&l.moe.shared.0)
-                + lin(&l.moe.shared.1)
-                + lin(&l.moe.shared.2)
-                + (l.attn.q_norm.len() + l.attn.kv_norm.len() + l.attn.sink.len()) * 4;
-            for (a, b, c) in &l.moe.experts {
-                t += lin(a) + lin(b) + lin(c);
-            }
-            t += l.engram.as_ref().map_or(0, engram);
+            t += layer_bytes(l);
+            t += l.moe.experts.iter().map(expert_bytes).sum::<usize>();
         }
         t
     }
+}
+
+fn lin_bytes(l: &Lin) -> usize {
+    l.w.len() * 4
+}
+
+/// Bytes one routed expert takes: `w1`, `w2` and `w3` in f32.
+fn expert_bytes((a, b, c): &(Lin, Lin, Lin)) -> usize {
+    lin_bytes(a) + lin_bytes(b) + lin_bytes(c)
+}
+
+/// Bytes one block takes without its routed experts: the attention, the router, the shared expert and the Engram
+/// projections.
+fn layer_bytes(l: &Layer) -> usize {
+    let engram = l
+        .engram
+        .as_ref()
+        .map_or(0, |e| lin_bytes(&e.wkv) + e.q_weight.len() * 4 + e.k_weight.len() * 4);
+    lin_bytes(&l.attn.wq_a)
+        + lin_bytes(&l.attn.wq_b)
+        + lin_bytes(&l.attn.wkv)
+        + lin_bytes(&l.attn.wo_a)
+        + lin_bytes(&l.attn.wo_b)
+        + lin_bytes(&l.moe.gate)
+        + lin_bytes(&l.moe.shared.0)
+        + lin_bytes(&l.moe.shared.1)
+        + lin_bytes(&l.moe.shared.2)
+        + (l.attn.q_norm.len() + l.attn.kv_norm.len() + l.attn.sink.len()) * 4
+        + engram
 }
 
 fn load_lin(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Result<Lin> {
@@ -1339,14 +1352,19 @@ impl Weights {
     }
 }
 
+/// A tensor source the streamer owns: the backbone (and the Engram table) are read for the whole life of a served
+/// model, so nothing hangs them off the loader that opened them. `Send` because the model moves to the engine
+/// thread, `Sync` because a served run counts the bytes read through a handle shared with the log.
+pub type Source = Box<dyn TensorSource + Send + Sync>;
+
 /// The backbone read a block at a time: its 162.45 GB do not fit, so a block is built from the file, run on the
 /// streams and dropped. What stays resident is the embedding, the head, the final norm and one block's non-expert
 /// weights — ~6 GB — while the routed experts are read when a position selects them.
-pub struct Streamer<'a> {
+pub struct Streamer {
     config: Config,
     graph: Weights,
-    src: &'a dyn TensorSource,
-    table: Option<&'a dyn TensorSource>,
+    src: Source,
+    table: Option<Source>,
     state: Option<EngramState>,
     /// Routed experts held at once per block, before the cache is emptied.
     hold: usize,
@@ -1358,10 +1376,12 @@ pub struct Streamer<'a> {
     blocks: Option<Vec<Layer>>,
 }
 
-impl<'a> Streamer<'a> {
-    pub fn open(src: &'a dyn TensorSource, c: &Config) -> Result<Self> {
+impl Streamer {
+    /// Takes the backbone as its own: `Model` holds the streamer across requests, so the file cannot be borrowed
+    /// from the caller's frame any more.
+    pub fn open(src: Source, c: &Config) -> Result<Self> {
         Ok(Streamer {
-            graph: Weights::open(src, c)?,
+            graph: Weights::open(src.as_ref(), c)?,
             config: c.clone(),
             src,
             table: None,
@@ -1377,7 +1397,7 @@ impl<'a> Streamer<'a> {
     pub fn with_blocks(mut self) -> Result<Self> {
         let mut blocks = Vec::with_capacity(self.config.n_layers);
         for i in 0..self.config.n_layers {
-            blocks.push(Layer::load(self.src, &self.config, i, false)?);
+            blocks.push(Layer::load(self.src.as_ref(), &self.config, i, false)?);
         }
         self.blocks = Some(blocks);
         Ok(self)
@@ -1426,7 +1446,7 @@ impl<'a> Streamer<'a> {
         let engram = match (&self.table, hash.is_empty()) {
             (Some(table), false) => Some(EngramInput {
                 hash: &hash,
-                table: *table,
+                table: table.as_ref(),
             }),
             _ => None,
         };
@@ -1437,7 +1457,7 @@ impl<'a> Streamer<'a> {
                     .get(layer)
                     .with_context(|| format!("block {layer} outside the stack"))?,
                 None => {
-                    owned = Layer::load(self.src, &self.config, layer, false)?;
+                    owned = Layer::load(self.src.as_ref(), &self.config, layer, false)?;
                     &owned
                 }
             };
@@ -1449,7 +1469,7 @@ impl<'a> Streamer<'a> {
                 (&mut after[0], Some(&before[source]))
             };
             let mut bank = HeldExperts {
-                src: self.src,
+                src: self.src.as_ref(),
                 layer,
                 inter: d.moe_inter,
                 hidden: h_dim,
@@ -1479,7 +1499,7 @@ impl<'a> Streamer<'a> {
     }
 
     /// The Engram tables and the addressing they are hashed with: an Engram layer without them cannot run.
-    pub fn with_engram(mut self, table: &'a dyn TensorSource, state: EngramState) -> Self {
+    pub fn with_engram(mut self, table: Source, state: EngramState) -> Self {
         self.table = Some(table);
         self.state = Some(state);
         self
@@ -1492,9 +1512,14 @@ impl<'a> Streamer<'a> {
         self
     }
 
-    /// Bytes the run keeps on the host, minus the experts it is holding.
+    /// Bytes the run keeps on the host, minus the experts it is holding: the embedding, the head and the norm,
+    /// plus every block's non-expert weights when they are held resident.
     pub fn resident_bytes(&self) -> usize {
         self.graph.bytes()
+            + self
+                .blocks
+                .as_ref()
+                .map_or(0, |b| b.iter().map(layer_bytes).sum::<usize>())
     }
 
     /// One prefill of `ids`: the logits of every position, `[t, vocab]`.
@@ -1572,18 +1597,21 @@ impl<'a> Streamer<'a> {
             (Some(state), Some(e), Some(ids)) => (0..e.layers.len()).map(|k| state.hash_ids(ids, k)).collect(),
             _ => Vec::new(),
         };
-        let engram = match (self.table, hash.is_empty()) {
-            (Some(table), false) => Some(EngramInput { hash: &hash, table }),
+        let engram = match (&self.table, hash.is_empty()) {
+            (Some(table), false) => Some(EngramInput {
+                hash: &hash,
+                table: table.as_ref(),
+            }),
             _ => None,
         };
         let mut pre_mix = identity_mix(t, hc);
         let mut shared = Shared::default();
         for layer in self.graph.selected() {
             let begin = std::time::Instant::now();
-            let l = Layer::load(self.src, &self.config, layer, false)?;
+            let l = Layer::load(self.src.as_ref(), &self.config, layer, false)?;
             let read;
             {
-                let mut experts = StreamedExperts::new(self.src, &self.config, layer, self.hold);
+                let mut experts = StreamedExperts::new(self.src.as_ref(), &self.config, layer, self.hold);
                 self.graph.block(
                     &l,
                     layer,
@@ -1653,8 +1681,11 @@ impl<'a> Streamer<'a> {
             (Some(state), Some(e)) => (0..e.layers.len()).map(|k| state.hash_ids(ids, k)).collect(),
             _ => Vec::new(),
         };
-        let engram = match (self.table, hash.is_empty()) {
-            (Some(table), false) => Some(EngramInput { hash: &hash, table }),
+        let engram = match (&self.table, hash.is_empty()) {
+            (Some(table), false) => Some(EngramInput {
+                hash: &hash,
+                table: table.as_ref(),
+            }),
             _ => None,
         };
         for layer in self.graph.selected() {
@@ -1664,13 +1695,13 @@ impl<'a> Streamer<'a> {
                     .get(layer)
                     .with_context(|| format!("block {layer} outside the stack"))?,
                 None => {
-                    owned = Layer::load(self.src, &self.config, layer, false)?;
+                    owned = Layer::load(self.src.as_ref(), &self.config, layer, false)?;
                     &owned
                 }
             };
             let lc = &mut cache.layers[layer];
             let mut bank = HeldExperts {
-                src: self.src,
+                src: self.src.as_ref(),
                 layer,
                 inter: d.moe_inter,
                 hidden: h_dim,
@@ -2211,6 +2242,14 @@ fn indexer(
     layer: usize,
 ) -> Result<Vec<i32>> {
     let (heads, dim) = (ix.heads, ix.dim);
+    // A prefix shorter than the ratio has closed no group yet: there is nothing to compress, so there are no index
+    // keys and no selection to publish, and the window is all the attention has to read.
+    if ix.owns_k && groups == 0 {
+        shared.index_k.clear();
+        shared.index_len = 0;
+        shared.topk = Some(Vec::new());
+        return Ok(Vec::new());
+    }
     if ix.owns_k {
         let rows = groups;
         let mut k = match (&ix.wk, latent) {
@@ -2224,7 +2263,10 @@ fn indexer(
         hook(&format!("ixk{layer}"), &shared.index_k)?;
     }
     let n_ix = shared.index_len;
-    ensure!(n_ix > 0, "the indexer has no keys");
+    if n_ix == 0 {
+        shared.topk = Some(Vec::new());
+        return Ok(Vec::new());
+    }
     let mut q = ix.wq_b.mat(qr, t);
     rope_heads(&mut q, t, heads, dim, rd, inv, false);
     let w = ix.weights_proj.mat(x, t);
@@ -2692,7 +2734,7 @@ mod tests {
         let src = SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap();
         let w = Weights::load(&src, &c, &|_, _| {}).unwrap();
         let resident = w.forward(&ids).unwrap();
-        let mut s = Streamer::open(&src, &c).unwrap();
+        let mut s = Streamer::open(Box::new(src), &c).unwrap();
         let streamed = s.logits(&ids).unwrap();
         assert_eq!(resident.len(), streamed.len());
         compare("streamed", &streamed, &resident);
@@ -2702,6 +2744,29 @@ mod tests {
             "{} experts read, {:.1} MB resident",
             s.experts_read,
             s.resident_bytes() as f64 / 1e6
+        );
+    }
+
+    /// A prefix shorter than the compressed ratio — the tiny checkpoint's layers 2 and 3 close a group every two
+    /// positions — has nothing to compress yet: the attention reads the window alone and the indexer publishes an
+    /// empty list. Serving a one-token prompt goes through this, and it used to panic in the indexer.
+    ///
+    ///   DEEPSEEK_REF=/golden/deepseek-ref/tiny cargo test -p malleus-model a_prefix_shorter_than_the_ratio -- --ignored
+    #[test]
+    #[ignore = "reads the reference checkpoint"]
+    fn a_prefix_shorter_than_the_ratio_attends_on_the_window_alone() {
+        let dir = std::env::var("DEEPSEEK_REF").expect("DEEPSEEK_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids = [manifest["tokens"][0][0].as_u64().unwrap() as u32];
+        let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap();
+        let mut s = Streamer::open(Box::new(src), &c).unwrap();
+        let logits = s.logits(&ids).unwrap();
+        assert_eq!(logits.len(), c.vocab);
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "a one-token prompt does not give a logits row"
         );
     }
 
@@ -2722,7 +2787,7 @@ mod tests {
             .collect();
         let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
         let src = SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap();
-        let mut s = Streamer::open(&src, &c).unwrap();
+        let mut s = Streamer::open(Box::new(src), &c).unwrap();
         let vocab = c.vocab;
         let t = ids.len();
         // The reference: the whole sequence in one prefill.
@@ -2819,9 +2884,9 @@ mod tests {
         )
         .unwrap();
         let tables = Gguf::open(std::path::Path::new(&table)).unwrap();
-        let mut s = Streamer::open(&src, &c)
+        let mut s = Streamer::open(Box::new(src), &c)
             .unwrap()
-            .with_engram(&tables, state)
+            .with_engram(Box::new(tables), state)
             .with_experts_held(64);
         let mut worst = 1.0f64;
         let logits = s
@@ -2871,11 +2936,11 @@ mod tests {
             .exists()
             .then(|| f32_file(&format!("{dir}/x.f32")));
         // A window that carries an Engram layer needs the tables and their addressing.
-        let tables = std::env::var("DEEPSEEK_ENGRAM_TABLE")
+        let tables: Option<Source> = std::env::var("DEEPSEEK_ENGRAM_TABLE")
             .ok()
-            .map(|p| Gguf::open(std::path::Path::new(&p)).unwrap());
-        let mut s = Streamer::open(&src, &c).unwrap().with_experts_held(64);
-        if let (Some(tables), Ok(base)) = (&tables, std::env::var("DEEPSEEK_ENGRAM")) {
+            .map(|p| Box::new(Gguf::open(std::path::Path::new(&p)).unwrap()) as Source);
+        let mut s = Streamer::open(Box::new(src), &c).unwrap().with_experts_held(64);
+        if let (Some(tables), Ok(base)) = (tables, std::env::var("DEEPSEEK_ENGRAM")) {
             let state = EngramState::from_json(
                 &std::fs::read_to_string(format!("{base}-state.json")).unwrap(),
                 &std::fs::read(format!("{base}-token-map.i32")).unwrap(),

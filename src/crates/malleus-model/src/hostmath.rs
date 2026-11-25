@@ -2,9 +2,10 @@
 //! the CPU until the kernels take them. Everything here is plain f32 with disjoint-chunk threading, so a small
 //! model can be compared stage by stage against the reference on one machine.
 
-/// Runs `f(index, chunk)` on disjoint chunks of `data`, one thread per available core.
+/// Runs `f(index, chunk)` on disjoint chunks of `data`, one thread per available core. A chunk of zero is a
+/// degenerate split (a linear with no rows, an empty matrix), not a reason to panic: nothing is left to do.
 pub(crate) fn parallel_chunks<T: Send>(data: &mut [T], chunk: usize, f: impl Fn(usize, &mut [T]) + Sync) {
-    let chunks: Vec<(usize, &mut [T])> = data.chunks_mut(chunk).enumerate().collect();
+    let chunks: Vec<(usize, &mut [T])> = data.chunks_mut(chunk.max(1)).enumerate().collect();
     let threads = std::thread::available_parallelism()
         .map_or(1, |v| v.get())
         .min(chunks.len().max(1));

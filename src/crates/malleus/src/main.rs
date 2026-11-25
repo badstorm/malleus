@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
+use malleus_gguf::TensorSource;
 use malleus_gguf::gguf::Gguf;
 use malleus_gguf::safetensors::SafeTensors;
 use malleus_model::kernels::{Kernels, select_device};
@@ -455,6 +456,14 @@ fn preflight(path: &Path, ctx: usize, chunk: Option<usize>) -> Result<()> {
             g.meta_str("openmalleus.hf_config")?,
             g.meta_str("openmalleus.generation_config").ok(),
         )?;
+        // DeepSeek-V4.1 runs on the host: nothing of it goes on the device, so the device plan does not apply.
+        if cfg.family == Family::Deepseek41 {
+            eprintln!(
+                "memory: deepseek_v41 runs on the host (the backbone is streamed, the Engram tables are read by \
+                 row); it needs the host, not the device"
+            );
+            return Ok(());
+        }
         let weights = malleus_model::memplan::weights_on_device(&g, prefill_int8);
         tables = malleus_model::memplan::tables_on_disk(&g);
         eprintln!(
@@ -511,8 +520,9 @@ fn load_model(path: &Path) -> Result<Model> {
     let prefill_int8 = std::env::var("MALLEUS_PREFILL_WEIGHTS").map_or(true, |v| v != "none");
     let with_vision = std::env::var("MALLEUS_VISION").map(|v| v != "0").unwrap_or(true);
     let load_vision = |m: &mut Model, src: &dyn malleus_gguf::TensorSource, cfg_json: &str| -> Result<()> {
-        // Hy4-flash and Inkling-2 have towers of their own, loaded with their own weights.
-        if matches!(m.cfg.family, Family::Hy4 | Family::Inkling2) {
+        // Hy4-flash and Inkling-2 have towers of their own, loaded with their own weights; the DeepSeek-V4.1 host
+        // graph has no vision span yet (issue #121).
+        if matches!(m.cfg.family, Family::Hy4 | Family::Inkling2 | Family::Deepseek41) {
             return Ok(());
         }
         if let Some(vc) = VisionConfig::from_json(cfg_json)?
@@ -529,7 +539,7 @@ fn load_model(path: &Path) -> Result<Model> {
         let g = open_converted(path)?;
         let cfg_json = g.meta_str("openmalleus.hf_config")?;
         let cfg = Config::from_json(cfg_json, g.meta_str("openmalleus.generation_config").ok())?;
-        let opts = LoadOptions {
+        let mut opts = LoadOptions {
             hadamard_seed: g.meta_u64("openmalleus.hadamard_seed")?,
             prefill_int8,
             prefill_families: std::env::var("MALLEUS_PREFILL_INT8_FAMILIES")
@@ -538,6 +548,9 @@ fn load_model(path: &Path) -> Result<Model> {
             mtp: std::env::var("MALLEUS_MTP").map_or(true, |v| v != "0"),
             ..Default::default()
         };
+        if cfg.family == Family::Deepseek41 {
+            opts.deepseek = Some(deepseek_files(path)?);
+        }
         let mut m = Model::load(cfg, &g, &opts, k, &progress)?;
         load_vision(&mut m, &g, cfg_json)?;
         m
@@ -588,27 +601,40 @@ fn draft_vocab(model: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A source that counts the bytes it serves: a streamed run has to say what it read from disk, because that is the
-/// number that decides whether the design works on this machine.
-struct Counting<'a> {
-    inner: &'a dyn malleus_gguf::TensorSource,
-    bytes: std::cell::Cell<u64>,
+/// The bytes a source served, shared with the report: the streamer owns its sources, so the counter is a handle
+/// the caller keeps.
+#[derive(Clone, Default)]
+struct Tally(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Tally {
+    fn gb(&self) -> f64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+    }
 }
 
-impl<'a> Counting<'a> {
-    fn new(inner: &'a dyn malleus_gguf::TensorSource) -> Self {
+/// A source that counts the bytes it serves: a streamed run has to say what it read from disk, because that is the
+/// number that decides whether the design works on this machine. It owns the source it wraps, because the streamer
+/// that receives it holds it for the whole run.
+struct Counting {
+    inner: Arc<dyn malleus_gguf::TensorSource + Send + Sync>,
+    bytes: Tally,
+}
+
+impl Counting {
+    fn new(inner: Arc<dyn malleus_gguf::TensorSource + Send + Sync>) -> Self {
         Counting {
             inner,
-            bytes: std::cell::Cell::new(0),
+            bytes: Tally::default(),
         }
     }
 
-    fn gb(&self) -> f64 {
-        self.bytes.get() as f64 / 1e9
+    /// The counter this source adds to, to be read from outside the streamer that owns it.
+    fn tally(&self) -> Tally {
+        self.bytes.clone()
     }
 }
 
-impl malleus_gguf::TensorSource for Counting<'_> {
+impl malleus_gguf::TensorSource for Counting {
     fn info(&self, name: &str) -> Option<&malleus_gguf::TensorInfo> {
         self.inner.info(name)
     }
@@ -618,7 +644,9 @@ impl malleus_gguf::TensorSource for Counting<'_> {
     }
 
     fn read(&self, name: &str, start: usize, buf: &mut [u8]) -> std::io::Result<()> {
-        self.bytes.set(self.bytes.get() + buf.len() as u64);
+        self.bytes
+            .0
+            .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
         self.inner.read(name, start, buf)
     }
 }
@@ -640,17 +668,17 @@ fn deepseek_run(
 ) -> Result<()> {
     // A `.malleus` file carries its own config; a checkpoint directory is the release's own storage, which is the
     // reference this quantized file is measured against.
-    let (c, weights): (Config, Box<dyn malleus_gguf::TensorSource>) = if is_converted(model) {
+    let (c, weights): (Config, Arc<dyn malleus_gguf::TensorSource + Send + Sync>) = if is_converted(model) {
         let g = Gguf::open(model)?;
         let c = Config::from_json(
             g.meta_str("openmalleus.hf_config")?,
             g.meta_str("openmalleus.generation_config").ok(),
         )?;
-        (c, Box::new(g))
+        (c, Arc::new(g))
     } else {
-        (Config::from_hf(model)?, Box::new(SafeTensors::open_dir(model)?))
+        (Config::from_hf(model)?, Arc::new(SafeTensors::open_dir(model)?))
     };
-    let table = Gguf::open(engram)?;
+    let table = Arc::new(Gguf::open(engram)?);
     let state = malleus_model::deepseek_engram::EngramState::from_json(
         &std::fs::read_to_string(format!("{}-state.json", state.display()))?,
         &std::fs::read(format!("{}-token-map.i32", state.display()))?,
@@ -669,10 +697,11 @@ fn deepseek_run(
     };
     let ids = chat.encode(&text)?;
     eprintln!("{text:?}\n{} prompt tokens: {ids:?}", ids.len());
-    let backbone = Counting::new(weights.as_ref());
-    let tables = Counting::new(&table);
-    let mut s = malleus_model::deepseek_text::Streamer::open(&backbone, &c)?
-        .with_engram(&tables, state)
+    let backbone = Counting::new(weights);
+    let tables = Counting::new(table);
+    let (read_backbone, read_tables) = (backbone.tally(), tables.tally());
+    let mut s = malleus_model::deepseek_text::Streamer::open(Box::new(backbone), &c)?
+        .with_engram(Box::new(tables), state)
         .with_experts_held(experts);
     if blocks {
         s = s.with_blocks()?;
@@ -687,7 +716,7 @@ fn deepseek_run(
             "  token {}: {:.1}s, {:.2} GB read",
             out.len(),
             t0.elapsed().as_secs_f64(),
-            backbone.gb() + tables.gb(),
+            read_backbone.gb() + read_tables.gb(),
         );
         if top > 0 {
             let mut best: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
@@ -726,10 +755,45 @@ fn deepseek_run(
     eprintln!(
         "{} experts read, {:.2} GB read, {:.0}s total",
         experts_read,
-        backbone.gb() + tables.gb(),
+        read_backbone.gb() + read_tables.gb(),
         t0.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// The three files the DeepSeek-V4.1 host graph reads: the backbone (the catalog entry), the companion file with
+/// the Engram tables, and the prefix of the Engram state `scripts/deepseek_engram_state.py` writes.
+///
+/// `MALLEUS_DEEPSEEK_ENGRAM` and `MALLEUS_DEEPSEEK_ENGRAM_STATE` name the last two; without the first, the
+/// backbone's sibling `-engram.malleus` is used (`deepseek-v41-flash-mls2.malleus` -> `deepseek-v41-flash-engram`).
+fn deepseek_files(model: &Path) -> Result<malleus_model::DeepseekFiles> {
+    let engram = match std::env::var("MALLEUS_DEEPSEEK_ENGRAM") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            let stem = model
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .with_context(|| format!("{} has no UTF-8 file stem", model.display()))?;
+            let base = stem.rsplit_once("-mls").map_or(stem, |(b, _)| b);
+            model.with_file_name(format!("{base}-engram.malleus"))
+        }
+    };
+    anyhow::ensure!(
+        engram.is_file(),
+        "deepseek_v41: no Engram table file {} (MALLEUS_DEEPSEEK_ENGRAM points at it)",
+        engram.display()
+    );
+    let state = std::env::var("MALLEUS_DEEPSEEK_ENGRAM_STATE").map_err(|_| {
+        anyhow::anyhow!(
+            "deepseek_v41: MALLEUS_DEEPSEEK_ENGRAM_STATE must name the prefix of the Engram state \
+             (<prefix>-state.json and <prefix>-token-map.i32)"
+        )
+    })?;
+    Ok(malleus_model::DeepseekFiles {
+        backbone: model.to_path_buf(),
+        engram,
+        state: PathBuf::from(state),
+    })
 }
 
 fn load_chat(path: &Path) -> Result<malleus_chat::Chat> {
@@ -1818,6 +1882,27 @@ fn build_catalog(models_dir: &Path, ctx: usize, default_model: Option<String>) -
             .and_then(|s| s.to_str())
             .with_context(|| format!("{} has no UTF-8 file stem", path.display()))?
             .to_string();
+        let converted = if is_converted(&path) {
+            open_converted(&path).ok()
+        } else {
+            None
+        };
+        // A DeepSeek-V4.1 companion carries only the two Engram tables: it is a file the backbone's graph reads
+        // beside it, not a model, and serving it would try to stream it as a backbone.
+        if let Some(g) = &converted {
+            let family = g
+                .meta_str("openmalleus.hf_config")
+                .ok()
+                .and_then(|cfg| Config::from_json(cfg, g.meta_str("openmalleus.generation_config").ok()).ok())
+                .map(|c| c.family);
+            if family == Some(Family::Deepseek41) && g.info("embed.weight").is_none() {
+                eprintln!(
+                    "skipping {}: the Engram companion of a deepseek_v41 backbone",
+                    path.display()
+                );
+                continue;
+            }
+        }
         let chat = match load_chat(&path) {
             Ok(chat) => chat,
             Err(e) => {
@@ -1833,8 +1918,7 @@ fn build_catalog(models_dir: &Path, ctx: usize, default_model: Option<String>) -
         }
         // The model's own end tokens (generation_config): Hy4 ends a turn with `<｜hy_end:opensource｜>`, which the
         // two Qwen names above do not cover, so the server never stopped on it.
-        if is_converted(&path)
-            && let Ok(g) = open_converted(&path)
+        if let Some(g) = &converted
             && let Ok(cfg) = g.meta_str("openmalleus.hf_config")
             && let Ok(c) = Config::from_json(cfg, g.meta_str("openmalleus.generation_config").ok())
         {
