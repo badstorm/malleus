@@ -1357,6 +1357,30 @@ impl Weights {
 /// thread, `Sync` because a served run counts the bytes read through a handle shared with the log.
 pub type Source = Box<dyn TensorSource + Send + Sync>;
 
+/// An image span in the prompt: `len` positions starting at `at` whose embeddings come from the vision tower
+/// instead of the token table, and whose positions are the ones the Engram gate shuts, the Engram lookback stops at,
+/// and the router steers with its VL bias.
+#[derive(Clone, Debug)]
+pub struct Span {
+    /// First position of the span in the prompt.
+    pub at: usize,
+    /// `[len, hidden]`: the delimiters and the aligner rows in the order `deepseek_vision::span_embeddings`
+    /// produces them.
+    pub rows: Vec<f32>,
+}
+
+impl Span {
+    /// Positions the span covers.
+    pub fn len(&self, hidden: usize) -> usize {
+        self.rows.len() / hidden
+    }
+
+    /// Whether the span covers nothing (an empty image is not one, but a caller may pass `None` rows).
+    pub fn is_empty(&self, hidden: usize) -> bool {
+        self.len(hidden) == 0
+    }
+}
+
 /// The backbone read a block at a time: its 162.45 GB do not fit, so a block is built from the file, run on the
 /// streams and dropped. What stays resident is the embedding, the head, the final norm and one block's non-expert
 /// weights — ~6 GB — while the routed experts are read when a position selects them.
@@ -1429,6 +1453,14 @@ impl Streamer {
         }
         let mut pre_mix = identity_mix(1, hc);
         let mut shared = Shared::default();
+        // A position is text unless the prefill said otherwise: the mask is what keeps the n-grams of this token
+        // from reaching back into an image span.
+        ensure!(
+            cache.text.len() + 1 == t,
+            "the mask holds {} positions, the sequence {t}",
+            cache.text.len()
+        );
+        cache.text.push(true);
         let hash: Vec<Vec<u64>> = match (&self.table, &self.state, &d.engram) {
             (Some(_), Some(state), Some(e)) => {
                 // The hash row is `(max_ngram - 1) * heads` wide, the geometry the state carries; the layer's
@@ -1436,7 +1468,7 @@ impl Streamer {
                 let cols = (state.max_ngram - 1) * state.heads;
                 (0..e.layers.len())
                     .map(|i| {
-                        let all = state.hash_ids(ids, i);
+                        let all = state.hash_ids_masked(ids, i, &cache.text);
                         all[all.len() - cols..].to_vec()
                     })
                     .collect()
@@ -1538,11 +1570,23 @@ impl Streamer {
     pub fn run_with(
         &mut self,
         ids: &[u32],
+        on_layer: impl FnMut(usize, f64),
+        hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        self.run_with_span(ids, None, on_layer, hook)
+    }
+
+    /// The same, with one image span whose rows replace the embeddings of its positions.
+    pub fn run_with_span(
+        &mut self,
+        ids: &[u32],
+        span: Option<&Span>,
         mut on_layer: impl FnMut(usize, f64),
         hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
     ) -> Result<Vec<f32>> {
         let mut h = self.embed_streams(ids)?;
-        self.stack(&mut h, ids.len(), Some(ids), &mut on_layer, hook)
+        let mask = splice(&mut h, ids.len(), span, self.graph.hidden, self.graph.c.hc_mult)?;
+        self.stack(&mut h, ids.len(), Some(ids), mask.as_deref(), &mut on_layer, hook)
     }
 
     /// The stack from a stream somebody else handed over — `x` is `[t, hc, hidden]` — with `ids` for the Engram
@@ -1562,7 +1606,7 @@ impl Streamer {
             "engram: {} values for {t} positions",
             h.len()
         );
-        self.stack(&mut h, t, ids, &mut on_layer, hook)
+        self.stack(&mut h, t, ids, None, &mut on_layer, hook)
     }
 
     /// The embedding, expanded to the `hc_mult` copies the streams are carried in.
@@ -1582,19 +1626,28 @@ impl Streamer {
     }
 
     /// Every selected block on the streams `h`, then the last stage.
+    #[allow(clippy::too_many_arguments)]
     fn stack(
         &mut self,
         h: &mut Vec<f32>,
         t: usize,
         ids: Option<&[u32]>,
+        mask: Option<&[bool]>,
         on_layer: &mut impl FnMut(usize, f64),
         hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
     ) -> Result<Vec<f32>> {
         let d = self.graph.c.clone();
         let hc = d.hc_mult;
         // The hash ids of the whole prompt, one list per table: they do not depend on the block that reads them.
+        // Inside an image span a position is dead, so no n-gram reaches into it.
+        let text: Option<Vec<bool>> = mask.map(|m| m.iter().map(|inside| !inside).collect());
         let hash: Vec<Vec<u64>> = match (&self.state, &d.engram, ids) {
-            (Some(state), Some(e), Some(ids)) => (0..e.layers.len()).map(|k| state.hash_ids(ids, k)).collect(),
+            (Some(state), Some(e), Some(ids)) => (0..e.layers.len())
+                .map(|k| match &text {
+                    Some(all) => state.hash_ids_masked(ids, k, all),
+                    None => state.hash_ids(ids, k),
+                })
+                .collect(),
             _ => Vec::new(),
         };
         let engram = match (&self.table, hash.is_empty()) {
@@ -1621,7 +1674,7 @@ impl Streamer {
                     &mut shared,
                     &mut experts,
                     engram.as_ref(),
-                    None,
+                    mask,
                     None,
                     hook,
                 )?;
@@ -1664,6 +1717,12 @@ impl Streamer {
     /// The prefill into the cache: one pass over the prompt, keeping the KV of every layer. The positions after it
     /// are `step`s, so the prompt costs one pass and each token one position.
     pub fn prefill_cached(&mut self, cache: &mut Cache, ids: &[u32]) -> Result<Vec<f32>> {
+        self.prefill_cached_span(cache, ids, None)
+    }
+
+    /// The same, with one image span: its rows replace the embeddings of its positions, and its positions take no
+    /// part in an n-gram and no Engram contribution.
+    pub fn prefill_cached_span(&mut self, cache: &mut Cache, ids: &[u32], span: Option<&Span>) -> Result<Vec<f32>> {
         let d = self.graph.c.clone();
         let (h_dim, hc, t) = (self.graph.hidden, d.hc_mult, ids.len());
         ensure!(t > 0, "an empty prompt");
@@ -1675,10 +1734,17 @@ impl Streamer {
                 h[(i * hc + c) * h_dim..(i * hc + c + 1) * h_dim].copy_from_slice(row);
             }
         }
+        let mask = splice(&mut h, t, span, h_dim, hc)?;
+        cache.text = match &mask {
+            Some(m) => m.iter().map(|inside| !inside).collect(),
+            None => vec![true; t],
+        };
         let mut pre_mix = identity_mix(t, hc);
         let mut shared = Shared::default();
         let hash: Vec<Vec<u64>> = match (&self.state, &d.engram) {
-            (Some(state), Some(e)) => (0..e.layers.len()).map(|k| state.hash_ids(ids, k)).collect(),
+            (Some(state), Some(e)) => (0..e.layers.len())
+                .map(|k| state.hash_ids_masked(ids, k, &cache.text))
+                .collect(),
             _ => Vec::new(),
         };
         let engram = match (&self.table, hash.is_empty()) {
@@ -1720,7 +1786,7 @@ impl Streamer {
                 &mut shared,
                 &mut bank,
                 engram.as_ref(),
-                None,
+                mask.as_deref(),
                 Some(lc),
                 &mut hook,
             )?;
@@ -1736,11 +1802,23 @@ impl Streamer {
         cache: &mut Cache,
         ids: &[u32],
         tokens: usize,
+        on_token: impl FnMut(usize, &[u32], &[f32]),
+    ) -> Result<Vec<u32>> {
+        self.generate_cached_span(cache, ids, tokens, None, on_token)
+    }
+
+    /// The same, with one image span in the prompt.
+    pub fn generate_cached_span(
+        &mut self,
+        cache: &mut Cache,
+        ids: &[u32],
+        tokens: usize,
+        span: Option<&Span>,
         mut on_token: impl FnMut(usize, &[u32], &[f32]),
     ) -> Result<Vec<u32>> {
         let vocab = self.graph.vocab;
         let mut ids = ids.to_vec();
-        let logits = self.prefill_cached(cache, &ids)?;
+        let logits = self.prefill_cached_span(cache, &ids, span)?;
         let mut row = logits[(ids.len() - 1) * vocab..].to_vec();
         let mut out = Vec::with_capacity(tokens);
         for step in 0..tokens {
@@ -1800,6 +1878,9 @@ pub struct Cache {
     expert_bytes: usize,
     /// Positions the cache holds, set by the prefill and advanced by every step.
     positions: usize,
+    /// Whether each position so far is text: the positions of an image span are not, and the Engram lookback stops
+    /// at them. Set by the prefill, one `true` per step.
+    text: Vec<bool>,
     /// Experts read from the file over the whole run.
     pub experts_read: usize,
 }
@@ -1833,6 +1914,7 @@ impl Cache {
             tick: 0,
             expert_bytes: expert_bytes_of(d, c.hidden),
             positions: 0,
+            text: Vec::new(),
             experts_read: 0,
         }
     }
@@ -1857,6 +1939,7 @@ impl Cache {
         }
         self.positions = 0;
         self.experts_read = 0;
+        self.text.clear();
     }
 
     /// Bytes the held experts take on the host, in f32.
@@ -2181,6 +2264,34 @@ fn block_step(
     *h = hc_post(&ffn_out, h, &fm.post, &fm.comb, 1, hc, h_dim);
     *pre_mix = fm.pre;
     Ok(())
+}
+
+/// Writes an image span into the streams `h` (`[t, hc, hidden]`): its rows replace the embeddings of the positions
+/// it covers, in every copy, and the positions it covers are the ones the Engram gate and the router are told about.
+fn splice(h: &mut [f32], t: usize, span: Option<&Span>, h_dim: usize, hc: usize) -> Result<Option<Vec<bool>>> {
+    let Some(span) = span else { return Ok(None) };
+    let len = span.len(h_dim);
+    ensure!(len > 0, "an image span with no positions");
+    ensure!(
+        span.rows.len() == len * h_dim,
+        "the span's rows are {} values for {len} x {h_dim}",
+        span.rows.len()
+    );
+    ensure!(
+        span.at + len <= t,
+        "the span [{}..{}) does not fit {t} positions",
+        span.at,
+        span.at + len
+    );
+    for i in 0..len {
+        for c in 0..hc {
+            let dst = ((span.at + i) * hc + c) * h_dim;
+            h[dst..dst + h_dim].copy_from_slice(&span.rows[i * h_dim..(i + 1) * h_dim]);
+        }
+    }
+    let mut mask = vec![false; t];
+    mask[span.at..span.at + len].fill(true);
+    Ok(Some(mask))
 }
 
 fn identity_mix(t: usize, hc: usize) -> Vec<f32> {
@@ -2748,6 +2859,67 @@ mod tests {
             "{} experts read, {:.1} MB resident",
             s.experts_read,
             s.resident_bytes() as f64 / 1e6
+        );
+    }
+
+    /// The span's rows replace the embeddings of the positions it covers, in every hyper-connection copy: the same
+    /// prompt, spliced by the caller into a stream and run through `run_from`, has to give the same logits, bit for
+    /// bit. The tiny checkpoint has no Engram layer and no VL bias, so the mask is a no-op there and the splice is
+    /// the only difference; the mask's arithmetic is gated against the reference on the real tables.
+    ///
+    ///   DEEPSEEK_REF=/golden/deepseek-ref/tiny
+    #[test]
+    #[ignore = "reads the reference checkpoint"]
+    fn the_image_span_is_spliced_into_the_embeddings() {
+        let dir = std::env::var("DEEPSEEK_REF").expect("DEEPSEEK_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["tokens"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
+        let (hidden, hc) = (c.hidden, c.deepseek.as_ref().unwrap().hc_mult);
+        let src = SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap();
+        let mut s = Streamer::open(Box::new(src), &c).unwrap();
+        // A span of three positions in the middle, whose rows are not any token's embedding.
+        let (at, len) = (2usize, 3usize);
+        let rows: Vec<f32> = (0..len * hidden).map(|i| ((i % 89) as f32) * 0.011 - 0.5).collect();
+        let span = Span { at, rows: rows.clone() };
+        // What the caller would have done by hand: the token embeddings with those rows written in.
+        let mut x = vec![0f32; ids.len() * hc * hidden];
+        for (i, &id) in ids.iter().enumerate() {
+            let row = &s.graph.embed[id as usize * hidden..(id as usize + 1) * hidden];
+            for copy in 0..hc {
+                x[(i * hc + copy) * hidden..][..hidden].copy_from_slice(row);
+            }
+        }
+        for i in 0..len {
+            for copy in 0..hc {
+                let dst = ((at + i) * hc + copy) * hidden;
+                x[dst..dst + hidden].copy_from_slice(&rows[i * hidden..(i + 1) * hidden]);
+            }
+        }
+        let want = s
+            .run_from(&x, ids.len(), Some(&ids), |_, _| {}, &mut |_, _| Ok(()))
+            .unwrap();
+        let mut cache = s.cache(8);
+        let got = s.prefill_cached_span(&mut cache, &ids, Some(&span)).unwrap();
+        assert_eq!(got.len(), want.len());
+        let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "{differing} of {} logits differ", got.len());
+        // And the span is where it says it is: written one position later, the logits move.
+        let shifted = Span {
+            at: at + 1,
+            rows: rows.clone(),
+        };
+        let mut other = s.cache(8);
+        let moved = s.prefill_cached_span(&mut other, &ids, Some(&shifted)).unwrap();
+        assert!(
+            moved.iter().zip(&got).any(|(a, b)| a != b),
+            "the span's position is ignored"
         );
     }
 

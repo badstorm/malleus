@@ -15,6 +15,7 @@ token of the tokenizer's vocabulary).
 import argparse
 import json
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,7 @@ def main() -> None:
     sys.path.insert(0, str(ref))
 
     import torch
-    from engram import EngramLayout, build_compressed_token_map, compute_hash_multipliers
+    from engram import EngramLayout, NgramHashState, build_compressed_token_map, compute_hash_multipliers
     from tokenizers import Tokenizer
 
     t = json.loads((a.checkpoint / "config.json").read_text())["text_config"]
@@ -88,7 +89,41 @@ def main() -> None:
         "token_map": len(token_map),
     }
     Path(f"{a.out}-state.json").write_text(json.dumps(state) + "\n")
+
+    # One prompt's hashes, plain and with an image span masked out: the addressing is what the engine's `hash_ids`
+    # has to reproduce integer for integer, and the masked variant is the release's `token_mask` (a position inside
+    # an image span takes no part in an n-gram and no lookback reaches into it).
+    hashed = EngramLayout(**{**vars(layout), "primes": tuple(tuple(tuple(h) for h in per) for per in primes)})
+    shim = types.SimpleNamespace(
+        max_batch_size=1,
+        max_seq_len=len(PROMPT),
+        engram_pad_id=t["engram_pad_token_id"],
+        engram_compressed_vocab_size=t["engram_compressed_vocab_size"],
+    )
+    hasher = NgramHashState(shim, hashed, Shim())
+    ids = torch.tensor([PROMPT])
+    text = torch.ones_like(ids, dtype=torch.bool)
+    text[0, 4:7] = False  # an image span of three positions in the middle of the prompt
+    for suffix, mask in (("", None), ("-masked", text)):
+        hashes = hasher(ids, 0, mask)[0]
+        Path(f"{a.out}-hash{suffix}.i64").write_bytes(hashes.reshape(-1).numpy().astype("<i8").tobytes())
+        Path(f"{a.out}-hash{suffix}.json").write_text(
+            json.dumps(
+                {
+                    "ids": list(PROMPT),
+                    "mask": (text[0] if mask is not None else torch.ones_like(ids, dtype=torch.bool)[0]).tolist(),
+                    "shape": list(hashes.shape),
+                    "source": "engram.NgramHashState.forward",
+                }
+            )
+            + "\n"
+        )
     print(json.dumps({"compressed_vocab": vocab_size, "layers": state["layers"], "primes0": primes[0][0][:3]}))
+
+
+# The prompt the hash dumps are written for: the same ids `deepseek_ref_engram.py` uses, so one file explains the
+# other. It has to be somewhere the n-gram orders reach (three positions inside the sequence).
+PROMPT = [671, 6102, 294, 8760, 344, 11111, 14, 305, 270, 9670]
 
 
 def _next_prime(start: int, seen: set) -> int:

@@ -336,6 +336,10 @@ enum Cmd {
         /// Hold every block's non-expert weights resident instead of reading them back from the file per step.
         #[arg(long)]
         no_blocks: bool,
+        /// An image for the prompt: the placeholder token is expanded into the span its processor defines and the
+        /// tower's rows replace its embeddings.
+        #[arg(long)]
+        image: Option<PathBuf>,
     },
 }
 
@@ -651,6 +655,47 @@ impl malleus_gguf::TensorSource for Counting {
     }
 }
 
+/// The image span of a prompt: the placeholder token expanded to the layout its processor defines
+/// (`[START] ([IMAGE] * w + [NEW_LINE]) * h [END]`), and the rows the tower's aligner gave framed by the three
+/// learned delimiters. `ids` is expanded in place; the span says where it started.
+fn deepseek_image_span(
+    src: &dyn malleus_gguf::TensorSource,
+    c: &Config,
+    ids: &mut Vec<u32>,
+    path: &Path,
+) -> Result<malleus_model::deepseek_text::Span> {
+    let d = c.deepseek.as_ref().context("no deepseek config")?;
+    let v = d.vision.as_ref().context("the config carries no vision tower")?;
+    let token = d.image_token;
+    ensure!(token != 0, "the config carries no image token");
+    let at = ids
+        .iter()
+        .position(|&t| t == token)
+        .with_context(|| format!("the prompt has no image token ({token})"))?;
+    let t0 = Instant::now();
+    let tower = malleus_model::deepseek_vision::VisionWeights::load(src, c, &|i, n| {
+        if i == n || i.is_multiple_of(8) {
+            eprint!("\rloading the vision tower {i}/{n}");
+        }
+    })?;
+    eprintln!(
+        "\nthe vision tower: {:.2} GB on the host in {:.0}s",
+        tower.bytes() as f64 / 1e9,
+        t0.elapsed().as_secs_f64()
+    );
+    let delimiters = malleus_model::deepseek_vision::ImageTokens::load(src, c)?;
+    let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
+    let (patches, gh, gw, n_llm_h, n_llm_w) = malleus_model::deepseek_vision::preprocess(v, &bytes, 4 << 20)?;
+    let (_vit, merged) = malleus_model::deepseek_vision::forward(&tower, &patches, gh, gw)?;
+    let rows = malleus_model::deepseek_vision::span_embeddings(&delimiters, &merged, n_llm_h, n_llm_w, c.hidden)?;
+    let span = malleus_model::deepseek_text::Span { at, rows };
+    let len = span.len(c.hidden);
+    ensure!(len > 0, "the tower gave an empty span");
+    ids.splice(at..at + 1, std::iter::repeat_n(token, len));
+    eprintln!("image: {gh}x{gw} patches, {n_llm_h}x{n_llm_w} token grid, a span of {len} positions at {at}");
+    Ok(span)
+}
+
 /// The DeepSeek-V4.1 host run: the backbone streams block by block (162.45 GB against 122 GB of memory), the Engram
 /// tables are read from their companion file, and every step says what it read and how long it took.
 #[allow(clippy::too_many_arguments)]
@@ -665,6 +710,7 @@ fn deepseek_run(
     chat_template: bool,
     full_prefill: bool,
     blocks: bool,
+    image: Option<&Path>,
 ) -> Result<()> {
     // A `.malleus` file carries its own config; a checkpoint directory is the release's own storage, which is the
     // reference this quantized file is measured against.
@@ -685,8 +731,17 @@ fn deepseek_run(
     )?;
     let chat = load_chat(model)?;
     let text = if chat_template {
+        // An image is a content block, not a token in the text: the template turns the block into the placeholder
+        // token the processor expands, and refuses a placeholder typed into the text.
+        let content = match image {
+            Some(_) => serde_json::json!([
+                { "type": "image", "image_url": { "url": "" } },
+                { "type": "text", "text": prompt }
+            ]),
+            None => serde_json::json!(prompt),
+        };
         chat.render(
-            &serde_json::json!([{ "role": "user", "content": prompt }]),
+            &serde_json::json!([{ "role": "user", "content": content }]),
             &malleus_chat::RenderOptions {
                 add_generation_prompt: true,
                 ..Default::default()
@@ -695,8 +750,16 @@ fn deepseek_run(
     } else {
         prompt.to_string()
     };
-    let ids = chat.encode(&text)?;
+    let mut ids = chat.encode(&text)?;
     eprintln!("{text:?}\n{} prompt tokens: {ids:?}", ids.len());
+    let span = match image {
+        Some(path) => Some(deepseek_image_span(weights.as_ref(), &c, &mut ids, path)?),
+        None => None,
+    };
+    ensure!(
+        span.is_none() || !full_prefill,
+        "an image span is spliced into the cached prefill: drop --full-prefill"
+    );
     let backbone = Counting::new(weights);
     let tables = Counting::new(table);
     let (read_backbone, read_tables) = (backbone.tally(), tables.tally());
@@ -742,7 +805,7 @@ fn deepseek_run(
     } else {
         // The prompt in one prefill into the cache, then one position per token.
         let mut cache = s.cache(experts);
-        let out = s.generate_cached(&mut cache, &ids, tokens, &mut report)?;
+        let out = s.generate_cached_span(&mut cache, &ids, tokens, span.as_ref(), &mut report)?;
         experts_read = cache.experts_read;
         eprintln!(
             "cache: {} positions, {:.2} GB of experts held",
@@ -3873,6 +3936,7 @@ fn main() -> Result<()> {
             raw,
             full_prefill,
             no_blocks,
+            image,
         } => deepseek_run(
             &model,
             &engram,
@@ -3884,6 +3948,7 @@ fn main() -> Result<()> {
             !raw,
             full_prefill,
             !no_blocks,
+            image.as_deref(),
         )?,
         Cmd::Eval {
             model,

@@ -538,6 +538,9 @@ on the bf16/fp8/fp4 checkpoint (`/mnt/usb/deepseekv41-flash` here, 510 GB, so it
 | `the_engram_table_matches_the_checkpoint` | the 4-bit rows against the checkpoint's fp8, both layers | 0.9395 (layer 1), 0.9591 (layer 14) |
 | `the_engram_forward_matches_the_reference` | the Engram gate on the release's module: rows, `wkv`, the signed sqrt and the sigmoid (layers 1 and 14) | rows exact, `kv` 1.0000000 (max 1.2e-4), gate 1.0000000 (max 4e-6) |
 | `the_text_graph_matches_the_reference` | the whole graph on the tiny checkpoint | every stage ≥ 0.99696, `logits_all` 0.99937 |
+| `the_hash_matches_the_reference` | the Engram addressing of one prompt, plain and with an image span masked out, integer for integer | exact, both cases |
+| `the_image_span_matches_the_reference` | the span the LLM sees: the delimiters and the aligner rows in the release's layout | exact (no value differs) |
+| `the_image_span_is_spliced_into_the_embeddings` | the tiny graph: the span spliced by the caller and by the graph give the same logits | bit-identical |
 
 The Engram tables are the low number and it is the quantizer, not the graph: 4-bit rows against the release's
 `IQ4_NL` land at 0.9395 and 0.9591, and that is the precision the file carries (issue #121 scopes the quantizer
@@ -550,6 +553,13 @@ not that handoff; the tiny graph is what covers it.
 The tiny gate used to sit at 0.9978 because the reference ran on f32 weights while the file it exports is bf16:
 `scripts/deepseek_ref.py` now reloads the values it wrote, so the comparison is about the graph and not about the
 storage.
+
+An image is a **span** of the prompt: the placeholder token expands to
+`[START] ([IMAGE] * w + [NEW_LINE]) * h [END]`, the tower's aligner fills the image slots, and those positions take
+no part in an n-gram, get no Engram contribution and route with the VL bias. The corn photo
+(`inference/examples/images/corn.jpeg`, 450x308) is a 33x47 patch grid, 11x16 tokens and therefore a span of 189
+positions; the tower is 1.94 GB of f32 on the host and a second. End to end, a 39-token prompt with that image is
+227 positions of prefill: 2628 s, 28 760 experts read, 279.5 GB off the disk, one token generated.
 
 ```sh
 # the dumps, once (the release's own model.py under torch, in the golden image)
@@ -566,6 +576,9 @@ scripts/golden.sh python3 scripts/deepseek_ref_engram.py --checkpoint /models/de
 MALLEUS_MODELS=/mnt/usb scripts/dev.sh env MALLEUS_DEEPSEEK_LAYERS=0 DEEPSEEK_CKPT=/models/deepseekv41-flash \
   DEEPSEEK_REF_LAYER=/golden/deepseek-ref/layer0 \
   cargo test -p malleus-model --release -- layer_zero_matches_the_reference_on_the_real_weights -- --ignored --nocapture
+MALLEUS_MODELS=/mnt/usb scripts/dev.sh env DEEPSEEK_CKPT=/models/deepseekv41-flash \
+  DEEPSEEK_VISION_REF=/golden/deepseek-vision/corn \
+  cargo test -p malleus-model --release -- the_image_span -- --ignored --nocapture
 MALLEUS_MODELS=/mnt/usb scripts/dev.sh env MALLEUS_DEEPSEEK_LAYERS=2 DEEPSEEK_LAYER=2 \
   DEEPSEEK_CKPT=/models/deepseekv41-flash DEEPSEEK_REF_LAYER=/golden/deepseek-ref/layer2 \
   cargo test -p malleus-model --release -- an_isolated_layer_attention_matches -- --ignored --nocapture
@@ -573,6 +586,12 @@ MALLEUS_MODELS=/mnt/usb scripts/dev.sh env DEEPSEEK_CKPT=/models/deepseekv41-fla
   DEEPSEEK_ENGRAM=/golden/deepseek-engram DEEPSEEK_ENGRAM_TABLE=/models/deepseek-v41-flash-engram.malleus \
   DEEPSEEK_REF_ENGRAM=/golden/deepseek-ref/engram1 \
   cargo test -p malleus-model --release -- the_engram -- --ignored --nocapture
+
+# an image: the placeholder goes in as a content block, the tower runs on the host and the span is spliced in
+scripts/dev.sh /target/release/malleus deepseek-run --model /models/deepseek-v41-flash-mls2.malleus \
+  --engram /models/deepseek-v41-flash-engram.malleus --engram-state /golden/deepseek-engram \
+  --image /models/deepseekv41-flash/inference/examples/images/corn.jpeg \
+  --prompt "Describe this image in one word." --tokens 1 --top 8
 
 # serving it (issue #121): the host graph is CPU-only, so no device is needed, and the Engram companion file is
 # skipped from the catalog on its own (it has no `embed.weight`); the state comes from the environment.
