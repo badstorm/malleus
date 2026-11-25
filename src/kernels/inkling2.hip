@@ -683,7 +683,40 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, 
     const int per = (nk + 7) / 8, i0 = wave * per, i1 = min(nk, i0 + per);
     float m = -INFINITY, l = 0.f;
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-    for (int i = i0; i < i1; ++i) {
+    // Four keys' dots at a time: each key keeps its own five-`xor` reduction in the same order, but the four chains
+    // are independent, so the warp waits on one round of shuffles per four keys instead of on five per key. The
+    // softmax and the value accumulation still run in key order.
+    int i = i0;
+    for (; i + 3 < i1; i += 4) {
+        float d[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int at = i + u, row = ring > 0 ? (k0 + at >= ring ? k0 + at - ring : k0 + at) : k0 + at;
+            const __half* kp = k + ((size_t)row * nkv + kh) * dim + 4 * lane;
+            const float2 ka = __half22float2(*(const __half2*)kp), kb = __half22float2(*(const __half2*)(kp + 2));
+            d[u] = qv.x * ka.x + qv.y * ka.y + qv.z * kb.x + qv.w * kb.y;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) d[u] += __shfl_xor(d[u], o, 32);
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int at = i + u, row = ring > 0 ? (k0 + at >= ring ? k0 + at - ring : k0 + at) : k0 + at;
+            const float sc = d[u] * scale + bias[(size_t)h * nk + at];
+            const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
+            const __half* vp = v + ((size_t)row * nkv + kh) * dim + 4 * lane;
+            const float2 v0 = __half22float2(*(const __half2*)vp), v1 = __half22float2(*(const __half2*)(vp + 2));
+            acc.x = acc.x * corr + p * v0.x;
+            acc.y = acc.y * corr + p * v0.y;
+            acc.z = acc.z * corr + p * v1.x;
+            acc.w = acc.w * corr + p * v1.y;
+            l = l * corr + p;
+            m = mn;
+        }
+    }
+    for (; i < i1; ++i) {
         const int row = ring > 0 ? (k0 + i >= ring ? k0 + i - ring : k0 + i) : k0 + i;
         const __half* kp = k + ((size_t)row * nkv + kh) * dim + 4 * lane;
         const float2 k0v = __half22float2(*(const __half2*)kp), k1v = __half22float2(*(const __half2*)(kp + 2));
