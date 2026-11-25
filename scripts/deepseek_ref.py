@@ -386,12 +386,38 @@ def main() -> None:
     # dumped here is the draft alone — the block it proposes, its logits and its confidence — not a spec loop.
     # The prefill seeds the stages' window caches from the target layers' hidden states; the step one position
     # later is what proposes.
+    # The prefill's own row for the last position, next to the step's: the draft reads the step's, and the two
+    # say whether the release's decode and its prefill agree there.
+    dump("spec_prefill_hidden", main_hidden[0, -1])
     model.forward_spec(output_ids, main_hidden, 0)
     start = ids.size(1) - 1
     step = ids[:, -1:]
     with torch.inference_mode():
         _, _, step_hidden = model(step, start)
+        # Stage by stage, so a divergence names the stage it starts at: the draft's embeds, each stage's attention
+        # and each stage's block output, then the streams the head reads.
+        stages = []
+
+        def stage_hook(i):
+            def attn(_m, _inp, out):
+                stages.append(("spec_attn%d" % i, out.detach().float().reshape(-1)))
+
+            def block(_m, _inp, out):
+                stages.append(("spec_block%d" % i, out[0].detach().float().reshape(-1)))
+
+            model.mtp[i].attn.register_forward_hook(attn)
+            model.mtp[i].register_forward_hook(block)
+
+        for i in range(ARGS["n_mtp_layers"]):
+            stage_hook(i)
+        model.mtp[0].main_norm.register_forward_hook(lambda _m, _i, out: stages.append(("spec_main_x", out.detach().float().reshape(-1))))
+        model.mtp[0].embed.register_forward_hook(lambda _m, _i, out: stages.append(("spec_embeds", out.detach().float().reshape(-1))))
+        model.mtp[0].main_proj.register_forward_pre_hook(
+            lambda _m, inp: stages.append(("spec_main_hidden", inp[0].detach().float().reshape(-1)))
+        )
         spec_ids, spec_logits, spec_conf = model.forward_spec(step, step_hidden, start)
+        for name, values in stages:
+            dumps[name] = values
     dump("spec_ids", spec_ids.float())
     dump("spec_logits", spec_logits.float())
     dump("spec_conf", spec_conf.float())
