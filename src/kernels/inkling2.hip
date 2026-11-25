@@ -224,7 +224,8 @@ typedef float ik_f8 __attribute__((ext_vector_type(8)));
 // masks and in the bias is the session's, not the chunk's.
 template <bool CACHED>
 __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const float* k, const float* v,
-                                               const __half* ck, const __half* cv, int rows, int ring, int pos,
+                                               const signed char* ck, const signed char* cv, const float* cks,
+                                               const float* cvs, int rows, int ring, int pos,
                                                const float* rel, const float* proj, const float* sink,
                                                const float* gate, int T, int heads, int nkv, int dim, int d_rel,
                                                int extent, int window, float scale) {
@@ -279,8 +280,11 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
             if (CACHED) {
                 const int row = live ? (ring > 0 ? s % ring : s) : 0;
                 if (live) {
-                    kv = ck[((size_t)row * nkv + kh) * dim + d];
-                    vv = cv[((size_t)row * nkv + kh) * dim + d];
+                    // int8 with one scale per (position, KV head): the staging into shared is where the prefill
+                    // reads the cache, so this is the only place the format shows there (issue #106, item 2).
+                    const int at = (int)((size_t)row * nkv + kh);
+                    kv = (_Float16)((float)ck[at * dim + d] * cks[at]);
+                    vv = (_Float16)((float)cv[at * dim + d] * cvs[at]);
                 }
             } else if (live) {
                 kv = (_Float16)k[((size_t)s * nkv + kh) * dim + d];
@@ -369,11 +373,12 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
 
 #define IK_ATTN_WMMA(NAME, CACHED)                                                                                    \
     extern "C" __global__ void __launch_bounds__(128) NAME(                                                           \
-        float* out, const float* q, const float* k, const float* v, const __half* ck, const __half* cv, int rows,      \
-        int ring, int pos, const float* rel, const float* proj, const float* sink, const float* gate, int T, int heads, \
-        int nkv, int dim, int d_rel, int extent, int window, float scale) {                                            \
-        attn_wmma_core<CACHED>(out, q, k, v, ck, cv, rows, ring, pos, rel, proj, sink, gate, T, heads, nkv, dim, d_rel, \
-                               extent, window, scale);                                                                \
+        float* out, const float* q, const float* k, const float* v, const signed char* ck, const signed char* cv,      \
+        const float* cks, const float* cvs, int rows, int ring, int pos, const float* rel, const float* proj,          \
+        const float* sink, const float* gate, int T, int heads, int nkv, int dim, int d_rel, int extent, int window,   \
+        float scale) {                                                                                                \
+        attn_wmma_core<CACHED>(out, q, k, v, ck, cv, cks, cvs, rows, ring, pos, rel, proj, sink, gate, T, heads, nkv,  \
+                               dim, d_rel, extent, window, scale);                                                    \
     }
 IK_ATTN_WMMA(inkling2_attn_wmma, false)
 IK_ATTN_WMMA(inkling2_attn_wmma_cached, true)
@@ -669,10 +674,11 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_sconv_dec(float* y, c
 // only, and the output gate is applied after the merge.
 // A key sits at row `k0 + i`, wrapped when `ring` is not 0: a sliding layer only keeps its window, so its cache is a
 // ring and the first key of the window may be anywhere in it.
-extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, const float* q, const __half* k,
-                                                                  const __half* v, const float* bias, const float* sink,
-                                                                  const float* gate, int k0, int nk, int heads,
-                                                                  int nkv, int dim, int ring, float scale) {
+extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, const float* q, const signed char* k,
+                                                                  const float* ksc, const signed char* v,
+                                                                  const float* vsc, const float* bias,
+                                                                  const float* sink, const float* gate, int k0, int nk,
+                                                                  int heads, int nkv, int dim, int ring, float scale) {
     __shared__ float sm[8], sl[8], sa[8][128];
     const int h = blockIdx.x, kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -718,19 +724,24 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, 
     }
     for (; i < i1; ++i) {
         const int row = ring > 0 ? (k0 + i >= ring ? k0 + i - ring : k0 + i) : k0 + i;
-        const __half* kp = k + ((size_t)row * nkv + kh) * dim + 4 * lane;
-        const float2 k0v = __half22float2(*(const __half2*)kp), k1v = __half22float2(*(const __half2*)(kp + 2));
-        float d = qv.x * k0v.x + qv.y * k0v.y + qv.z * k1v.x + qv.w * k1v.y;
+        // int8 keys with one scale per (position, KV head): four codes a lane, one scale a row.
+        const float kscale = ksc[(size_t)row * nkv + kh];
+        const int kbits = *(const int*)(k + ((size_t)row * nkv + kh) * dim + 4 * lane);
+        const float ka = (float)(signed char)(kbits & 0xff) * kscale;
+        const float kb = (float)(signed char)((kbits >> 8) & 0xff) * kscale;
+        const float kc = (float)(signed char)((kbits >> 16) & 0xff) * kscale;
+        const float kd = (float)(signed char)((kbits >> 24) & 0xff) * kscale;
+        float d = qv.x * ka + qv.y * kb + qv.z * kc + qv.w * kd;
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
         const float sc = d * scale + bias[(size_t)h * nk + i];
         const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
-        const __half* vp = v + ((size_t)row * nkv + kh) * dim + 4 * lane;
-        const float2 v0 = __half22float2(*(const __half2*)vp), v1 = __half22float2(*(const __half2*)(vp + 2));
-        acc.x = acc.x * corr + p * v0.x;
-        acc.y = acc.y * corr + p * v0.y;
-        acc.z = acc.z * corr + p * v1.x;
-        acc.w = acc.w * corr + p * v1.y;
+        const float vscale = vsc[(size_t)row * nkv + kh];
+        const int vbits = *(const int*)(v + ((size_t)row * nkv + kh) * dim + 4 * lane);
+        acc.x = acc.x * corr + p * ((float)(signed char)(vbits & 0xff) * vscale);
+        acc.y = acc.y * corr + p * ((float)(signed char)((vbits >> 8) & 0xff) * vscale);
+        acc.z = acc.z * corr + p * ((float)(signed char)((vbits >> 16) & 0xff) * vscale);
+        acc.w = acc.w * corr + p * ((float)(signed char)((vbits >> 24) & 0xff) * vscale);
         l = l * corr + p;
         m = mn;
     }
@@ -773,15 +784,40 @@ extern "C" __global__ void inkling2_moe_acc(float* y, const float* x, const floa
 
 // Stores a step's keys (or values) as fp16 at logical position `pos`, wrapping in the slot's ring: half the bytes of
 // the fp32 the cache used to hold, and the same rounding the reference uses for its own cache.
-extern "C" __global__ void __launch_bounds__(256) inkling2_kv_store(__half* dst, const float* src, int pos, int t,
-                                                                  int capacity, int ring, int c) {
-    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
-    if (i >= (long long)t * c) return;
-    const int row = pos + (int)(i / c);
+extern "C" __global__ void __launch_bounds__(256) inkling2_kv_store(signed char* dst, float* dsc, const float* src,
+                                                                  int pos, int t, int capacity, int ring, int c,
+                                                                  int dim) {
+    // One warp per (row of the step, KV head), eight of them a block: the max of the head's `dim` values, its scale,
+    // then the codes. int8 with a scale a head is half the bytes of the fp16 cache and keeps eight bits of mantissa
+    // where e4m3 keeps four (issue #106, item 2). Eight units a block because a chunk of 512 rows is 4 096 of them
+    // and a block of 32 threads each was 4 % of the prefill.
+    const int nkv = c / dim;
+    const int unit = blockIdx.x * 8 + (int)(threadIdx.x / 32);
+    const int r = unit / nkv, kh = unit % nkv;
+    const int row = pos + r;
     const int keep = pos + t - min(t, capacity);
     if (row < keep) return;
     const int at = ring > 0 ? row % ring : row;
-    dst[(size_t)at * c + (int)(i % c)] = __float2half(src[i]);
+    const int lane = (int)(threadIdx.x % 32);
+    const size_t base = (size_t)r * c + (size_t)kh * dim;
+    float mx = 0.f;
+    for (int i = 4 * lane; i < dim; i += 4) {
+        const float4 x = *(const float4*)(src + base + i);
+        mx = fmaxf(mx, fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w))));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+    const float sc = mx > 0.f ? mx / 127.f : 1.f;
+    const float inv = 1.f / sc;
+    signed char* dp = dst + (size_t)at * c + (size_t)kh * dim;
+    for (int i = 4 * lane; i < dim; i += 4) {
+        const float4 x = *(const float4*)(src + base + i);
+        dp[i] = (signed char)__float2int_rn(x.x * inv);
+        dp[i + 1] = (signed char)__float2int_rn(x.y * inv);
+        dp[i + 2] = (signed char)__float2int_rn(x.z * inv);
+        dp[i + 3] = (signed char)__float2int_rn(x.w * inv);
+    }
+    if (lane == 0) dsc[(size_t)at * nkv + kh] = sc;
 }
 
 // ---- the MTP head (issue #110, item 6): the fuse of the four target states and the rope the block reads ----
