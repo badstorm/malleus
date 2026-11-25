@@ -1837,6 +1837,9 @@ impl Model {
         if self.hy4.is_some() {
             return crate::hy4::rollback(self, sess, n);
         }
+        if let Some(k) = sess.inkling2.as_deref_mut() {
+            return crate::inkling2::rollback(self, k, n);
+        }
         if n == 0 {
             return Ok(());
         }
@@ -1879,13 +1882,17 @@ impl Model {
         self.has_mtp() || self.inkling2.is_some()
     }
 
-    /// Hy4's DFly2: the drafts of a block come in one call (`block_draft`), not one MTP step at a time.
+    /// Hy4's DFly2 and Inkling-2's MTP head: the drafts of a block come in one call (`block_draft`), not one step at
+    /// a time — the head is a block of proposals, and the block is what the verify then checks in one pass.
     pub fn has_block_draft(&self) -> bool {
-        crate::hy4::has_draft(self)
+        crate::hy4::has_draft(self) || (self.inkling2.is_some() && crate::inkling2::draft_enabled())
     }
 
-    /// Up to `n` greedy drafts after `bonus`, the token the last call produced (DFly2).
+    /// Up to `n` greedy drafts after `bonus`, the token the last call produced (DFly2, or the MTP block).
     pub fn block_draft(&self, sess: &mut Session, bonus: u32, n: usize) -> Result<Vec<u32>> {
+        if let Some(k) = sess.inkling2.as_deref_mut() {
+            return crate::inkling2::draft(self, k, bonus, n);
+        }
         crate::hy4::draft(self, sess, bonus, n)
     }
 

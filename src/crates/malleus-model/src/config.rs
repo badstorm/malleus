@@ -260,6 +260,8 @@ pub struct Inkling2Mtp {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub rope_theta: f32,
+    /// `mtp_config.rms_norm_eps`: the head has its own, and it is not the text stack's.
+    pub eps: f32,
     pub window: usize,
     /// Layers of the head that slide; the rest are full attention.
     pub local: Vec<usize>,

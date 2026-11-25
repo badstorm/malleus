@@ -783,3 +783,139 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_kv_store(__half* dst,
     const int at = ring > 0 ? row % ring : row;
     dst[(size_t)at * c + (int)(i % c)] = __float2half(src[i]);
 }
+
+// ---- the MTP head (issue #110, item 6): the fuse of the four target states and the rope the block reads ----
+
+__device__ __forceinline__ float ik_warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
+    return v;
+}
+
+// The head's fuse, one stage at a time: out[r] = RMSNorm(sum_q alpha[q] * feats[q][r], eps) * w, one warp a row.
+// `feats` is [4, rows, n] (the four target states this step kept), `alpha` the four weights of one row of
+// `softmax(fuse_weight)`, `w` that stage's `dflare_norm` (bf16). The Markov stage is the fourth row of the same
+// softmax; it runs through this kernel with its own weight.
+extern "C" __global__ void __launch_bounds__(256) inkling2_draft_mix(float* out, const float* feats,
+                                                                    const float* alpha, const ik_bf16* w, int rows,
+                                                                    int row0, int stride, int n, float eps) {
+    const int r = (int)(blockIdx.x * 8 + threadIdx.x / 32), lane = (int)(threadIdx.x % 32);
+    if (r >= rows) return;
+    const size_t pl = (size_t)stride * n;
+    const float* f = feats + (size_t)(row0 + r) * n;
+    const float a0 = alpha[0], a1 = alpha[1], a2 = alpha[2], a3 = alpha[3];
+    float ss = 0.f;
+    for (int i = lane; i < n; i += 32) {
+        const float v = a0 * f[i] + a1 * f[pl + i] + a2 * f[2 * pl + i] + a3 * f[3 * pl + i];
+        ss += v * v;
+    }
+    const float inv = rsqrtf(ik_warp_sum(ss) / (float)n + eps);
+    float* y = out + (size_t)r * n;
+    for (int i = lane; i < n; i += 32) {
+        const float v = a0 * f[i] + a1 * f[pl + i] + a2 * f[2 * pl + i] + a3 * f[3 * pl + i];
+        y[i] = v * inv * ik_bf2f(w[i]);
+    }
+}
+
+// NeoX rope, in place, over the `dim` of every head of a [rows, nh, dim] row: the pair is (f, f + dim / 2), the
+// inverse frequency theta^(-2f/dim) and the angle is the row's position.
+extern "C" __global__ void __launch_bounds__(256) inkling2_rope_neox(float* x, const int* pos, int rows, int nh,
+                                                                    int dim, float theta, int mode) {
+    if (mode == 2) return;
+    const int half = dim / 2;
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (long long)rows * nh * half) return;
+    const int r = (int)(i / (nh * half)), rest = (int)(i % (nh * half));
+    const int h = rest / half, f = rest % half;
+    float* p = x + ((size_t)r * nh + h) * dim;
+    const float ang = (float)pos[r] / powf(theta, (float)(2 * f) / (float)dim);
+    const float c = cosf(ang), s = sinf(ang);
+    // mode 0: NeoX, the pair is (f, f + half). mode 1: interleaved, the pair is (2f, 2f + 1) with one angle per pair.
+    const int j = mode == 0 ? f : 2 * f;
+    const int k = mode == 0 ? f + half : 2 * f + 1;
+    const float x0 = p[j], x1 = p[k];
+    p[j] = x0 * c - x1 * s;
+    p[k] = x1 * c + x0 * s;
+}
+
+// `n` bf16 values copied out as f32 at `out[off + i]`: the head's `mask_embed` row, which the block writes into
+// every one of its proposals.
+extern "C" __global__ void __launch_bounds__(256) inkling2_bf16_rows(float* out, const ik_bf16* src, int soff,
+                                                                    int doff, int n) {
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i < (long long)n) out[doff + i] = ik_bf2f(src[soff + i]);
+}
+
+// The three-row history a convolution input has after every row of a multi-row step: snap[r][3][c] holds the rows
+// that `past` holds once row r is done (oldest first, zero before the sequence), so a rolled-back verify can put back
+// the history of the row the caller keeps with one copy. Layout: [t, 3, c], `pos` is the first row's position.
+extern "C" __global__ void __launch_bounds__(256) inkling2_hist_snap(float* snap, const float* past, const float* x,
+                                                                    int pos, int t, int c) {
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (long long)t * c) return;
+    const int r = (int)(i / c), col = (int)(i % c);
+    for (int k = 0; k < 3; ++k) {
+        const int g = pos + r - 2 + k;
+        float v = 0.f;
+        if (g >= pos) v = x[(size_t)(g - pos) * c + col];
+        else if (g >= 0) v = past[(size_t)(g + 3 - pos) * c + col];
+        snap[((size_t)r * 3 + k) * c + col] = v;
+    }
+}
+
+// ---- the Markov half of the MTP head: the walk that shapes the proposed logits ----
+
+// One step of the walk: `h = rnn_proj @ in + bias` (5120 -> 768 = 3 x rank), then
+// `gate = sigmoid(h[2r]), state' = gate * state + (1 - gate) * tanh(h[r]), latent = tanh(h[r + rank])`.
+// `in` is [state | markov_w1[prev] | hidden | f_rnn], `w` is [3 * rank, 5120] bf16, one warp an output row.
+extern "C" __global__ void __launch_bounds__(256) inkling2_markov_step(float* state, float* latent, const float* in,
+                                                                     const ik_bf16* w, const ik_bf16* bias, int rank,
+                                                                     int k) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    __shared__ float sh[768];
+    for (int o = warp; o < 3 * rank; o += 8) {
+        const ik_bf16* wr = w + (size_t)o * k;
+        float acc = 0.f;
+        for (int i = lane; i < k; i += 32) acc += ik_bf2f(wr[i]) * in[i];
+        acc = ik_warp_sum(acc);
+        if (lane == 0) sh[o] = acc + ik_bf2f(bias[o]);
+    }
+    __syncthreads();
+    if (threadIdx.x < rank) {
+        const int r = threadIdx.x;
+        const float gate = 1.f / (1.f + expf(-sh[2 * rank + r]));
+        state[r] = gate * state[r] + (1.f - gate) * tanhf(sh[r]);
+        latent[r] = tanhf(sh[rank + r]);
+    }
+}
+
+// The folded Markov bias added to a row of logits: `logits[v] += folded_bias[v] + sum_r fold[r, v] * latent[r]`.
+// The fold is [rank, vocab] (the layout a GEMM of the transposed `hidden_out` against `unembed` writes), so a warp
+// reads a contiguous run of vocab for one rank: 103 MB a row, which is what the walk costs.
+extern "C" __global__ void __launch_bounds__(256) inkling2_markov_bias(float* logits, const ik_bf16* fold,
+                                                                      const float* latent, const float* fbias,
+                                                                      int vocab, int rank) {
+    const int v = blockIdx.x * 256 + threadIdx.x;
+    if (v >= vocab) return;
+    float acc = fbias[v];
+    for (int r = 0; r < rank; ++r) acc += ik_bf2f(fold[(size_t)r * vocab + v]) * latent[r];
+    logits[v] += acc;
+}
+
+// [rows, cols] bf16 -> f32 transposed, i.e. out[c * rows + r] = in[r * cols + c]: the fold needs `hidden_out` as
+// the rows of a GEMM input.
+extern "C" __global__ void __launch_bounds__(256) inkling2_bf16_transpose(float* out, const ik_bf16* in, int rows,
+                                                                         int cols) {
+    const long long i = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (long long)rows * cols) return;
+    const int r = (int)(i / cols), c = (int)(i % cols);
+    out[(size_t)c * rows + r] = ik_bf2f(in[i]);
+}
+
+// f32 -> bf16, n values.
+extern "C" __global__ void __launch_bounds__(256) inkling2_to_bf16(ik_bf16* out, const float* in, int n) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= n) return;
+    const unsigned u = __float_as_uint(in[i]);
+    out[i] = (ik_bf16)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
