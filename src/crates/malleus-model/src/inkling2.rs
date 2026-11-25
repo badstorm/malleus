@@ -3827,7 +3827,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
     let rope_mode = knob("MALLEUS_MTP_ROPE", 0) as i32;
     let pos_mode = knob("MALLEUS_MTP_POS", 0);
     let logit_rows = knob("MALLEUS_MTP_LOGITS", 0);
-    let emb_norm = knob("MALLEUS_MTP_EMB", 1);
+    let emb_norm = knob("MALLEUS_MTP_EMB", 0);
     let anchor_pos = (d.base_pos + base - 1) as i32 + pos_mode as i32;
     let scale = 1.0 / (hd as f32).sqrt();
     // Row 0 is the anchor token, at the anchor's own position; the proposals are the mask row, one position each.
@@ -4003,6 +4003,8 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
             g.eps.into(),
         ],
     )?;
+    // The walk starts from a zero state for every block (`markov_head.init_state`).
+    d.state.memset(0, st)?;
     markov_fold(model, d)?;
     let (fold, fbias) = d.fold.as_ref().context("markov fold")?;
     let walk = f32s(rank + rank + h + h)?;
@@ -4012,9 +4014,33 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
     } else {
         walk.copy_from_shared(2 * rank * 4, &frnn, 0, h * 4, st)?;
     }
+    let markov = knob("MALLEUS_MTP_MARKOV", 1) == 1;
     let mut drafts: Vec<u32> = Vec::with_capacity(n);
     let mut prev = anchor;
     for r in 0..n {
+        if !markov {
+            let out = DeviceBuffer::alloc(4)?;
+            let row = Arg::U64(logits.addr() + (r * c.vocab * 4) as u64);
+            model.k.get("inkling2_softcap").launch(
+                (c.vocab.div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                st,
+                &[row, row, c.vocab.into(), i.logit_softcap.into()],
+            )?;
+            model.k.get("logits_argmax").launch(
+                (1, 1, 1),
+                (1024, 1, 1),
+                0,
+                st,
+                &[(&out).into(), row, c.vocab.into()],
+            )?;
+            st.synchronize()?;
+            let got: Vec<i32> = out.download(1)?;
+            prev = got[0] as u32;
+            drafts.push(prev);
+            continue;
+        }
         // [state | markov_w1[prev] | hidden | f_rnn]
         walk.copy_from_shared(0, &d.state, 0, rank * 4, st)?;
         model.k.get("inkling2_bf16_rows").launch(
