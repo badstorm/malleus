@@ -381,8 +381,11 @@ pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
         let info = src
             .info(&e.name)
             .with_context(|| format!("{}: not in the file", e.name))?;
+        // The draft head's own layers are bf16 in a file converted after #110 and 4 bits (with their scales) in the
+        // ones before it: both are readable, so the check takes either and the older files keep validating.
+        let draft_layer = e.name.starts_with("layers.") && info.dtype == DType::Mls4 && e.dtype == DType::BF16;
         ensure!(
-            info.dtype == e.dtype && info.shape == e.shape,
+            (info.dtype == e.dtype || draft_layer) && info.shape == e.shape,
             "{}: expected {:?} {:?}, the file has {:?} {:?}",
             e.name,
             e.dtype,
@@ -1298,6 +1301,9 @@ pub fn mtp_map(c: &Config) -> Result<Vec<Expected>> {
         for n in ["dflare_norm", "input_layernorm", "post_attention_layernorm"] {
             push(p(&format!("{n}.weight")), DType::BF16, vec![h]);
         }
+        // The head's own layers stay bf16: it is the draft, and 4 bits cost it 4 % of the hidden state its argmax is
+        // made of (issue #110). A file converted before that decision carries MLS4 here plus its scales, and `check`
+        // accepts either — the loader reads whatever the file holds (`Uploader::linear`).
         for (n, shape) in [
             ("mlp.gate_proj.weight", vec![m.inter, h]),
             ("mlp.up_proj.weight", vec![m.inter, h]),
@@ -1307,10 +1313,7 @@ pub fn mtp_map(c: &Config) -> Result<Vec<Expected>> {
             ("self_attn.v_proj.weight", vec![kvd, h]),
             ("self_attn.o_proj.weight", vec![h, qd]),
         ] {
-            let k = *shape.last().unwrap();
-            let scales = vec![shape[0], k / 128];
-            push(p(n), DType::Mls4, shape);
-            push(p(&format!("{n}.scales")), DType::F16, scales);
+            push(p(n), DType::BF16, shape);
         }
         for n in ["k_proj_ctx", "v_proj_ctx"] {
             push(p(&format!("self_attn.{n}.weight")), DType::BF16, vec![kvd, h]);

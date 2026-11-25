@@ -226,7 +226,9 @@ impl Family {
         // Inkling-2's MTP head keeps its own layers at bf16. The implementation the head is checked against refuses
         // anything else there, and 4 bits cost it ~4 % of the hidden state its argmax is made of (issue #110): the
         // block is 60M parameters, 0.13 GB of a 15 GB file, bought back by the tokens the draft has to earn.
-        if self == Family::Inkling2 && name.starts_with("mtp.") && shape.len() == 2 {
+        // The MTP head of this family maps without the stack's `model.llm.` prefix (`layers.N.self_attn.…`), so a
+        // bare `layers.` name is the draft and nothing else.
+        if self == Family::Inkling2 && name.starts_with("layers.") && shape.len() == 2 {
             return Kind::Raw;
         }
         // The MLA output gate of Ling is [num_heads, hidden]: a gate, never quantized. The KDA one is [4096, 2560].
@@ -1418,8 +1420,13 @@ mod tests {
         let o = opts();
         let c = |name: &str, shape: &[usize]| Family::Inkling2.classify(name, shape, &o, None, None);
         assert_eq!(c("model.layers.0.attn.wq_du.weight", &[3072, 2304]), Kind::Mls4);
+        assert_eq!(
+            c("model.llm.layers.0.mlp.experts.gate_up_proj", &[128, 18432, 2304]),
+            Kind::Mls4,
+            "the text stack's experts stay at 4 bits"
+        );
         for l in 0..3 {
-            let p = format!("mtp.layers.{l}.");
+            let p = format!("layers.{l}.");
             for (name, shape) in [
                 ("self_attn.q_proj.weight", vec![3072, 2304]),
                 ("self_attn.k_proj.weight", vec![1024, 2304]),
