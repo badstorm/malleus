@@ -283,10 +283,21 @@ pub fn quantize_row_int8(row: &[f32], out: &mut [i8]) -> f32 {
     s
 }
 
+/// The `MLS4` packing: two's-complement nibbles, low first, so a nibble sign-extends to its level.
 pub fn dequant_int4(nib: &[u8], s: f32, out: &mut [f32]) {
     for (i, &b) in nib.iter().enumerate() {
         out[2 * i] = (((b << 4) as i8) >> 4) as f32 * s;
         out[2 * i + 1] = ((b as i8) >> 4) as f32 * s;
+    }
+}
+
+/// The `RowI4` packing, which is not `MLS4`: the converter writes `level + 8` into the nibble, so the levels run
+/// `nibble - 8` from -8 to 7. Sign-extending these adds a constant offset of eight levels to every row — the
+/// Engram tables are read this way, and the offset is eight times the row's scale.
+pub fn dequant_rows_i4(nib: &[u8], s: f32, out: &mut [f32]) {
+    for (i, &b) in nib.iter().enumerate() {
+        out[2 * i] = ((b & 0xF) as f32 - 8.0) * s;
+        out[2 * i + 1] = ((b >> 4) as f32 - 8.0) * s;
     }
 }
 
@@ -301,6 +312,18 @@ mod tests {
             .enumerate()
             .fold(0u128, |m, (i, &s)| if s < 0 { m | 1 << i } else { m });
         assert_eq!(mask, 0x98913798d17e8d905c16e345695a0124);
+    }
+
+    #[test]
+    fn row_i4_levels_are_offset_by_eight() {
+        let mut out = [0f32; 4];
+        // Nibbles 8, 0, 15, 7: levels 0, -8, 7, -1.
+        dequant_rows_i4(&[0x08, 0x7F], 0.5, &mut out);
+        assert_eq!(out, [0.0, -4.0, 3.5, -0.5]);
+        // The MLS4 packing of the same bytes is a different format: two's complement, so 8 is -8 and 0 is 0.
+        let mut mls = [0f32; 4];
+        dequant_int4(&[0x08, 0x7F], 0.5, &mut mls);
+        assert_eq!(mls, [-4.0, 0.0, -0.5, 3.5]);
     }
 
     #[test]

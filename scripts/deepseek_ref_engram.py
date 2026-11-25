@@ -78,12 +78,10 @@ class Table:
             nib = np.frombuffer(self.f.read(packed), np.uint8)
             self.f.seek(self.data + scale_off + int(r) * 2)
             scale = np.frombuffer(self.f.read(2), "<f2")[0].astype(np.float32)
-            # Low nibble first, stored as value + 8, so a nibble sign-extends to its level.
-            lo = (nib & 0x0F).astype(np.int8)
-            hi = (nib >> 4).astype(np.int8)
+            # Low nibble first, stored as level + 8 (offset binary, not two's complement).
             vals = np.empty(2 * packed, np.float32)
-            vals[0::2] = np.where(lo & 8, lo - 16, lo)
-            vals[1::2] = np.where(hi & 8, hi - 16, hi)
+            vals[0::2] = (nib & 0x0F).astype(np.float32) - 8.0
+            vals[1::2] = (nib >> 4).astype(np.float32) - 8.0
             out[i] = vals[:k] * scale
         return out
 

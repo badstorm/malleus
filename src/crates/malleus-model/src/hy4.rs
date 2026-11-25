@@ -461,10 +461,7 @@ impl Table {
             self.file.read_at(id * rb, &mut buf)?;
             self.scales.read_at(id * 2, &mut sb)?;
             let s = half::f16::from_le_bytes(sb).to_f32();
-            for (i, &b) in buf.iter().enumerate() {
-                dst[2 * i] = ((b & 0xF) as f32 - 8.0) * s;
-                dst[2 * i + 1] = ((b >> 4) as f32 - 8.0) * s;
-            }
+            malleus_gguf::quant::dequant_rows_i4(&buf, s, dst);
             Ok(())
         };
         if ids.len() > 64 {

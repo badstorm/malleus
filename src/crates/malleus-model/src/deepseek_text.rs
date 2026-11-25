@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::{DType, TensorSource};
 
 use crate::config::{Config, DeepseekConfig};
+use crate::deepseek_engram::EngramState;
 use crate::hostmath::{dot, linear, parallel_chunks, rmsnorm, silu};
 
 /// A linear weight, row-major `[n, k]`, applied as `y = x · wᵀ`.
@@ -140,7 +141,7 @@ pub fn load_matrix(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Re
                     ensure!(scales.len() == n, "{name}: {} row scales", scales.len());
                     for r in 0..n {
                         let row = &mut w[r * k..(r + 1) * k];
-                        malleus_gguf::quant::dequant_int4(&codes[r * k / 2..(r + 1) * k / 2], scales[r], row);
+                        malleus_gguf::quant::dequant_rows_i4(&codes[r * k / 2..(r + 1) * k / 2], scales[r], row);
                     }
                 }
                 DType::Mls8 => {
@@ -318,6 +319,146 @@ struct Layer {
     engram: Option<Engram>,
 }
 
+impl Layer {
+    /// One block, from the file. `residents` loads the 384 routed experts too (54 GB in f32); the streamed path
+    /// leaves them to `StreamedExperts`, so a block costs what its attention and its shared expert cost.
+    pub fn load(src: &dyn TensorSource, c: &Config, i: usize, residents: bool) -> Result<Self> {
+        let d = c.deepseek.as_ref().context("no deepseek config")?;
+        let h = c.hidden;
+        let p = |s: &str| format!("layers.{i}.{s}");
+        let hc = |which: &str| -> Result<Hc> {
+            Ok(Hc {
+                f: load_mat(
+                    src,
+                    &p(&format!("{which}_fn")),
+                    (2 + d.hc_mult) * d.hc_mult,
+                    d.hc_mult * h,
+                )?,
+                base: load_vector(src, &p(&format!("{which}_base")), (2 + d.hc_mult) * d.hc_mult)?,
+                scale: load_vector(src, &p(&format!("{which}_scale")), 3)?,
+            })
+        };
+        let ratio = d.compress_ratios[i] as usize;
+        let is_kv_source = d.kv_source_layers.contains(&i);
+        let is_index_source = d.index_source_layers.contains(&i);
+        let compressor = if is_kv_source {
+            Some(Compressor {
+                ratio,
+                norm: load_vector(src, &p("attn.compressor.norm.weight"), d.head_dim)?,
+                wkv: load_lin(src, &p("attn.compressor.wkv.weight"), d.head_dim, h)?,
+                wgate: if ratio > 1 {
+                    Some(load_lin(src, &p("attn.compressor.wgate.weight"), d.head_dim, h)?)
+                } else {
+                    None
+                },
+            })
+        } else {
+            None
+        };
+        let indexer = if is_index_source {
+            let owns_k = is_kv_source;
+            Some(Indexer {
+                owns_k,
+                is_candidate: d.candidate.as_ref().is_some_and(|x| x.source_layer == i),
+                ratio,
+                heads: d.index.heads,
+                dim: d.index.dim,
+                topk: d.index.topk,
+                wq_b: load_lin(
+                    src,
+                    &p("attn.indexer.wq_b.weight"),
+                    d.index.heads * d.index.dim,
+                    d.q_lora,
+                )?,
+                weights_proj: load_lin(src, &p("attn.indexer.weights_proj.weight"), d.index.heads, h)?,
+                wk: if owns_k {
+                    Some(load_lin(src, &p("attn.indexer.wk.weight"), d.index.dim, d.head_dim)?)
+                } else {
+                    None
+                },
+                k_norm: if owns_k {
+                    Some(load_vector(src, &p("attn.indexer.k_norm.weight"), d.index.dim)?)
+                } else {
+                    None
+                },
+            })
+        } else {
+            None
+        };
+        let attn = Attn {
+            heads: d.heads,
+            head_dim: d.head_dim,
+            rope: d.rope,
+            q_lora: d.q_lora,
+            o_groups: d.o_groups,
+            o_lora: d.o_lora,
+            ratio,
+            wq_a: load_lin(src, &p("attn.wq_a.weight"), d.q_lora, h)?,
+            wq_b: load_lin(src, &p("attn.wq_b.weight"), d.heads * d.head_dim, d.q_lora)?,
+            wkv: load_lin(src, &p("attn.wkv.weight"), d.head_dim, h)?,
+            wo_a: load_lin(
+                src,
+                &p("attn.wo_a.weight"),
+                d.o_groups * d.o_lora,
+                d.heads * d.head_dim / d.o_groups,
+            )?,
+            wo_b: load_lin(src, &p("attn.wo_b.weight"), h, d.o_groups * d.o_lora)?,
+            q_norm: load_vector(src, &p("attn.q_norm.weight"), d.q_lora)?,
+            kv_norm: load_vector(src, &p("attn.kv_norm.weight"), d.head_dim)?,
+            sink: load_vector(src, &p("attn.attn_sink"), d.heads)?,
+            compressor,
+            indexer,
+        };
+        let inter = d.moe_inter;
+        let gate = Lin {
+            n: d.experts,
+            k: h,
+            w: load_matrix(src, &p("ffn.gate.weight"), d.experts, h)?,
+        };
+        // The routed experts are 54 GB of one block: the streamed path leaves them to `StreamedExperts`, which
+        // reads the few a position selects.
+        let mut experts = Vec::new();
+        if residents {
+            experts.reserve(d.experts);
+            for e in 0..d.experts {
+                let ep = |s: &str| p(&format!("ffn.experts.{e}.{s}"));
+                experts.push((
+                    load_lin(src, &ep("w1.weight"), inter, h)?,
+                    load_lin(src, &ep("w2.weight"), h, inter)?,
+                    load_lin(src, &ep("w3.weight"), inter, h)?,
+                ));
+            }
+        }
+        let moe = Moe {
+            gate,
+            bias: load_vector(src, &p("ffn.gate.bias"), d.experts)?,
+            bias_vl: if d.vision.is_some() {
+                Some(load_vector(src, &p("ffn.gate.bias_vl"), d.experts)?)
+            } else {
+                None
+            },
+            shared: (
+                load_lin(src, &p("ffn.shared_experts.w1.weight"), inter, h)?,
+                load_lin(src, &p("ffn.shared_experts.w2.weight"), h, inter)?,
+                load_lin(src, &p("ffn.shared_experts.w3.weight"), inter, h)?,
+            ),
+            experts,
+        };
+        Ok(Layer {
+            attn_norm: load_vector(src, &p("attn_norm.weight"), h)?,
+            ffn_norm: load_vector(src, &p("ffn_norm.weight"), h)?,
+            hc_attn: hc("hc_attn")?,
+            hc_ffn: hc("hc_ffn")?,
+            attn,
+            moe,
+            engram: match &d.engram {
+                Some(e) if e.layers.contains(&i) => Some(Engram::load(src, c, i)?),
+                _ => None,
+            },
+        })
+    }
+}
+
 /// The Engram memory of one layer, on the host: the rows a position hashes to go through `wkv` into one key per
 /// residual copy plus a shared value, and the gate is a normalised dot of the stream against the key. The table
 /// itself is in the companion file and is read a row at a time, so only the projections are held here.
@@ -362,6 +503,7 @@ impl Engram {
 
     /// Writes the lookup into the streams: `h` is `[t, hc, hidden]`, `hash` is `[t, (max_ngram - 1) * heads]` of
     /// table rows and `table` is the file holding them.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         table: &dyn TensorSource,
@@ -371,6 +513,7 @@ impl Engram {
         hidden: usize,
         hc: usize,
         eps: f32,
+        image_mask: Option<&[bool]>,
     ) -> Result<()> {
         ensure!(
             t > 0 && hash.len().is_multiple_of(t) && h.len() == t * hc * hidden,
@@ -418,6 +561,11 @@ impl Engram {
                     let d = dot * rstd * inv_sqrt_hidden;
                     // Signed sqrt before the sigmoid: the gate keeps the sign of the dot and its loudness.
                     let gate = 1.0 / (1.0 + (-d.abs().max(clamp).sqrt().copysign(d)).exp());
+                    // An image span takes no part in an n-gram: its gate is shut and the stream passes through.
+                    let gate = match image_mask {
+                        Some(mask) if !mask.get(i).copied().unwrap_or(false) => 0.0,
+                        _ => gate,
+                    };
                     for j in 0..hidden {
                         out[at + j] = stream[j] + gate * value[j];
                     }
@@ -444,165 +592,46 @@ pub struct Weights {
 
 impl Weights {
     pub fn load(src: &dyn TensorSource, c: &Config, progress: &dyn Fn(usize, usize)) -> Result<Self> {
-        let d = c.deepseek.as_ref().context("no deepseek config")?.clone();
-        let h = c.hidden;
-        let n = c.n_layers;
-        ensure!(d.compress_ratios.len() == n, "compress_ratios must cover every layer");
-        let embed = load_matrix(src, "embed.weight", c.vocab, h)?;
-        let head = load_matrix(src, "head.weight", c.vocab, h)?;
-        let norm = load_vector(src, "norm.weight", h)?;
-        // A slice of the stack, for a stage-by-stage comparison against the reference: `MALLEUS_DEEPSEEK_LAYERS=0`
-        // loads layer 0 alone and the forward then runs embed -> that block -> norm -> head.
-        let only: Option<Vec<usize>> = std::env::var("MALLEUS_DEEPSEEK_LAYERS").ok().map(|s| {
-            s.split(',')
-                .filter_map(|x| x.trim().parse().ok())
-                .collect::<Vec<usize>>()
-        });
-        let mut layers = Vec::with_capacity(n);
-        for i in 0..n {
-            if only.as_ref().is_some_and(|l| !l.contains(&i)) {
-                progress(i + 1, n);
-                continue;
-            }
-            let p = |s: &str| format!("layers.{i}.{s}");
-            let hc = |which: &str| -> Result<Hc> {
-                Ok(Hc {
-                    f: load_mat(
-                        src,
-                        &p(&format!("{which}_fn")),
-                        (2 + d.hc_mult) * d.hc_mult,
-                        d.hc_mult * h,
-                    )?,
-                    base: load_vector(src, &p(&format!("{which}_base")), (2 + d.hc_mult) * d.hc_mult)?,
-                    scale: load_vector(src, &p(&format!("{which}_scale")), 3)?,
-                })
-            };
-            let ratio = d.compress_ratios[i] as usize;
-            let is_kv_source = d.kv_source_layers.contains(&i);
-            let is_index_source = d.index_source_layers.contains(&i);
-            let compressor = if is_kv_source {
-                Some(Compressor {
-                    ratio,
-                    norm: load_vector(src, &p("attn.compressor.norm.weight"), d.head_dim)?,
-                    wkv: load_lin(src, &p("attn.compressor.wkv.weight"), d.head_dim, h)?,
-                    wgate: if ratio > 1 {
-                        Some(load_lin(src, &p("attn.compressor.wgate.weight"), d.head_dim, h)?)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            };
-            let indexer = if is_index_source {
-                let owns_k = is_kv_source;
-                Some(Indexer {
-                    owns_k,
-                    is_candidate: d.candidate.as_ref().is_some_and(|x| x.source_layer == i),
-                    ratio,
-                    heads: d.index.heads,
-                    dim: d.index.dim,
-                    topk: d.index.topk,
-                    wq_b: load_lin(
-                        src,
-                        &p("attn.indexer.wq_b.weight"),
-                        d.index.heads * d.index.dim,
-                        d.q_lora,
-                    )?,
-                    weights_proj: load_lin(src, &p("attn.indexer.weights_proj.weight"), d.index.heads, h)?,
-                    wk: if owns_k {
-                        Some(load_lin(src, &p("attn.indexer.wk.weight"), d.index.dim, d.head_dim)?)
-                    } else {
-                        None
-                    },
-                    k_norm: if owns_k {
-                        Some(load_vector(src, &p("attn.indexer.k_norm.weight"), d.index.dim)?)
-                    } else {
-                        None
-                    },
-                })
-            } else {
-                None
-            };
-            let attn = Attn {
-                heads: d.heads,
-                head_dim: d.head_dim,
-                rope: d.rope,
-                q_lora: d.q_lora,
-                o_groups: d.o_groups,
-                o_lora: d.o_lora,
-                ratio,
-                wq_a: load_lin(src, &p("attn.wq_a.weight"), d.q_lora, h)?,
-                wq_b: load_lin(src, &p("attn.wq_b.weight"), d.heads * d.head_dim, d.q_lora)?,
-                wkv: load_lin(src, &p("attn.wkv.weight"), d.head_dim, h)?,
-                wo_a: load_lin(
-                    src,
-                    &p("attn.wo_a.weight"),
-                    d.o_groups * d.o_lora,
-                    d.heads * d.head_dim / d.o_groups,
-                )?,
-                wo_b: load_lin(src, &p("attn.wo_b.weight"), h, d.o_groups * d.o_lora)?,
-                q_norm: load_vector(src, &p("attn.q_norm.weight"), d.q_lora)?,
-                kv_norm: load_vector(src, &p("attn.kv_norm.weight"), d.head_dim)?,
-                sink: load_vector(src, &p("attn.attn_sink"), d.heads)?,
-                compressor,
-                indexer,
-            };
-            let gate = Lin {
-                n: d.experts,
-                k: h,
-                w: load_matrix(src, &p("ffn.gate.weight"), d.experts, h)?,
-            };
-            let mut experts = Vec::with_capacity(d.experts);
-            let inter = d.moe_inter;
-            for e in 0..d.experts {
-                let ep = |s: &str| p(&format!("ffn.experts.{e}.{s}"));
-                experts.push((
-                    load_lin(src, &ep("w1.weight"), inter, h)?,
-                    load_lin(src, &ep("w2.weight"), h, inter)?,
-                    load_lin(src, &ep("w3.weight"), inter, h)?,
-                ));
-            }
-            let moe = Moe {
-                gate,
-                bias: load_vector(src, &p("ffn.gate.bias"), d.experts)?,
-                bias_vl: if d.vision.is_some() {
-                    Some(load_vector(src, &p("ffn.gate.bias_vl"), d.experts)?)
-                } else {
-                    None
-                },
-                shared: (
-                    load_lin(src, &p("ffn.shared_experts.w1.weight"), inter, h)?,
-                    load_lin(src, &p("ffn.shared_experts.w2.weight"), h, inter)?,
-                    load_lin(src, &p("ffn.shared_experts.w3.weight"), inter, h)?,
-                ),
-                experts,
-            };
-            layers.push(Layer {
-                attn_norm: load_vector(src, &p("attn_norm.weight"), h)?,
-                ffn_norm: load_vector(src, &p("ffn_norm.weight"), h)?,
-                hc_attn: hc("hc_attn")?,
-                hc_ffn: hc("hc_ffn")?,
-                attn,
-                moe,
-                engram: match &d.engram {
-                    Some(e) if e.layers.contains(&i) => Some(Engram::load(src, c, i)?),
-                    _ => None,
-                },
-            });
+        let mut w = Weights::open(src, c)?;
+        let n = w.n_layers;
+        w.layers.reserve(n);
+        for (i, selected) in w.selected().into_iter().enumerate() {
+            w.layers.push(Layer::load(src, c, selected, true)?);
             progress(i + 1, n);
         }
+        Ok(w)
+    }
+
+    /// What stays resident whatever the stack: the embedding, the head and the final norm. The loads are 5.3 GB in
+    /// f32 — two `[vocab, hidden]` matrices — and the blocks are left to the caller.
+    pub fn open(src: &dyn TensorSource, c: &Config) -> Result<Self> {
+        let d = c.deepseek.as_ref().context("no deepseek config")?.clone();
+        ensure!(
+            d.compress_ratios.len() == c.n_layers,
+            "compress_ratios must cover every layer"
+        );
         Ok(Weights {
-            hidden: h,
+            hidden: c.hidden,
             vocab: c.vocab,
             eps: d.eps,
-            n_layers: n,
+            n_layers: c.n_layers,
             c: d,
-            embed,
-            head,
-            norm,
-            layers,
+            embed: load_matrix(src, "embed.weight", c.vocab, c.hidden)?,
+            head: load_matrix(src, "head.weight", c.vocab, c.hidden)?,
+            norm: load_vector(src, "norm.weight", c.hidden)?,
+            layers: Vec::new(),
         })
+    }
+
+    /// The block indices to run, in order: all of them, or the slice `MALLEUS_DEEPSEEK_LAYERS` names. One layer is
+    /// the stage-by-stage comparison against the reference, and the cheapest way to try the streamed path.
+    pub fn selected(&self) -> Vec<usize> {
+        let only: Option<Vec<usize>> = std::env::var("MALLEUS_DEEPSEEK_LAYERS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+        (0..self.n_layers)
+            .filter(|i| only.as_ref().is_none_or(|l| l.contains(i)))
+            .collect()
     }
 
     /// Runs the attention of one loaded layer on an already-normed input. This is the stage gate for the
@@ -1009,43 +1038,82 @@ impl Weights {
         let mut pre_mix = identity_mix(t, hc);
         let mut shared = Shared::default();
         for (layer, l) in self.layers.iter().enumerate() {
-            // The Engram lookup is written into the streams before the block's own sub-layers.
-            if let Some(e) = &l.engram {
-                let input = engram
-                    .context("this stack carries an Engram table: it needs its hash ids and its companion file")?;
-                let hash = input
-                    .hash
-                    .get(e.position)
-                    .with_context(|| format!("engram: no hash ids for table {}", e.position))?;
-                e.forward(input.table, &mut h, hash, t, h_dim, hc, self.eps)?;
-                hook(&format!("engram{layer}"), &h)?;
-            }
-            // Attention: its mixes come from the streams, the pre-mix from the previous sub-layer.
-            let am = l.hc_attn.mixes(&h, t, h_dim, hc, d.hc_iters, d.hc_eps);
-            let x = hc_pre(&h, &pre_mix, t, hc, h_dim);
-            let mut xn = x.clone();
-            rmsnorm(&mut xn, h_dim, &l.attn_norm, self.eps);
-            let attn_out = self.attention(l, &xn, t, &mut shared, &mut hook, layer)?;
-            h = hc_post(&attn_out, &h, &am.post, &am.comb, t, hc, h_dim);
-            hook(&format!("attn{layer}"), &attn_out)?;
-
-            // FFN: its own mixes, and the pre-mix the attention just produced.
-            let fm = l.hc_ffn.mixes(&h, t, h_dim, hc, d.hc_iters, d.hc_eps);
-            let x = hc_pre(&h, &am.pre, t, hc, h_dim);
-            hook(&format!("ffn_premix{layer}"), &x)?;
-            let mut xn = x.clone();
-            rmsnorm(&mut xn, h_dim, &l.ffn_norm, self.eps);
-            let ffn_out = moe(&l.moe, &xn, t, h_dim, d, None, &mut hook, layer)?;
-            h = hc_post(&ffn_out, &h, &fm.post, &fm.comb, t, hc, h_dim);
-            hook(&format!("ffn{layer}"), &ffn_out)?;
-            pre_mix = fm.pre;
-            hook(&format!("block{layer}"), &h)?;
+            let mut residents = ResidentExperts(&l.moe.experts);
+            self.block(
+                l,
+                layer,
+                &mut h,
+                &mut pre_mix,
+                t,
+                &mut shared,
+                &mut residents,
+                engram,
+                None,
+                &mut hook,
+            )?;
         }
-        let x = hc_pre(&h, &pre_mix, t, hc, h_dim);
-        let mut x = x;
+        Ok(self.head_logits(&h, &pre_mix, t))
+    }
+
+    /// The last stage: collapse the streams, normalise, project to the vocabulary. `[t, vocab]`, one row per
+    /// position.
+    fn head_logits(&self, h: &[f32], pre_mix: &[f32], t: usize) -> Vec<f32> {
+        let (h_dim, hc) = (self.hidden, self.c.hc_mult);
+        let mut x = hc_pre(h, pre_mix, t, hc, h_dim);
         rmsnorm(&mut x, h_dim, &self.norm, self.eps);
-        let logits = linear(&x, t, h_dim, &self.head, self.vocab, None);
-        Ok(logits)
+        linear(&x, t, h_dim, &self.head, self.vocab, None)
+    }
+
+    /// One block on the streams `h`: the Engram lookup, then the attention sub-layer between its hyper-connections,
+    /// then the FFN. `experts` is where the routed experts come from — resident, or read out of the file.
+    #[allow(clippy::too_many_arguments)]
+    fn block(
+        &self,
+        l: &Layer,
+        layer: usize,
+        h: &mut Vec<f32>,
+        pre_mix: &mut Vec<f32>,
+        t: usize,
+        shared: &mut Shared,
+        experts: &mut dyn ExpertBank,
+        engram: Option<&EngramInput>,
+        image_mask: Option<&[bool]>,
+        hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let d = &self.c;
+        let (h_dim, hc) = (self.hidden, d.hc_mult);
+        // The Engram lookup is written into the streams before the block's own sub-layers.
+        if let Some(e) = &l.engram {
+            let input =
+                engram.context("this stack carries an Engram table: it needs its hash ids and its companion file")?;
+            let hash = input
+                .hash
+                .get(e.position)
+                .with_context(|| format!("engram: no hash ids for table {}", e.position))?;
+            e.forward(input.table, h, hash, t, h_dim, hc, self.eps, image_mask)?;
+            hook(&format!("engram{layer}"), h)?;
+        }
+        // Attention: its mixes come from the streams, the pre-mix from the previous sub-layer.
+        let am = l.hc_attn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
+        let x = hc_pre(h, pre_mix, t, hc, h_dim);
+        let mut xn = x.clone();
+        rmsnorm(&mut xn, h_dim, &l.attn_norm, self.eps);
+        let attn_out = self.attention(l, &xn, t, shared, hook, layer)?;
+        *h = hc_post(&attn_out, h, &am.post, &am.comb, t, hc, h_dim);
+        hook(&format!("attn{layer}"), &attn_out)?;
+
+        // FFN: its own mixes, and the pre-mix the attention just produced.
+        let fm = l.hc_ffn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
+        let x = hc_pre(h, &am.pre, t, hc, h_dim);
+        hook(&format!("ffn_premix{layer}"), &x)?;
+        let mut xn = x.clone();
+        rmsnorm(&mut xn, h_dim, &l.ffn_norm, self.eps);
+        let ffn_out = moe(&l.moe, &xn, t, h_dim, d, image_mask, experts, hook, layer)?;
+        *h = hc_post(&ffn_out, h, &fm.post, &fm.comb, t, hc, h_dim);
+        hook(&format!("ffn{layer}"), &ffn_out)?;
+        *pre_mix = fm.pre;
+        hook(&format!("block{layer}"), h)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1197,6 +1265,189 @@ impl Weights {
     }
 }
 
+/// The backbone read a block at a time: its 162.45 GB do not fit, so a block is built from the file, run on the
+/// streams and dropped. What stays resident is the embedding, the head, the final norm and one block's non-expert
+/// weights — ~6 GB — while the routed experts are read when a position selects them.
+pub struct Streamer<'a> {
+    config: Config,
+    graph: Weights,
+    src: &'a dyn TensorSource,
+    table: Option<&'a dyn TensorSource>,
+    state: Option<EngramState>,
+    /// Routed experts held at once per block, before the cache is emptied.
+    hold: usize,
+    /// Experts read from the file over the whole run.
+    pub experts_read: usize,
+}
+
+impl<'a> Streamer<'a> {
+    pub fn open(src: &'a dyn TensorSource, c: &Config) -> Result<Self> {
+        Ok(Streamer {
+            graph: Weights::open(src, c)?,
+            config: c.clone(),
+            src,
+            table: None,
+            state: None,
+            hold: 8,
+            experts_read: 0,
+        })
+    }
+
+    /// The Engram tables and the addressing they are hashed with: an Engram layer without them cannot run.
+    pub fn with_engram(mut self, table: &'a dyn TensorSource, state: EngramState) -> Self {
+        self.table = Some(table);
+        self.state = Some(state);
+        self
+    }
+
+    /// How many experts of one block to hold at once. A position uses six in a row, so a handful is enough; a large
+    /// prompt selects hundreds and pays a dequant per use instead of 54 GB of memory.
+    pub fn with_experts_held(mut self, hold: usize) -> Self {
+        self.hold = hold.max(1);
+        self
+    }
+
+    /// Bytes the run keeps on the host, minus the experts it is holding.
+    pub fn resident_bytes(&self) -> usize {
+        self.graph.bytes()
+    }
+
+    /// One prefill of `ids`: the logits of every position, `[t, vocab]`.
+    pub fn logits(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        self.logits_with(ids, |_, _| {})
+    }
+
+    /// The same, calling `on_layer(layer, seconds)` after each block: a pass over the streamed backbone takes
+    /// minutes and silence is indistinguishable from a hang.
+    pub fn logits_with(&mut self, ids: &[u32], on_layer: impl FnMut(usize, f64)) -> Result<Vec<f32>> {
+        let mut hook = |_: &str, _: &[f32]| Ok(());
+        self.run_with(ids, on_layer, &mut hook)
+    }
+
+    /// The same, calling `hook(name, values)` after the stages the reference dumps.
+    pub fn run_with(
+        &mut self,
+        ids: &[u32],
+        mut on_layer: impl FnMut(usize, f64),
+        hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        let mut h = self.embed_streams(ids)?;
+        self.stack(&mut h, ids.len(), Some(ids), &mut on_layer, hook)
+    }
+
+    /// The stack from a stream somebody else handed over — `x` is `[t, hc, hidden]` — with `ids` for the Engram
+    /// layers when the window carries one. This is what a two-block comparison against the reference needs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_from(
+        &mut self,
+        x: &[f32],
+        t: usize,
+        ids: Option<&[u32]>,
+        mut on_layer: impl FnMut(usize, f64),
+        hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        let mut h = x.to_vec();
+        ensure!(
+            h.len() == t * self.graph.c.hc_mult * self.graph.hidden,
+            "engram: {} values for {t} positions",
+            h.len()
+        );
+        self.stack(&mut h, t, ids, &mut on_layer, hook)
+    }
+
+    /// The embedding, expanded to the `hc_mult` copies the streams are carried in.
+    fn embed_streams(&self, ids: &[u32]) -> Result<Vec<f32>> {
+        let (h_dim, hc) = (self.graph.hidden, self.graph.c.hc_mult);
+        let t = ids.len();
+        ensure!(t > 0, "an empty prompt");
+        let mut h = vec![0f32; t * hc * h_dim];
+        for (i, &id) in ids.iter().enumerate() {
+            ensure!((id as usize) < self.graph.vocab, "token {id} outside the vocabulary");
+            let row = &self.graph.embed[id as usize * h_dim..(id as usize + 1) * h_dim];
+            for c in 0..hc {
+                h[(i * hc + c) * h_dim..(i * hc + c + 1) * h_dim].copy_from_slice(row);
+            }
+        }
+        Ok(h)
+    }
+
+    /// Every selected block on the streams `h`, then the last stage.
+    fn stack(
+        &mut self,
+        h: &mut Vec<f32>,
+        t: usize,
+        ids: Option<&[u32]>,
+        on_layer: &mut impl FnMut(usize, f64),
+        hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        let d = self.graph.c.clone();
+        let hc = d.hc_mult;
+        // The hash ids of the whole prompt, one list per table: they do not depend on the block that reads them.
+        let hash: Vec<Vec<u64>> = match (&self.state, &d.engram, ids) {
+            (Some(state), Some(e), Some(ids)) => (0..e.layers.len()).map(|k| state.hash_ids(ids, k)).collect(),
+            _ => Vec::new(),
+        };
+        let engram = match (self.table, hash.is_empty()) {
+            (Some(table), false) => Some(EngramInput { hash: &hash, table }),
+            _ => None,
+        };
+        let mut pre_mix = identity_mix(t, hc);
+        let mut shared = Shared::default();
+        for layer in self.graph.selected() {
+            let begin = std::time::Instant::now();
+            let l = Layer::load(self.src, &self.config, layer, false)?;
+            let read;
+            {
+                let mut experts = StreamedExperts::new(self.src, &self.config, layer, self.hold);
+                self.graph.block(
+                    &l,
+                    layer,
+                    h,
+                    &mut pre_mix,
+                    t,
+                    &mut shared,
+                    &mut experts,
+                    engram.as_ref(),
+                    None,
+                    hook,
+                )?;
+                read = experts.read;
+            }
+            self.experts_read += read;
+            on_layer(layer, begin.elapsed().as_secs_f64());
+        }
+        Ok(self.graph.head_logits(h, &pre_mix, t))
+    }
+
+    /// Greedy generation. The host graph has no KV cache yet, so every token is a full pass over the prefix: this is
+    /// the slowest sampler there is, and it is here to see the model talk, not to time decode.
+    pub fn generate(
+        &mut self,
+        ids: &[u32],
+        tokens: usize,
+        mut on_token: impl FnMut(usize, &[u32], &[f32]),
+    ) -> Result<Vec<u32>> {
+        let mut ids = ids.to_vec();
+        let vocab = self.graph.vocab;
+        let mut out = Vec::with_capacity(tokens);
+        for step in 0..tokens {
+            let logits = self.logits(&ids)?;
+            let row = &logits[(ids.len() - 1) * vocab..];
+            let mut best = 0;
+            for (i, v) in row.iter().enumerate() {
+                if *v > row[best] {
+                    best = i;
+                }
+            }
+            let next = best as u32;
+            ids.push(next);
+            out.push(next);
+            on_token(step, &out, row);
+        }
+        Ok(out)
+    }
+}
+
 fn identity_mix(t: usize, hc: usize) -> Vec<f32> {
     let mut pre = vec![0f32; t * hc];
     for i in 0..t {
@@ -1331,6 +1582,81 @@ fn indexer(
     Ok(out)
 }
 
+/// Where a block's routed experts come from: the f32 matrices the resident loader built, or the file, dequantized
+/// when a position selects an expert. Either way `with_expert` hands one expert's three matrices to the caller, so
+/// the FFN keeps one implementation and one accumulation order.
+pub trait ExpertBank {
+    fn with_expert(&mut self, e: usize, f: &mut dyn FnMut(&(Lin, Lin, Lin))) -> Result<()>;
+}
+
+/// The resident stack's experts, already in memory.
+pub struct ResidentExperts<'a>(pub &'a [(Lin, Lin, Lin)]);
+
+impl ExpertBank for ResidentExperts<'_> {
+    fn with_expert(&mut self, e: usize, f: &mut dyn FnMut(&(Lin, Lin, Lin))) -> Result<()> {
+        let w = self
+            .0
+            .get(e)
+            .with_context(|| format!("expert {e} of {}", self.0.len()))?;
+        f(w);
+        Ok(())
+    }
+}
+
+/// One block's experts straight from the file, kept for the positions that select them again and dropped with the
+/// block. 384 experts in f32 are 54 GB; six of them, 850 MB.
+pub struct StreamedExperts<'a> {
+    src: &'a dyn TensorSource,
+    layer: usize,
+    inter: usize,
+    hidden: usize,
+    /// Experts held at once. Past this, the cache is emptied: a position's own six are used in a row, so the ones it
+    /// needs are always the ones just read.
+    hold: usize,
+    cache: std::collections::HashMap<usize, Box<(Lin, Lin, Lin)>>,
+    pub read: usize,
+}
+
+impl<'a> StreamedExperts<'a> {
+    pub fn new(src: &'a dyn TensorSource, c: &Config, layer: usize, hold: usize) -> Self {
+        let d = c.deepseek.as_ref().expect("a deepseek config");
+        StreamedExperts {
+            src,
+            layer,
+            inter: d.moe_inter,
+            hidden: c.hidden,
+            hold: hold.max(1),
+            cache: std::collections::HashMap::new(),
+            read: 0,
+        }
+    }
+
+    fn load(&mut self, e: usize) -> Result<Box<(Lin, Lin, Lin)>> {
+        let p = |s: &str| format!("layers.{}.ffn.experts.{e}.{s}", self.layer);
+        let (inter, hidden) = (self.inter, self.hidden);
+        self.read += 1;
+        Ok(Box::new((
+            load_lin(self.src, &p("w1.weight"), inter, hidden)?,
+            load_lin(self.src, &p("w2.weight"), hidden, inter)?,
+            load_lin(self.src, &p("w3.weight"), inter, hidden)?,
+        )))
+    }
+}
+
+impl ExpertBank for StreamedExperts<'_> {
+    fn with_expert(&mut self, e: usize, f: &mut dyn FnMut(&(Lin, Lin, Lin))) -> Result<()> {
+        if !self.cache.contains_key(&e) {
+            if self.cache.len() >= self.hold {
+                self.cache.clear();
+            }
+            let w = self.load(e)?;
+            self.cache.insert(e, w);
+        }
+        f(&self.cache[&e]);
+        Ok(())
+    }
+}
+
 /// The FFN: `top_k` routed experts plus the shared one, both under the SwiGLU clamps.
 #[allow(clippy::too_many_arguments)]
 fn moe(
@@ -1340,10 +1666,11 @@ fn moe(
     hidden: usize,
     d: &DeepseekConfig,
     image_mask: Option<&[bool]>,
+    bank: &mut dyn ExpertBank,
     hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
     layer: usize,
 ) -> Result<Vec<f32>> {
-    let experts = m.experts.len();
+    let experts = d.experts;
     hook(&format!("ffn_in{layer}"), x)?;
     let mut scores = linear(x, t, hidden, &m.gate.w, experts, None);
     for v in scores.iter_mut() {
@@ -1378,12 +1705,16 @@ fn moe(
             *v *= d.route_scale;
         }
         let xi = &x[i * hidden..(i + 1) * hidden];
+        let limit = d.swiglu_limit;
         for (slot, &e) in top.iter().enumerate() {
-            let (w1, w2, w3) = &m.experts[e];
-            let e_out = expert(w1, w2, w3, xi, d.swiglu_limit);
-            for (o, v) in out[i * hidden..(i + 1) * hidden].iter_mut().zip(&e_out) {
-                *o += w[slot] * v;
-            }
+            let weight = w[slot];
+            let mut add = |w: &(Lin, Lin, Lin)| {
+                let e_out = expert(&w.0, &w.1, &w.2, xi, limit);
+                for (o, v) in out[i * hidden..(i + 1) * hidden].iter_mut().zip(&e_out) {
+                    *o += weight * v;
+                }
+            };
+            bank.with_expert(e, &mut add)?;
         }
         let s_out = expert(&m.shared.0, &m.shared.1, &m.shared.2, xi, d.swiglu_limit);
         for (o, v) in out[i * hidden..(i + 1) * hidden].iter_mut().zip(&s_out) {
@@ -1408,7 +1739,6 @@ fn expert(w1: &Lin, w2: &Lin, w3: &Lin, x: &[f32], limit: f32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deepseek_engram::EngramState;
     use malleus_gguf::gguf::Gguf;
     use malleus_gguf::safetensors::SafeTensors;
 
@@ -1638,6 +1968,197 @@ mod tests {
         assert!(cos_last > 0.99, "the last row diverges: {cos_last}");
     }
 
+    /// The streamed stack changes where the bytes come from, not the numbers: on the tiny reference checkpoint the
+    /// resident and the streamed paths have to agree bit for bit, layer by layer, expert by expert.
+    ///
+    ///   DEEPSEEK_REF=/golden/deepseek-ref/tiny
+    #[test]
+    #[ignore = "reads the tiny reference checkpoint"]
+    fn the_streamed_stack_matches_the_resident_one() {
+        let dir = std::env::var("DEEPSEEK_REF").expect("DEEPSEEK_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["tokens"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap();
+        let w = Weights::load(&src, &c, &|_, _| {}).unwrap();
+        let resident = w.forward(&ids).unwrap();
+        let mut s = Streamer::open(&src, &c).unwrap();
+        let streamed = s.logits(&ids).unwrap();
+        assert_eq!(resident.len(), streamed.len());
+        compare("streamed", &streamed, &resident);
+        let differing = resident.iter().zip(&streamed).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "{differing} of {} logits differ", resident.len());
+        eprintln!(
+            "{} experts read, {:.1} MB resident",
+            s.experts_read,
+            s.resident_bytes() as f64 / 1e6
+        );
+    }
+
+    /// The 4-bit rows are the checkpoint's own rows, up to the quantizer: a table read by row at run time turns a
+    /// decode that is off by a bias into noise in the streams of the two layers that carry one. The Engram forward
+    /// gate decodes both sides with this crate's reader, so it cannot see that — this compares against the source.
+    ///
+    ///   DEEPSEEK_CKPT=... DEEPSEEK_ENGRAM_TABLE=.../deepseek-v41-flash-engram.malleus
+    #[test]
+    #[ignore = "reads rows of the 100 GB table and of the checkpoint"]
+    fn the_engram_table_matches_the_checkpoint() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let table = std::env::var("DEEPSEEK_ENGRAM_TABLE").expect("DEEPSEEK_ENGRAM_TABLE");
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let g = Gguf::open(std::path::Path::new(&table)).unwrap();
+        for layer in [1usize, 14] {
+            let name = format!("layers.{layer}.engram.embed.weight");
+            let scales = format!("layers.{layer}.engram.embed.scale");
+            let info = src.info(&name).unwrap();
+            let (rows, k) = (info.shape[0], info.shape[1]);
+            // The first rows of the table and a few far inside it: the rows a prompt reads are arbitrary.
+            let ids: Vec<u64> = [0u64, 1, 7, 4096, 1 << 20, rows as u64 / 2, rows as u64 - 1].to_vec();
+            let got = crate::deepseek_engram::read_rows(&g, &name, &ids, k).unwrap();
+            let mut want = Vec::with_capacity(ids.len() * k);
+            let per_row = k.div_ceil(32);
+            let (mut q, mut sc) = (vec![0u8; k], vec![0u8; per_row]);
+            for &r in &ids {
+                src.read(&name, r as usize * k, &mut q).unwrap();
+                src.read(&scales, r as usize * per_row, &mut sc).unwrap();
+                for (c, b) in q.iter().enumerate() {
+                    want.push(f8_e4m3(*b) * e8m0(sc[c / 32]));
+                }
+            }
+            // 4 bits of absmax per row against the checkpoint's fp8: 0.9395 measured, and the release's own build keeps
+            // the table at IQ4_NL. A decode off by the bias falls to -0.59, so the floor separates the two by far.
+            let cos = compare(&name, &got, &want);
+            assert!(cos > 0.93, "{name}: the rows diverge from the checkpoint: {cos}");
+        }
+    }
+
+    /// Two real blocks end to end — the embedding, the hyper-connection handoff between them, and the Engram lookup
+    /// at layer 1 — against the release's own blocks in bf16: `scripts/deepseek_ref_stack.py --layers 0,1`.
+    ///
+    ///   MALLEUS_DEEPSEEK_LAYERS=0,1 DEEPSEEK_CKPT=... DEEPSEEK_ENGRAM=... DEEPSEEK_ENGRAM_TABLE=... \
+    ///   DEEPSEEK_REF_STACK=/golden/deepseek-ref/stack01
+    #[test]
+    #[ignore = "streams two real blocks from the checkpoint"]
+    fn the_first_blocks_match_the_reference() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let base = std::env::var("DEEPSEEK_ENGRAM").expect("DEEPSEEK_ENGRAM");
+        let table = std::env::var("DEEPSEEK_ENGRAM_TABLE").expect("DEEPSEEK_ENGRAM_TABLE");
+        let dir = std::env::var("DEEPSEEK_REF_STACK").expect("DEEPSEEK_REF_STACK");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let layers: Vec<usize> = manifest["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&ckpt)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let state = EngramState::from_json(
+            &std::fs::read_to_string(format!("{base}-state.json")).unwrap(),
+            &std::fs::read(format!("{base}-token-map.i32")).unwrap(),
+        )
+        .unwrap();
+        let tables = Gguf::open(std::path::Path::new(&table)).unwrap();
+        let mut s = Streamer::open(&src, &c)
+            .unwrap()
+            .with_engram(&tables, state)
+            .with_experts_held(64);
+        let mut worst = 1.0f64;
+        let logits = s
+            .run_with(&ids, |_, _| {}, &mut |name, values| {
+                let path = format!("{dir}/{name}.f32");
+                if std::path::Path::new(&path).exists() {
+                    worst = worst.min(compare(name, values, &f32_file(&path)));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let cos = compare("logits_all", &logits, &f32_file(&format!("{dir}/logits_all.f32")));
+        eprintln!(
+            "{layers:?}: worst block {worst:.6}, logits {cos:.6}, {} experts read",
+            s.experts_read
+        );
+        // The reference is in bf16 and this run is f32, so the two differ by the storage, not by the graph.
+        // The reference is in bf16 here and this run is in f32, so the floor separates a structural error from the
+        // storage: a wrong compressed-KV handoff or a row decode off by eight lands at 0.6, not at 0.99.
+        assert!(worst > 0.99, "a block diverges: {worst}");
+        assert!(cos > 0.99, "the logits diverge: {cos}");
+    }
+
+    /// A window of blocks starting from a fixed stream: `scripts/deepseek_ref_stack.py --layers 2,3 --random-x`.
+    /// Two blocks 2 and 3 are a compressed-KV source and the layer that reuses what it published — the handoff the
+    /// isolated gates cannot see.
+    ///
+    ///   MALLEUS_DEEPSEEK_LAYERS=2,3 DEEPSEEK_CKPT=... DEEPSEEK_REF_STACK=/golden/deepseek-ref/stack23
+    #[test]
+    #[ignore = "streams real blocks from the checkpoint"]
+    fn a_window_of_blocks_matches_the_reference() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let dir = std::env::var("DEEPSEEK_REF_STACK").expect("DEEPSEEK_REF_STACK");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let tokens = manifest["tokens"].as_u64().unwrap() as usize;
+        let ids: Vec<u32> = manifest["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&ckpt)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        // A window from a fixed stream starts at `x.f32`; one that starts at the prompt embeds its ids.
+        let x = std::path::Path::new(&format!("{dir}/x.f32"))
+            .exists()
+            .then(|| f32_file(&format!("{dir}/x.f32")));
+        // A window that carries an Engram layer needs the tables and their addressing.
+        let tables = std::env::var("DEEPSEEK_ENGRAM_TABLE")
+            .ok()
+            .map(|p| Gguf::open(std::path::Path::new(&p)).unwrap());
+        let mut s = Streamer::open(&src, &c).unwrap().with_experts_held(64);
+        if let (Some(tables), Ok(base)) = (&tables, std::env::var("DEEPSEEK_ENGRAM")) {
+            let state = EngramState::from_json(
+                &std::fs::read_to_string(format!("{base}-state.json")).unwrap(),
+                &std::fs::read(format!("{base}-token-map.i32")).unwrap(),
+            )
+            .unwrap();
+            s = s.with_engram(tables, state);
+        }
+        let mut worst = 1.0f64;
+        let mut hook = |name: &str, values: &[f32]| {
+            let path = format!("{dir}/{name}.f32");
+            if std::path::Path::new(&path).exists() {
+                worst = worst.min(compare(name, values, &f32_file(&path)));
+            }
+            Ok(())
+        };
+        let logits = match &x {
+            Some(x) => s.run_from(x, tokens, Some(&ids), |_, _| {}, &mut hook).unwrap(),
+            None => s.run_with(&ids, |_, _| {}, &mut hook).unwrap(),
+        };
+        let cos = compare("logits_all", &logits, &f32_file(&format!("{dir}/logits_all.f32")));
+        eprintln!(
+            "worst block {worst:.6}, logits {cos:.6}, {} experts read",
+            s.experts_read
+        );
+        // The reference is in bf16 here and this run is in f32, so the floor separates a structural error from the
+        // storage: a wrong compressed-KV handoff or a row decode off by eight lands at 0.6, not at 0.99.
+        assert!(worst > 0.99, "a block diverges: {worst}");
+        assert!(cos > 0.99, "the logits diverge: {cos}");
+    }
+
     /// The Engram forward against the release's own module: the rows come from our 4-bit table, `wkv` and the two
     /// gate vectors from the checkpoint, and the gate itself is the reference's `Engram` in torch. The hash ids are
     /// recomputed here from the state, so the lookup, the rows and the gate are compared together.
@@ -1684,7 +2205,7 @@ mod tests {
         compare("kv", &kv, &f32_file(&format!("{dir}/kv.f32")));
         let mut h = f32_file(&format!("{dir}/x.f32"));
         assert_eq!(h.len(), t * hc * hidden);
-        e.forward(&table, &mut h, &hash, t, hidden, hc, d.eps).unwrap();
+        e.forward(&table, &mut h, &hash, t, hidden, hc, d.eps, None).unwrap();
         let cos = compare("engram", &h, &f32_file(&format!("{dir}/out.f32")));
         assert!(cos > 0.9999, "the Engram forward diverges: {cos}");
     }

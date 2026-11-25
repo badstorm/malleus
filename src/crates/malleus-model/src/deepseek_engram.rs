@@ -14,7 +14,7 @@ use malleus_gguf::{DType, TensorSource};
 use serde_json::Value;
 
 /// Reads rows `rows[i]` of a `RowI4` table as f32: `k / 2` bytes of nibbles per row (LSB first, stored as
-/// `value + 8`) and one f16 scale per row. A table is 98.31B rows, so it is never materialised: every row is a
+/// `value + 8`, so the levels are `nibble - 8`) and one f16 scale per row. A table is 98.31B rows, so it is never materialised: every row is a
 /// read of `k / 2 + 2` bytes from the file, which is what makes it a lookup and not a matmul.
 pub fn read_rows(src: &dyn TensorSource, name: &str, rows: &[u64], k: usize) -> Result<Vec<f32>> {
     let info = src.info(name).with_context(|| format!("missing tensor {name}"))?;
@@ -36,7 +36,7 @@ pub fn read_rows(src: &dyn TensorSource, name: &str, rows: &[u64], k: usize) -> 
         src.read(name, r as usize * packed, &mut codes)?;
         src.read(&scales, r as usize * 2, &mut scale)?;
         let s = half::f16::from_le_bytes(scale).to_f32();
-        malleus_gguf::quant::dequant_int4(&codes, s, &mut out[i * k..(i + 1) * k]);
+        malleus_gguf::quant::dequant_rows_i4(&codes, s, &mut out[i * k..(i + 1) * k]);
     }
     Ok(out)
 }
