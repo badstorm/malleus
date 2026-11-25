@@ -525,6 +525,46 @@ A layer's 384 experts are 54 GB in f32, which is why the gates below load **one 
 streamed stack works (issue #120) but it reads the backbone per request, so the numbers above are the price of
 having the graph right, not a speed to compare with the other models.
 
+### The DSpark draft (issues #83, #121)
+
+The file also carries the draft: three stages of 128 experts each under `mtp.*`, 7.93 GB. Held in f32 their experts
+would be 163 GB, so a pass reads the nine it selects; the rest of a stage — attention, shared expert,
+hyper-connections, the Markov and confidence heads — stays resident, about 2.5 GB.
+
+On a chat prompt the draft's first proposal was the token the target itself then chose in **4 of 8 steps (50 %)**,
+measured with `deepseek-run --draft`: that is the acceptance a verify would start from.
+
+The verify and the rollback are wired (`--spec`): a block is appended one row at a time — the same arithmetic a
+serial step runs, which is what makes the gate bit-exact — the accepted prefix stays and the rejected rows are given
+back to the cache, so the text is the serial text by construction. It does **not** pay yet, and by construction: a
+serial verify costs five steps to accept one, so on `Hello` (0 % acceptance) four tokens took 203 s against 63 s for
+three. A verify that reads the weights once for the whole block is what turns acceptance into speed, and that is the
+kernel work of issue #83.
+
+### What it would take to serve it (issues #83, #121)
+
+The graph runs, and it is not a production candidate: 6.5-10.4 s a token of decode and 12.7-13.6 s a position of
+prefill, one request at a time. The reason is arithmetic, not tuning.
+
+A token reads **7 GB** of active weights (5.1 GB of attention at 8 bits, 1.4 GB of shared experts at 4, 0.4 of
+embedding and head) plus its 240 routed experts (2.4 GB at the file's 2.3 bpw). Everything resident would be
+**~30 GB/s of read a token** — the machine moves 231 GB/s, so ~30 tok/s, *faster than Hy4*. The wall is the other
+way round: 162.5 GB of backbone against 128 GB of GTT, and on an APU that memory is the host's.
+
+| | bytes |
+|---|---|
+| non-expert weights | 6.5 GB (5.1 of it attention at fp8; 2.6 at 4 bits) |
+| routed experts | 156 GB: 15 360 experts of 10.2 MB |
+| Engram tables | 99.8 GB — a row lookup, ~3 KB a token: they stay on NVMe by design |
+| KV at 256k, the release's design | ~0.65 GB (a 128-row ring a layer, plus 1280 values a position from the four source layers) |
+| KV at 256k, this host graph | 10.7 GB (it keeps every layer's raw KV, which the real cache does not) |
+
+So ~110 GB are available for 156 GB of experts: **70 % resident**, the rest streamed at ~2 GB/s. That is 2-3 tok/s
+of decode — the regime Ornith-1.5-122B already runs in — and a prefill that streams the whole expert set per chunk
+(~26 tok/s). Two ways out, both real work: a leaner expert format (~1.5 bpw to fit, a quality question the 2-bit
+Engram tables already warn about) or the kernels that make the resident part fast enough to matter (issue #83,
+point 5). The issue it opens tracks that; this section is the record of what was measured.
+
 ### The gates on the checkpoint's own weights
 
 One window layer, one compressed layer with its compressor and its two-level indexer, and the Engram tables,
@@ -541,6 +581,9 @@ on the bf16/fp8/fp4 checkpoint (`/mnt/usb/deepseekv41-flash` here, 510 GB, so it
 | `the_hash_matches_the_reference` | the Engram addressing of one prompt, plain and with an image span masked out, integer for integer | exact, both cases |
 | `the_image_span_matches_the_reference` | the span the LLM sees: the delimiters and the aligner rows in the release's layout | exact (no value differs) |
 | `the_image_span_is_spliced_into_the_embeddings` | the tiny graph: the span spliced by the caller and by the graph give the same logits | bit-identical |
+| `the_draft_matches_the_reference` | the draft's tokens, logits, confidence and every stage against the release's `forward_spec` | tokens exact, everything else > 0.999 |
+| `the_rollback_gives_back_the_appended_rows` | the cache's mark and rollback: the same positions appended twice give the same logits | bit-identical |
+| `the_speculative_loop_emits_the_serial_tokens` | a draft's block verified and rolled back: the text is the serial text | bit-identical |
 
 The Engram tables are the low number and it is the quantizer, not the graph: 4-bit rows against the release's
 `IQ4_NL` land at 0.9395 and 0.9591, and that is the precision the file carries (issue #121 scopes the quantizer

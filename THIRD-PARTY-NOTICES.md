@@ -54,6 +54,13 @@ the checkpoint geometry and from that documented behaviour; it is cited because 
 MIT/Apache sources consulted as references. Copyright © the SGLang authors (Apache License 2.0) and the DFlash
 authors (MIT).
 
+For DeepSeek-V4.1's own DSpark draft (`mtp.*`, three stages) the same file
+(`sglang/srt/models/deepseek_v4_dspark.py`) was consulted for two details the checkpoint does not spell out: the
+Markov head is `markov_w2 · embed_markov(previous token)` with its own rank, not a second vocabulary projection,
+and the confidence head reads the stage output concatenated with the previous token's Markov embedding. The engine
+code (`src/crates/malleus-model/src/deepseek_dspark.rs`) is written here from the model's own definitions; nothing
+is copied or translated.
+
 ### AngelSpec — Apache-2.0, vLLM — Apache-2.0
 
 Hy4-flash's DFly2 draft (`model.dfly_layers.*`) is not in `transformers`. Its forward (slot-0 fusion, the blocks on

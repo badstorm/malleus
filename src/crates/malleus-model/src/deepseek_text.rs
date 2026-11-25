@@ -23,7 +23,7 @@ pub struct Lin {
 }
 
 impl Lin {
-    fn mat(&self, x: &[f32], t: usize) -> Vec<f32> {
+    pub(crate) fn mat(&self, x: &[f32], t: usize) -> Vec<f32> {
         linear(x, t, self.k, &self.w, self.n, None)
     }
 }
@@ -232,7 +232,7 @@ fn f32_scales(raw: &[u8]) -> Result<Vec<f32>> {
 }
 
 /// Reads a vector (`[n]`) of f32 or bf16.
-pub fn load_vector(src: &dyn TensorSource, name: &str, n: usize) -> Result<Vec<f32>> {
+pub(crate) fn load_vector(src: &dyn TensorSource, name: &str, n: usize) -> Result<Vec<f32>> {
     let info = src.info(name).with_context(|| format!("missing tensor {name}"))?;
     ensure!(info.shape == [n], "{name}: shape {:?}, expected [{n}]", info.shape);
     let bytes = src.read_all(name)?;
@@ -256,9 +256,9 @@ pub fn load_vector(src: &dyn TensorSource, name: &str, n: usize) -> Result<Vec<f
 
 /// The hyper-connections of one sub-layer: one projection of the flattened streams, split into pre/post/comb.
 pub struct Hc {
-    f: Vec<f32>,
-    base: Vec<f32>,
-    scale: Vec<f32>,
+    pub(crate) f: Vec<f32>,
+    pub(crate) base: Vec<f32>,
+    pub(crate) scale: Vec<f32>,
 }
 
 struct Compressor {
@@ -301,12 +301,12 @@ struct Attn {
     indexer: Option<Indexer>,
 }
 
-struct Moe {
-    gate: Lin,
-    bias: Vec<f32>,
-    bias_vl: Option<Vec<f32>>,
-    shared: (Lin, Lin, Lin),
-    experts: Vec<(Lin, Lin, Lin)>,
+pub(crate) struct Moe {
+    pub(crate) gate: Lin,
+    pub(crate) bias: Vec<f32>,
+    pub(crate) bias_vl: Option<Vec<f32>>,
+    pub(crate) shared: (Lin, Lin, Lin),
+    pub(crate) experts: Vec<(Lin, Lin, Lin)>,
 }
 
 struct Layer {
@@ -588,6 +588,9 @@ pub struct Weights {
     head: Vec<f32>,
     norm: Vec<f32>,
     layers: Vec<Layer>,
+    /// Backbone layers whose attention input the DSpark draft reads (`dspark_target_layer_ids`), empty without a
+    /// draft. Their hidden states are what `Streamer::main_hidden` collects.
+    pub target: Vec<usize>,
 }
 
 impl Weights {
@@ -602,6 +605,17 @@ impl Weights {
         Ok(w)
     }
 
+    /// One row of the token table, which the draft embeds its own positions with.
+    pub(crate) fn embed_row(&self, id: usize) -> &[f32] {
+        &self.embed[id * self.hidden..(id + 1) * self.hidden]
+    }
+
+    /// The head on an already collapsed stream, `[t, hidden]`: the draft scores its block with it, without the
+    /// final hyper-connection step the served graph does.
+    pub(crate) fn head_rows(&self, x: &[f32], t: usize) -> Vec<f32> {
+        linear(x, t, self.hidden, &self.head, self.vocab, None)
+    }
+
     /// What stays resident whatever the stack: the embedding, the head and the final norm. The loads are 5.3 GB in
     /// f32 — two `[vocab, hidden]` matrices — and the blocks are left to the caller.
     pub fn open(src: &dyn TensorSource, c: &Config) -> Result<Self> {
@@ -610,6 +624,7 @@ impl Weights {
             d.compress_ratios.len() == c.n_layers,
             "compress_ratios must cover every layer"
         );
+        let target = d.dspark.as_ref().map(|s| s.target_layers.clone()).unwrap_or_default();
         Ok(Weights {
             hidden: c.hidden,
             vocab: c.vocab,
@@ -620,6 +635,7 @@ impl Weights {
             head: load_matrix(src, "head.weight", c.vocab, c.hidden)?,
             norm: load_vector(src, "norm.weight", c.hidden)?,
             layers: Vec::new(),
+            target,
         })
     }
 
@@ -706,7 +722,7 @@ fn layer_bytes(l: &Layer) -> usize {
         + engram
 }
 
-fn load_lin(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Result<Lin> {
+pub(crate) fn load_lin(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Result<Lin> {
     Ok(Lin {
         n,
         k,
@@ -715,7 +731,7 @@ fn load_lin(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Result<Li
 }
 
 /// `load_matrix` for a tensor whose name has no `.weight` suffix (the hyper-connection projection).
-fn load_mat(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Result<Vec<f32>> {
+pub(crate) fn load_mat(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Result<Vec<f32>> {
     load_matrix(src, name, n, k)
 }
 
@@ -726,7 +742,7 @@ fn load_mat(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Result<Ve
 /// What attention layers hand down the stack: the last source's compressed KV, index keys, candidate mask and top-k
 /// lists. Layers run in order and a source always precedes its consumers, so one slot each is enough.
 #[derive(Default)]
-struct Shared {
+pub(crate) struct Shared {
     compress_kv: Vec<f32>,
     compress_len: usize,
     index_k: Vec<f32>,
@@ -737,14 +753,14 @@ struct Shared {
 }
 
 /// The hyper-connection coefficients of one sub-layer.
-struct Mixes {
-    pre: Vec<f32>,
-    post: Vec<f32>,
-    comb: Vec<f32>,
+pub(crate) struct Mixes {
+    pub(crate) pre: Vec<f32>,
+    pub(crate) post: Vec<f32>,
+    pub(crate) comb: Vec<f32>,
 }
 
 impl Hc {
-    fn mixes(&self, h: &[f32], t: usize, hidden: usize, hc: usize, iters: usize, eps: f32) -> Mixes {
+    pub(crate) fn mixes(&self, h: &[f32], t: usize, hidden: usize, hc: usize, iters: usize, eps: f32) -> Mixes {
         let hd = hc * hidden;
         let mut flat = vec![0f32; t * hd];
         for i in 0..t {
@@ -819,7 +835,7 @@ impl Hc {
 }
 
 /// Collapse the streams: `[t, hc, hidden]` weighted by `pre [t, hc]` into `[t, hidden]`.
-fn hc_pre(h: &[f32], pre: &[f32], t: usize, hc: usize, hidden: usize) -> Vec<f32> {
+pub(crate) fn hc_pre(h: &[f32], pre: &[f32], t: usize, hc: usize, hidden: usize) -> Vec<f32> {
     let mut out = vec![0f32; t * hidden];
     for i in 0..t {
         for c in 0..hc {
@@ -836,7 +852,15 @@ fn hc_pre(h: &[f32], pre: &[f32], t: usize, hc: usize, hidden: usize) -> Vec<f32
 /// residual[c]`, which is the reference's `post.unsqueeze(-1) * x.unsqueeze(-2) + sum(comb.unsqueeze(-1) *
 /// residual.unsqueeze(-2), dim=2)`: the surviving index of that sum is comb's *second* stream, so the output
 /// stream is its column while the sum runs over its rows.
-fn hc_post(x: &[f32], res: &[f32], post: &[f32], comb: &[f32], t: usize, hc: usize, hidden: usize) -> Vec<f32> {
+pub(crate) fn hc_post(
+    x: &[f32],
+    res: &[f32],
+    post: &[f32],
+    comb: &[f32],
+    t: usize,
+    hc: usize,
+    hidden: usize,
+) -> Vec<f32> {
     let mut out = vec![0f32; t * hc * hidden];
     for i in 0..t {
         for e in 0..hc {
@@ -859,7 +883,14 @@ fn hc_post(x: &[f32], res: &[f32], post: &[f32], comb: &[f32], t: usize, hc: usi
 /// longer than `beta_fast` turns of that context are divided by `factor`, those shorter than `beta_slow` are
 /// left alone, and the band between the two fades linearly. The reference applies it to the compressed layers'
 /// base only; the window layers rotate at their own base with no extrapolation.
-fn rope_inv(rope: usize, theta: f32, original: usize, factor: f32, beta_fast: f32, beta_slow: f32) -> Vec<f32> {
+pub(crate) fn rope_inv(
+    rope: usize,
+    theta: f32,
+    original: usize,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Vec<f32> {
     let half = rope / 2;
     let mut inv: Vec<f32> = (0..half)
         .map(|j| 1.0 / theta.powf(2.0 * j as f32 / rope as f32))
@@ -880,7 +911,7 @@ fn rope_inv(rope: usize, theta: f32, original: usize, factor: f32, beta_fast: f3
 }
 
 /// RoPE in place on the last `rope` values of every row of an `[rows, row]` matrix (interleaved pairs).
-fn rope_rows(
+pub(crate) fn rope_rows(
     x: &mut [f32],
     rows: usize,
     row: usize,
@@ -910,7 +941,15 @@ fn rope_heads(x: &mut [f32], t: usize, heads: usize, head_dim: usize, rope: usiz
 }
 
 /// The same for a single row at an explicit position: a decode step runs one row whose index is not its position.
-fn rope_heads_at(x: &mut [f32], heads: usize, head_dim: usize, rope: usize, inv: &[f32], pos: f32, inverse: bool) {
+pub(crate) fn rope_heads_at(
+    x: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    rope: usize,
+    inv: &[f32],
+    pos: f32,
+    inverse: bool,
+) {
     rope_rows(x, heads, head_dim, rope, inv, |_| pos, inverse);
 }
 
@@ -929,7 +968,7 @@ fn window_idxs(t: usize, window: usize) -> (Vec<i32>, usize) {
 
 /// Sparse attention with the learned sink: `q [t, heads, hd]`, `kv [n, hd]`, `idx [t, m]`.
 #[allow(clippy::too_many_arguments)]
-fn sparse_attn(
+pub(crate) fn sparse_attn(
     q: &[f32],
     kv: &[f32],
     n_kv: usize,
@@ -1070,6 +1109,7 @@ impl Weights {
         }
         let mut pre_mix = identity_mix(t, hc);
         let mut shared = Shared::default();
+        let mut main: Vec<f32> = Vec::new();
         for (layer, l) in self.layers.iter().enumerate() {
             let mut residents = ResidentExperts(&l.moe.experts);
             self.block(
@@ -1083,6 +1123,7 @@ impl Weights {
                 engram,
                 None,
                 cache.as_mut().map(|c| &mut c.layers[layer]),
+                &mut main,
                 &mut hook,
             )?;
         }
@@ -1116,6 +1157,7 @@ impl Weights {
         engram: Option<&EngramInput>,
         image_mask: Option<&[bool]>,
         cache: Option<&mut LayerCache>,
+        main: &mut Vec<f32>,
         hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
     ) -> Result<()> {
         let d = &self.c;
@@ -1131,6 +1173,8 @@ impl Weights {
             e.forward(input.table, h, hash, t, h_dim, hc, self.eps, image_mask)?;
             hook(&format!("engram{layer}"), h)?;
         }
+        // The draft reads the streams this block starts from, averaged over the copies, before any sub-layer.
+        collect_main(self, layer, h, t, h_dim, hc, main);
         // Attention: its mixes come from the streams, the pre-mix from the previous sub-layer.
         let am = l.hc_attn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
         let x = hc_pre(h, pre_mix, t, hc, h_dim);
@@ -1146,7 +1190,9 @@ impl Weights {
         hook(&format!("ffn_premix{layer}"), &x)?;
         let mut xn = x.clone();
         rmsnorm(&mut xn, h_dim, &l.ffn_norm, self.eps);
-        let ffn_out = moe(&l.moe, &xn, t, h_dim, d, image_mask, experts, hook, layer)?;
+        let ffn_out = moe(
+            &l.moe, &xn, t, h_dim, d, d.experts, d.top_k, image_mask, experts, hook, layer,
+        )?;
         *h = hc_post(&ffn_out, h, &fm.post, &fm.comb, t, hc, h_dim);
         hook(&format!("ffn{layer}"), &ffn_out)?;
         *pre_mix = fm.pre;
@@ -1357,6 +1403,27 @@ impl Weights {
 /// thread, `Sync` because a served run counts the bytes read through a handle shared with the log.
 pub type Source = Box<dyn TensorSource + Send + Sync>;
 
+/// The index of the largest logit of a row.
+fn argmax(row: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, v) in row.iter().enumerate() {
+        if *v > row[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// What the draft did over a generation: how many passes it ran, how many tokens it proposed and how many of its
+/// first proposals the target itself then chose. That number is the acceptance rate a verify would see on the first
+/// row, before any speculative loop exists.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DraftStats {
+    pub passes: usize,
+    pub proposed: usize,
+    pub matched: usize,
+}
+
 /// An image span in the prompt: `len` positions starting at `at` whose embeddings come from the vision tower
 /// instead of the token table, and whose positions are the ones the Engram gate shuts, the Engram lookback stops at,
 /// and the router steers with its VL bias.
@@ -1394,6 +1461,12 @@ pub struct Streamer {
     hold: usize,
     /// Experts read from the file over the whole run.
     pub experts_read: usize,
+    /// The attention input of the DSpark target layers, concatenated, `[t, target_layers * hidden]`: what a draft
+    /// reads. Filled by the last prefill or step, empty when the config carries no draft.
+    pub main_hidden: Vec<f32>,
+    /// The DSpark draft, when one is attached (`with_draft`).
+    draft: Option<crate::deepseek_dspark::Dspark>,
+    draft_stats: DraftStats,
     /// The non-expert weights of every block, held resident for decode: 40 blocks of attention and shared experts
     /// are ~26 GB in f32 against 162 GB of backbone, and a step reads them once per position instead of once per
     /// prefill.
@@ -1412,6 +1485,9 @@ impl Streamer {
             state: None,
             hold: 8,
             experts_read: 0,
+            main_hidden: Vec::new(),
+            draft: None,
+            draft_stats: DraftStats::default(),
             blocks: None,
         })
     }
@@ -1453,6 +1529,7 @@ impl Streamer {
         }
         let mut pre_mix = identity_mix(1, hc);
         let mut shared = Shared::default();
+        let mut main: Vec<f32> = Vec::new();
         // A position is text unless the prefill said otherwise: the mask is what keeps the n-grams of this token
         // from reaching back into an image span.
         ensure!(
@@ -1524,10 +1601,24 @@ impl Streamer {
                 &mut bank,
                 engram.as_ref(),
                 None,
+                &mut main,
             )?;
         }
+        self.main_hidden = main;
         cache.positions += 1;
         Ok(self.graph.head_logits(&h, &pre_mix, 1))
+    }
+
+    /// The DSpark draft: when one is given, a cached generation also drafts after every committed token, so the
+    /// proposals can be scored against what the target itself chose.
+    pub fn with_draft(mut self, draft: crate::deepseek_dspark::Dspark) -> Self {
+        self.draft = Some(draft);
+        self
+    }
+
+    /// What the draft did over the last cached generation.
+    pub fn draft_stats(&self) -> DraftStats {
+        self.draft_stats
     }
 
     /// The Engram tables and the addressing they are hashed with: an Engram layer without them cannot run.
@@ -1542,6 +1633,18 @@ impl Streamer {
     pub fn with_experts_held(mut self, hold: usize) -> Self {
         self.hold = hold.max(1);
         self
+    }
+
+    /// The weights the streamer reads through, and the file it reads them from: the gates that compare a stage
+    /// against the reference open both (the DSpark draft's experts come from the same file).
+    #[cfg(test)]
+    pub(crate) fn graph(&self) -> &Weights {
+        &self.graph
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> &dyn TensorSource {
+        self.src.as_ref()
     }
 
     /// Bytes the run keeps on the host, minus the experts it is holding: the embedding, the head and the norm,
@@ -1659,6 +1762,7 @@ impl Streamer {
         };
         let mut pre_mix = identity_mix(t, hc);
         let mut shared = Shared::default();
+        let mut main: Vec<f32> = Vec::new();
         for layer in self.graph.selected() {
             let begin = std::time::Instant::now();
             let l = Layer::load(self.src.as_ref(), &self.config, layer, false)?;
@@ -1676,6 +1780,7 @@ impl Streamer {
                     engram.as_ref(),
                     mask,
                     None,
+                    &mut main,
                     hook,
                 )?;
                 read = experts.read;
@@ -1683,6 +1788,7 @@ impl Streamer {
             self.experts_read += read;
             on_layer(layer, begin.elapsed().as_secs_f64());
         }
+        self.main_hidden = main;
         Ok(self.graph.head_logits(h, &pre_mix, t))
     }
 
@@ -1741,6 +1847,7 @@ impl Streamer {
         };
         let mut pre_mix = identity_mix(t, hc);
         let mut shared = Shared::default();
+        let mut main: Vec<f32> = Vec::new();
         let hash: Vec<Vec<u64>> = match (&self.state, &d.engram) {
             (Some(state), Some(e)) => (0..e.layers.len())
                 .map(|k| state.hash_ids_masked(ids, k, &cache.text))
@@ -1788,9 +1895,11 @@ impl Streamer {
                 engram.as_ref(),
                 mask.as_deref(),
                 Some(lc),
+                &mut main,
                 &mut hook,
             )?;
         }
+        self.main_hidden = main;
         cache.positions = t;
         Ok(self.graph.head_logits(&h, &pre_mix, t))
     }
@@ -1820,6 +1929,14 @@ impl Streamer {
         let mut ids = ids.to_vec();
         let logits = self.prefill_cached_span(cache, &ids, span)?;
         let mut row = logits[(ids.len() - 1) * vocab..].to_vec();
+        self.draft_stats = DraftStats::default();
+        // The draft, if there is one, first takes the prompt's hidden into its window, then drafts from the last
+        // position of it.
+        let main = self.main_hidden.clone();
+        if let Some(d) = self.draft.as_mut() {
+            d.seed(&self.graph, &main, ids.len())?;
+        }
+        let mut pending = self.draft_from(&ids, ids.len() - 1, Some(&main))?;
         let mut out = Vec::with_capacity(tokens);
         for step in 0..tokens {
             let mut best = 0;
@@ -1829,14 +1946,123 @@ impl Streamer {
                 }
             }
             let next = best as u32;
+            if let Some(p) = &pending {
+                self.draft_stats.proposed += 1;
+                self.draft_stats.matched += usize::from(p.ids.first() == Some(&next));
+            }
             ids.push(next);
             out.push(next);
             on_token(step, &out, &row);
             if step + 1 < tokens {
                 row = self.step(cache, &ids)?;
+                pending = self.draft_from(&ids, ids.len() - 1, None)?;
             }
         }
         Ok(out)
+    }
+
+    /// Greedy speculative generation against the cache: the draft proposes a block, the block is appended and read
+    /// one row at a time (the same per-position arithmetic a serial step runs, so the gate on it is bit-exact), the
+    /// longest prefix that agrees with the target is kept and the cache gives back the rows that were rejected.
+    ///
+    /// Every emitted token is the argmax of the row the serial path would have used, so the text does not depend on
+    /// the draft: drafts propose, they never choose.
+    pub fn generate_spec(
+        &mut self,
+        cache: &mut Cache,
+        ids: &[u32],
+        tokens: usize,
+        span: Option<&Span>,
+        mut on_token: impl FnMut(usize, &[u32], &[f32]),
+    ) -> Result<Vec<u32>> {
+        let vocab = self.graph.vocab;
+        let mut ids = ids.to_vec();
+        let logits = self.prefill_cached_span(cache, &ids, span)?;
+        let mut row = logits[(ids.len() - 1) * vocab..].to_vec();
+        self.draft_stats = DraftStats::default();
+        let main = self.main_hidden.clone();
+        if let Some(d) = self.draft.as_mut() {
+            d.seed(&self.graph, &main, ids.len())?;
+        }
+        let mut pending = self.draft_from(&ids, ids.len() - 1, Some(&main))?;
+        let mut out: Vec<u32> = Vec::with_capacity(tokens);
+        while out.len() < tokens {
+            let block = match &pending {
+                Some(p) => p.ids.len().min(tokens - out.len()),
+                None => 0,
+            };
+            // The rows of the block, and the state before each of them, so the rejected ones can be given back.
+            let mut marks = Vec::with_capacity(block + 1);
+            marks.push(cache.mark());
+            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(block);
+            let mut seq = ids.clone();
+            for i in 0..block {
+                seq.push(pending.as_ref().expect("a block to verify").ids[i]);
+                rows.push(self.step(cache, &seq)?);
+                marks.push(cache.mark());
+            }
+            self.draft_stats.proposed += block;
+            // `row` predicts the first draft; row `i-1` predicts draft `i`.
+            let at = |i: usize, row: &Vec<f32>, rows: &Vec<Vec<f32>>| -> Vec<f32> {
+                if i == 0 { row.clone() } else { rows[i - 1].clone() }
+            };
+            let mut accept = 0;
+            while accept < block && argmax(&at(accept, &row, &rows)) == pending.as_ref().expect("a block").ids[accept] {
+                accept += 1;
+            }
+            // The token that closes the round: the argmax of the row after the last accepted draft.
+            let closing = at(accept, &row, &rows);
+            let closing_token = argmax(&closing);
+            for i in 0..accept {
+                let t = pending.as_ref().expect("a block").ids[i];
+                let r = at(i, &row, &rows);
+                ids.push(t);
+                out.push(t);
+                on_token(out.len() - 1, &out, &r);
+                if out.len() >= tokens {
+                    break;
+                }
+            }
+            self.draft_stats.matched += accept;
+            if out.len() < tokens {
+                ids.push(closing_token);
+                out.push(closing_token);
+                on_token(out.len() - 1, &out, &closing);
+            }
+            // The accepted rows stay; the rejected ones go back.
+            cache.rollback(marks.swap_remove(accept.min(marks.len() - 1)));
+            if out.len() >= tokens {
+                break;
+            }
+            // The closing token is committed but not in the cache yet: one step appends it, exactly as the serial
+            // path does, and its row is what predicts the next round's first draft.
+            row = self.step(cache, &ids)?;
+            pending = self.draft_from(&ids, ids.len() - 1, None)?;
+        }
+        Ok(out)
+    }
+
+    /// One draft pass from the last committed token, when a draft is attached: `main` is the hidden of that
+    /// position, `[layers * hidden]`, or `None` to take the last row of the step that just ran.
+    fn draft_from(
+        &mut self,
+        ids: &[u32],
+        pos: usize,
+        main: Option<&[f32]>,
+    ) -> Result<Option<crate::deepseek_dspark::Proposal>> {
+        let Some(draft) = self.draft.as_mut() else {
+            return Ok(None);
+        };
+        self.draft_stats.passes += 1;
+        let last = *ids.get(pos).context("the draft wants the token it drafts from")?;
+        let row = match main {
+            Some(all) => {
+                let layers = self.graph.target.len().max(1);
+                all[(pos * layers) * self.graph.hidden..].to_vec()
+            }
+            None => self.main_hidden.clone(),
+        };
+        Ok(Some(draft.propose(self.src.as_ref(), &self.graph, &row, last, pos)?))
     }
 }
 
@@ -1858,6 +2084,14 @@ struct LayerCache {
     xh: Vec<f32>,
     /// Index keys, `[g, dim]`, on the layer that owns the compressed KV.
     ik: Vec<f32>,
+}
+
+/// Where a `Cache` was before a draft's rows were appended: the lengths of every buffer, and the last `ratio`
+/// sub-layer inputs of every layer (the compressor's carry, which is replaced rather than appended).
+pub struct Mark {
+    positions: usize,
+    text: usize,
+    layers: Vec<(usize, usize, usize, usize, usize, Vec<f32>)>,
 }
 
 /// The decode cache: the per-layer KV of the sequence so far, and the routed experts each layer holds across
@@ -1940,6 +2174,35 @@ impl Cache {
         self.positions = 0;
         self.experts_read = 0;
         self.text.clear();
+    }
+
+    /// The state a draft's rows would extend, kept so it can be given back: every per-layer buffer only ever grows
+    /// while the rows are verified, so a length is enough for all of them but `xh` (which is *replaced* by the last
+    /// `ratio` rows) and the flips of `ik`.
+    pub fn mark(&self) -> Mark {
+        Mark {
+            positions: self.positions,
+            text: self.text.len(),
+            layers: self
+                .layers
+                .iter()
+                .map(|l| (l.n, l.g, l.kv.len(), l.ckv.len(), l.ik.len(), l.xh.clone()))
+                .collect(),
+        }
+    }
+
+    /// Gives the cache back the state `mark` was taken at, dropping the rows a verify appended.
+    pub fn rollback(&mut self, mark: Mark) {
+        for (l, (n, g, kv, ckv, ik, xh)) in self.layers.iter_mut().zip(mark.layers) {
+            l.n = n;
+            l.g = g;
+            l.kv.truncate(kv);
+            l.ckv.truncate(ckv);
+            l.ik.truncate(ik);
+            l.xh = xh;
+        }
+        self.positions = mark.positions;
+        self.text.truncate(mark.text);
     }
 
     /// Bytes the held experts take on the host, in f32.
@@ -2237,6 +2500,7 @@ fn block_step(
     experts: &mut dyn ExpertBank,
     engram: Option<&EngramInput>,
     image_mask: Option<&[bool]>,
+    main: &mut Vec<f32>,
 ) -> Result<()> {
     let d = &graph.c;
     let (h_dim, hc) = (graph.hidden, d.hc_mult);
@@ -2249,6 +2513,7 @@ fn block_step(
             .with_context(|| format!("engram: no hash ids for table {}", e.position))?;
         e.forward(input.table, h, hash, 1, h_dim, hc, graph.eps, image_mask)?;
     }
+    collect_main(graph, layer, h, 1, h_dim, hc, main);
     let am = l.hc_attn.mixes(h, 1, h_dim, hc, d.hc_iters, d.hc_eps);
     let x = hc_pre(h, pre_mix, 1, hc, h_dim);
     let mut xn = x.clone();
@@ -2260,7 +2525,19 @@ fn block_step(
     let x = hc_pre(h, &am.pre, 1, hc, h_dim);
     let mut xn = x.clone();
     rmsnorm(&mut xn, h_dim, &l.ffn_norm, graph.eps);
-    let ffn_out = moe(&l.moe, &xn, 1, h_dim, d, image_mask, experts, &mut |_, _| Ok(()), layer)?;
+    let ffn_out = moe(
+        &l.moe,
+        &xn,
+        1,
+        h_dim,
+        d,
+        d.experts,
+        d.top_k,
+        image_mask,
+        experts,
+        &mut |_, _| Ok(()),
+        layer,
+    )?;
     *h = hc_post(&ffn_out, h, &fm.post, &fm.comb, 1, hc, h_dim);
     *pre_mix = fm.pre;
     Ok(())
@@ -2294,7 +2571,29 @@ fn splice(h: &mut [f32], t: usize, span: Option<&Span>, h_dim: usize, hc: usize)
     Ok(Some(mask))
 }
 
-fn identity_mix(t: usize, hc: usize) -> Vec<f32> {
+/// Writes the streams a DSpark target layer hands to the draft when `layer` is one of them: the mean over the
+/// hyper-connection copies, one row per position, `[t, target_layers * hidden]` with the layers along the last axis
+/// — the order the draft's first projection reads (they are concatenated per position, not per layer).
+fn collect_main(g: &Weights, layer: usize, h: &[f32], t: usize, hidden: usize, hc: usize, main: &mut Vec<f32>) {
+    let Some(at) = g.target.iter().position(|&l| l == layer) else {
+        return;
+    };
+    let layers = g.target.len();
+    if main.len() < t * layers * hidden {
+        main.resize(t * layers * hidden, 0.0);
+    }
+    for i in 0..t {
+        for j in 0..hidden {
+            let mut sum = 0f32;
+            for c in 0..hc {
+                sum += h[(i * hc + c) * hidden + j];
+            }
+            main[(i * layers + at) * hidden + j] = sum / hc as f32;
+        }
+    }
+}
+
+pub(crate) fn identity_mix(t: usize, hc: usize) -> Vec<f32> {
     let mut pre = vec![0f32; t * hc];
     for i in 0..t {
         pre[i * hc] = 1.0;
@@ -2464,7 +2763,8 @@ impl ExpertBank for ResidentExperts<'_> {
 /// block. 384 experts in f32 are 54 GB; six of them, 850 MB.
 pub struct StreamedExperts<'a> {
     src: &'a dyn TensorSource,
-    layer: usize,
+    /// `layers.{layer}.ffn.experts.` for the backbone, `mtp.{stage}.ffn.experts.` for a draft stage.
+    pub base: String,
     inter: usize,
     hidden: usize,
     /// Experts held at once. Past this, the cache is emptied: a position's own six are used in a row, so the ones it
@@ -2479,7 +2779,7 @@ impl<'a> StreamedExperts<'a> {
         let d = c.deepseek.as_ref().expect("a deepseek config");
         StreamedExperts {
             src,
-            layer,
+            base: format!("layers.{layer}.ffn.experts."),
             inter: d.moe_inter,
             hidden: c.hidden,
             hold: hold.max(1),
@@ -2488,8 +2788,15 @@ impl<'a> StreamedExperts<'a> {
         }
     }
 
+    /// The same reader on another namespace: the draft keeps its stages under `mtp.`.
+    pub fn with_base(mut self, base: impl Into<String>) -> Self {
+        self.base = base.into();
+        self
+    }
+
     fn load(&mut self, e: usize) -> Result<Box<(Lin, Lin, Lin)>> {
-        let p = |s: &str| format!("layers.{}.ffn.experts.{e}.{s}", self.layer);
+        let base = self.base.clone();
+        let p = |s: &str| format!("{base}{e}.{s}");
         let (inter, hidden) = (self.inter, self.hidden);
         self.read += 1;
         Ok(Box::new((
@@ -2516,18 +2823,19 @@ impl ExpertBank for StreamedExperts<'_> {
 
 /// The FFN: `top_k` routed experts plus the shared one, both under the SwiGLU clamps.
 #[allow(clippy::too_many_arguments)]
-fn moe(
+pub(crate) fn moe(
     m: &Moe,
     x: &[f32],
     t: usize,
     hidden: usize,
     d: &DeepseekConfig,
+    experts: usize,
+    top_k: usize,
     image_mask: Option<&[bool]>,
     bank: &mut dyn ExpertBank,
     hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
     layer: usize,
 ) -> Result<Vec<f32>> {
-    let experts = d.experts;
     hook(&format!("ffn_in{layer}"), x)?;
     let mut scores = linear(x, t, hidden, &m.gate.w, experts, None);
     for v in scores.iter_mut() {
@@ -2550,9 +2858,9 @@ fn moe(
         };
         let mut order: Vec<usize> = (0..experts).collect();
         order.sort_by(|a, b| (scores[i * experts + *b] + bias[*b]).total_cmp(&(scores[i * experts + *a] + bias[*a])));
-        let top: Vec<usize> = order.iter().take(d.top_k).copied().collect();
+        let top: Vec<usize> = order.iter().take(top_k).copied().collect();
         let mut w: Vec<f32> = top.iter().map(|&e| scores[i * experts + e]).collect();
-        if d.norm_topk_prob && d.top_k > 1 {
+        if d.norm_topk_prob && top_k > 1 {
             let s: f32 = w.iter().sum::<f32>() + 1e-20;
             for v in w.iter_mut() {
                 *v /= s;
@@ -2581,7 +2889,7 @@ fn moe(
     Ok(out)
 }
 
-fn expert(w1: &Lin, w2: &Lin, w3: &Lin, x: &[f32], limit: f32) -> Vec<f32> {
+pub(crate) fn expert(w1: &Lin, w2: &Lin, w3: &Lin, x: &[f32], limit: f32) -> Vec<f32> {
     let gate = linear(x, 1, x.len(), &w1.w, w1.n, None);
     let up = linear(x, 1, x.len(), &w3.w, w3.n, None);
     let mut act = vec![0f32; w2.k];
@@ -2860,6 +3168,101 @@ mod tests {
             s.experts_read,
             s.resident_bytes() as f64 / 1e6
         );
+    }
+
+    /// The mark and the rollback on the cache itself: the same positions appended twice, once after a rollback,
+    /// have to give the same logits — the KV, the compressed rows, the index keys and the compressor's carry all
+    /// have to come back exactly. This is the half a speculative round relies on when it accepts only a prefix.
+    ///
+    ///   DEEPSEEK_REF=/golden/deepseek-ref/tiny
+    #[test]
+    #[ignore = "reads the reference checkpoint"]
+    fn the_rollback_gives_back_the_appended_rows() {
+        let dir = std::env::var("DEEPSEEK_REF").expect("DEEPSEEK_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["tokens"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
+        let mut s = Streamer::open(Box::new(SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap()), &c).unwrap();
+        // The plain path: the whole prompt, then four positions.
+        let mut plain = s.cache(8);
+        s.prefill_cached(&mut plain, &ids).unwrap();
+        let mut want: Vec<Vec<f32>> = Vec::new();
+        let mut seq = ids.clone();
+        for i in 0..4 {
+            seq.push(ids[i % ids.len()]);
+            want.push(s.step(&mut plain, &seq).unwrap());
+        }
+        // The same, with a mark taken after the second position and the last two given back and redone.
+        let mut marked = s.cache(8);
+        s.prefill_cached(&mut marked, &ids).unwrap();
+        let mut seq = ids.clone();
+        for i in 0..2 {
+            seq.push(ids[i % ids.len()]);
+            s.step(&mut marked, &seq).unwrap();
+        }
+        let mark = marked.mark();
+        for i in 2..4 {
+            seq.push(ids[i % ids.len()]);
+            s.step(&mut marked, &seq).unwrap();
+        }
+        marked.rollback(mark);
+        assert_eq!(marked.len(), ids.len() + 2, "the rollback kept the wrong positions");
+        seq.truncate(ids.len() + 2);
+        for i in 2..4 {
+            seq.push(ids[i % ids.len()]);
+            let got = s.step(&mut marked, &seq).unwrap();
+            let differing = got.iter().zip(&want[i]).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differing, 0,
+                "position {i}: {differing} logits differ after the rollback"
+            );
+        }
+    }
+
+    /// The speculative loop against the serial path, on the tiny checkpoint that carries a draft: the block is
+    /// appended one row at a time, the rows that disagree are given back to the cache, and the tokens must be the
+    /// serial ones — bit for bit, at temperature 0. A wrong rollback would perturb the rows that follow and show up
+    /// here as a different token.
+    ///
+    ///   DEEPSEEK_REF=/golden/deepseek-ref/tiny
+    #[test]
+    #[ignore = "reads the reference checkpoint"]
+    fn the_speculative_loop_emits_the_serial_tokens() {
+        let dir = std::env::var("DEEPSEEK_REF").expect("DEEPSEEK_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["tokens"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap();
+        let mut serial = Streamer::open(Box::new(src), &c).unwrap();
+        let draft = crate::deepseek_dspark::Dspark::load(serial.source(), &c).unwrap();
+        let cached = serial
+            .generate_cached(&mut serial.cache(8), &ids, 8, |_, _, _| {})
+            .unwrap();
+        let mut speculative = Streamer::open(Box::new(SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap()), &c)
+            .unwrap()
+            .with_draft(draft);
+        let spec = speculative
+            .generate_spec(&mut speculative.cache(8), &ids, 8, None, |_, _, _| {})
+            .unwrap();
+        let stats = speculative.draft_stats();
+        eprintln!(
+            "serial {:?}\nspec   {:?}\ndraft: {} passes, {} proposals, {} accepted",
+            cached, spec, stats.passes, stats.proposed, stats.matched
+        );
+        assert_eq!(spec, cached, "the speculative loop changed the text");
+        assert!(stats.proposed > 0, "the draft proposed nothing");
     }
 
     /// The span's rows replace the embeddings of the positions it covers, in every hyper-connection copy: the same

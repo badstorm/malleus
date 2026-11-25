@@ -3,6 +3,7 @@
 pub mod config;
 pub mod deepseek;
 pub mod deepseek_alloc;
+pub mod deepseek_dspark;
 pub mod deepseek_engram;
 pub mod deepseek_text;
 pub mod deepseek_vision;

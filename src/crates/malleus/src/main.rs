@@ -340,6 +340,14 @@ enum Cmd {
         /// tower's rows replace its embeddings.
         #[arg(long)]
         image: Option<PathBuf>,
+        /// Also run the DSpark draft after every committed token and report how many of its proposals the target
+        /// itself chose (the acceptance rate of the first row).
+        #[arg(long)]
+        draft: bool,
+        /// Speculative generation: the draft proposes a block, the block is verified and the rejected rows are
+        /// given back to the cache. Implies --draft, and the text is the serial one by construction.
+        #[arg(long)]
+        spec: bool,
     },
 }
 
@@ -711,6 +719,8 @@ fn deepseek_run(
     full_prefill: bool,
     blocks: bool,
     image: Option<&Path>,
+    draft: bool,
+    spec: bool,
 ) -> Result<()> {
     // A `.malleus` file carries its own config; a checkpoint directory is the release's own storage, which is the
     // reference this quantized file is measured against.
@@ -760,6 +770,14 @@ fn deepseek_run(
         span.is_none() || !full_prefill,
         "an image span is spliced into the cached prefill: drop --full-prefill"
     );
+    // The draft reads its own 7.93 GB out of the same file, so it is loaded before the counters wrap it.
+    let dspark = if draft {
+        let d = malleus_model::deepseek_dspark::Dspark::load(weights.as_ref(), &c)?;
+        eprintln!("the draft: a block of {} tokens", d.block());
+        Some(d)
+    } else {
+        None
+    };
     let backbone = Counting::new(weights);
     let tables = Counting::new(table);
     let (read_backbone, read_tables) = (backbone.tally(), tables.tally());
@@ -768,6 +786,9 @@ fn deepseek_run(
         .with_experts_held(experts);
     if blocks {
         s = s.with_blocks()?;
+    }
+    if let Some(d) = dspark {
+        s = s.with_draft(d);
     }
     eprintln!(
         "resident {:.2} GB, up to {experts} experts of one block held",
@@ -805,7 +826,11 @@ fn deepseek_run(
     } else {
         // The prompt in one prefill into the cache, then one position per token.
         let mut cache = s.cache(experts);
-        let out = s.generate_cached_span(&mut cache, &ids, tokens, span.as_ref(), &mut report)?;
+        let out = if spec {
+            s.generate_spec(&mut cache, &ids, tokens, span.as_ref(), &mut report)?
+        } else {
+            s.generate_cached_span(&mut cache, &ids, tokens, span.as_ref(), &mut report)?
+        };
         experts_read = cache.experts_read;
         eprintln!(
             "cache: {} positions, {:.2} GB of experts held",
@@ -815,6 +840,16 @@ fn deepseek_run(
         out
     };
     println!("{}", chat.decode(&out)?);
+    let stats = s.draft_stats();
+    if stats.passes > 0 {
+        eprintln!(
+            "draft: {} passes, {} tokens proposed, {} accepted ({:.0} %)",
+            stats.passes,
+            stats.proposed,
+            stats.matched,
+            100.0 * stats.matched as f64 / stats.proposed.max(1) as f64
+        );
+    }
     eprintln!(
         "{} experts read, {:.2} GB read, {:.0}s total",
         experts_read,
@@ -3937,6 +3972,8 @@ fn main() -> Result<()> {
             full_prefill,
             no_blocks,
             image,
+            draft,
+            spec,
         } => deepseek_run(
             &model,
             &engram,
@@ -3949,6 +3986,8 @@ fn main() -> Result<()> {
             full_prefill,
             !no_blocks,
             image.as_deref(),
+            draft || spec,
+            spec,
         )?,
         Cmd::Eval {
             model,
