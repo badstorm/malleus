@@ -175,27 +175,50 @@ impl EngramState {
     /// Hash ids of every position of `ids`: `[t, (max_ngram - 1) * heads]`, one row per position, for the
     /// Engram table `layer` (the position in `layers`, not the layer index).
     pub fn hash_ids(&self, ids: &[u32], layer: usize) -> Vec<u64> {
-        let t = ids.len();
-        let order = self.max_ngram - 1;
-        let cols = order * self.heads;
-        let pad = self.token_map[self.pad as usize] as i64;
         let compressed: Vec<i64> = ids
             .iter()
             .map(|&id| self.token_map.get(id as usize).copied().unwrap_or(-1) as i64)
             .collect();
+        self.hash_compressed(&compressed, layer)
+    }
+
+    /// The same, with a token mask: a position whose entry is false — every position of an image span — is hashed
+    /// as a dead token, so no n-gram reaches into it and none spans one. `text` is the release's `token_mask`,
+    /// which is `~image_mask`; it must cover `ids`.
+    pub fn hash_ids_masked(&self, ids: &[u32], layer: usize, text: &[bool]) -> Vec<u64> {
+        assert_eq!(text.len(), ids.len(), "engram: the mask must cover the sequence");
+        let mut compressed: Vec<i64> = ids
+            .iter()
+            .map(|&id| self.token_map.get(id as usize).copied().unwrap_or(-1) as i64)
+            .collect();
+        for (c, &keep) in compressed.iter_mut().zip(text) {
+            if !keep {
+                *c = -1;
+            }
+        }
+        self.hash_compressed(&compressed, layer)
+    }
+
+    /// The addressing itself, on the compressed ids (`-1` is a dead position: the pad fills its n-gram slots and
+    /// the lookback stops there).
+    fn hash_compressed(&self, compressed: &[i64], layer: usize) -> Vec<u64> {
+        let t = compressed.len();
+        let order = self.max_ngram - 1;
+        let cols = order * self.heads;
+        let pad = self.token_map[self.pad as usize] as i64;
         let mut out = vec![0u64; t * cols];
         for i in 0..t {
             // The n-gram is hashed one lookback at a time: after step k the running value is the (k+1)-gram's
-            // hash, and it lands in the (k+1)-th order's buckets.
+            // hash, and it lands in the (k+1)-th order's buckets. A dead position — the start of the sequence, a
+            // token without a compressed id, or a position inside an image span — blocks that n-gram and every
+            // longer one behind it, which is what the release's cumulative mask does.
             let mut rolling = 0i64;
+            let mut blocked = false;
             for shift in 0..self.max_ngram {
-                let (token, blocked) = if shift > i {
-                    (pad, true)
-                } else {
-                    let src = compressed[i - shift];
-                    (if src == -1 { pad } else { src }, src == -1)
-                };
-                let product = (if blocked { pad } else { token }) * self.multipliers[layer][shift];
+                let src = if shift > i { -1 } else { compressed[i - shift] };
+                blocked |= src == -1;
+                let token = if blocked { pad } else { src };
+                let product = token * self.multipliers[layer][shift];
                 if shift == 0 {
                     rolling = product;
                 } else {
@@ -216,8 +239,12 @@ impl EngramState {
 mod tests {
     use super::*;
 
-    /// The hash ids against `engram.py` on a real prompt: the addressing has to agree exactly, integer for integer.
-    /// `DEEPSEEK_ENGRAM=/golden/deepseek-engram DEEPSEEK_ENGRAM_HASH=/golden/deepseek-engram-hash`
+    /// The hash ids against `engram.py` on a real prompt, plain and with an image span masked out: the addressing
+    /// has to agree exactly, integer for integer, and a masked position must take no part in an n-gram and stop the
+    /// lookback that reaches into it.
+    ///
+    /// `DEEPSEEK_ENGRAM=/golden/deepseek-engram DEEPSEEK_ENGRAM_HASH=/golden/deepseek-engram-hash`; the masked dump
+    /// is the `-masked` sibling `scripts/deepseek_engram_state.py` writes.
     #[test]
     #[ignore = "reads the state the python script wrote"]
     fn the_hash_matches_the_reference() {
@@ -226,37 +253,57 @@ mod tests {
         let state = std::fs::read_to_string(format!("{base}-state.json")).unwrap();
         let map = std::fs::read(format!("{base}-token-map.i32")).unwrap();
         let e = EngramState::from_json(&state, &map).unwrap();
-        let manifest: Value = serde_json::from_str(&std::fs::read_to_string(format!("{hash}.json")).unwrap()).unwrap();
+        for (what, path) in [("plain", hash.clone()), ("masked", format!("{hash}-masked"))] {
+            let (t, layers, cols) = compare_hash_dump(&e, &path);
+            eprintln!("{what}: {t} positions x {layers} layers x {cols} buckets agree with the reference");
+        }
+    }
+
+    /// Compares one dump against `hash_ids` (or `hash_ids_masked` when the dump carries a mask) and returns its
+    /// `(positions, layers, buckets)`.
+    fn compare_hash_dump(e: &EngramState, path: &str) -> (usize, usize, usize) {
+        let manifest: Value = serde_json::from_str(&std::fs::read_to_string(format!("{path}.json")).unwrap()).unwrap();
         let ids: Vec<u32> = manifest["ids"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_u64().unwrap() as u32)
             .collect();
+        let mask: Vec<bool> = manifest["mask"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_bool().unwrap())
+            .collect();
+        // The reference dumps `[positions, layers, buckets]`.
         let shape: Vec<usize> = manifest["shape"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
-        let want: Vec<i64> = std::fs::read(format!("{hash}.i64"))
+        let want: Vec<i64> = std::fs::read(format!("{path}.i64"))
             .unwrap()
             .as_chunks::<8>()
             .0
             .iter()
             .map(|c| i64::from_le_bytes(*c))
             .collect();
-        let (t, layers, cols) = (shape[1], shape[2], shape[3]);
-        assert_eq!(t, ids.len());
+        let (t, layers, cols) = (shape[0], shape[1], shape[2]);
+        assert_eq!(t, ids.len(), "{path}: positions");
+        assert_eq!(mask.len(), t, "{path}: the mask must cover the prompt");
         assert_eq!((layers, cols), (e.layers.len(), (e.max_ngram - 1) * e.heads));
+        let plain = mask.iter().all(|&keep| keep);
         for l in 0..layers {
-            let got = e.hash_ids(&ids, l);
-            let want_l = &want[l * t * cols..(l + 1) * t * cols];
-            // `want` is [t, layer, col] with the layer dimension in the middle.
+            let got = if plain {
+                e.hash_ids(&ids, l)
+            } else {
+                e.hash_ids_masked(&ids, l, &mask)
+            };
             let mut wrong = 0;
             for i in 0..t {
                 for c in 0..cols {
-                    let w = want_l[i * cols + c] as u64;
+                    let w = want[(i * layers + l) * cols + c] as u64;
                     if got[i * cols + c] != w {
                         wrong += 1;
                         if wrong < 4 {
@@ -265,8 +312,8 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(wrong, 0, "layer {l}: {wrong} of {} ids differ", t * cols);
+            assert_eq!(wrong, 0, "{path}: layer {l} has {wrong} of {} ids wrong", t * cols);
         }
-        eprintln!("{t} positions x {layers} layers x {cols} buckets agree with the reference");
+        (t, layers, cols)
     }
 }

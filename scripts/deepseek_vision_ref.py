@@ -22,6 +22,13 @@ import torch
 from safetensors import safe_open
 
 
+def read_tensor(ckpt: Path, name: str) -> torch.Tensor:
+    """One tensor of the checkpoint, by name, from whichever shard holds it."""
+    index = json.loads((ckpt / "model.safetensors.index.json").read_text())["weight_map"]
+    with safe_open(str(ckpt / index[name]), framework="pt") as f:
+        return f.get_tensor(name)
+
+
 def load_state(ckpt: Path, prefix: str, module: torch.nn.Module) -> None:
     """Copy `prefix<param>` of the checkpoint into `module`, shard by shard, from the safetensors index."""
     index = json.loads((ckpt / "model.safetensors.index.json").read_text())["weight_map"]
@@ -107,11 +114,32 @@ def main() -> None:
     for h in handles:
         h.remove()
 
+    # The span the LLM sees: the three learned delimiters and the aligner rows in reading order, laid out as
+    # `[START] ([IMAGE] * w + [NEW_LINE]) * h [END]` — what `Transformer.merge_image_embeddings` writes into the
+    # prompt embeddings. It is what `deepseek_vision::span_embeddings` has to reproduce.
+    from image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START, image_token_types
+
+    rows = merged.reshape(n_llm_h * n_llm_w, t["hidden_size"]).float()
+    delimiter = {name: read_tensor(a.checkpoint, f"image_{name}").float() for name in ("start", "end", "newline")}
+    take = iter(range(rows.shape[0]))
+    span = []
+    for kind in image_token_types(n_llm_h, n_llm_w).reshape(-1).tolist():
+        if kind == IMAGE_START:
+            span.append(delimiter["start"])
+        elif kind == IMAGE_END:
+            span.append(delimiter["end"])
+        elif kind == IMAGE_NEW_LINE:
+            span.append(delimiter["newline"])
+        else:
+            span.append(rows[next(take)])
+    span = torch.stack(span).reshape(-1)
+
     a.out.parent.mkdir(parents=True, exist_ok=True)
     arrays = {
         "patches": patches.float().numpy().reshape(-1),
         "vit": vit_out.float().numpy().reshape(-1),
         "merged": merged.float().numpy().reshape(-1),
+        "span": span.float().numpy().reshape(-1),
     }
     for name, arr in arrays.items():
         Path(f"{a.out}-{name}.f32").write_bytes(arr.astype("<f4").tobytes())

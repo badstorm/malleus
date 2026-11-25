@@ -630,6 +630,36 @@ mod tests {
         );
     }
 
+    /// The span the LLM sees, against the release's own layout: the three learned delimiters and the aligner rows
+    /// in reading order, `[START] ([IMAGE] * w + [NEW_LINE]) * h [END]`. The rows are the reference's, so this pins
+    /// the layout and the delimiters — the tower has its own gate.
+    ///
+    ///   DEEPSEEK_CKPT=... DEEPSEEK_VISION_REF=/golden/deepseek-vision/corn
+    #[test]
+    #[ignore = "needs the 1 GB vision weights and a reference dump"]
+    fn the_image_span_matches_the_reference() {
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let reference = std::env::var("DEEPSEEK_VISION_REF").expect("DEEPSEEK_VISION_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{reference}.json")).unwrap()).unwrap();
+        let (nh, nw) = (
+            manifest["n_llm_h"].as_u64().unwrap() as usize,
+            manifest["n_llm_w"].as_u64().unwrap() as usize,
+        );
+        let c = Config::from_hf(std::path::Path::new(&ckpt)).unwrap();
+        let src = malleus_gguf::safetensors::SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        let delimiters = ImageTokens::load(&src, &c).unwrap();
+        let merged = f32_file(&format!("{reference}-merged.f32"));
+        let span = span_embeddings(&delimiters, &merged, nh, nw, c.hidden).unwrap();
+        let want = f32_file(&format!("{reference}-span.f32"));
+        assert_eq!(span.len(), want.len(), "the span's length");
+        let differing = span.iter().zip(&want).filter(|(a, b)| a != b).count();
+        let cos = compare("span", &span, &want);
+        // Both sides take the same rows and the same bf16 delimiters widened to f32: the layout is exact or wrong.
+        assert_eq!(differing, 0, "{differing} of {} values differ", span.len());
+        assert!(cos > 0.99999, "the span diverges: {cos}");
+    }
+
     /// The processor against the reference: same grid, same patches (a JPEG decoder can differ by a level or two).
     #[test]
     #[ignore = "needs the reference dump and the same image"]
