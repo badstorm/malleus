@@ -301,9 +301,8 @@ enum Cmd {
         #[arg(long)]
         dump_logits: Option<PathBuf>,
     },
-    /// Run the DeepSeek-V4.1 host graph: the backbone is read block by block from the file, the prompt is one full
-    /// prefill, and the reply is generated greedily. There is no KV cache yet, so every token is another pass over
-    /// the whole prefix — this is the run that tells whether the model talks, not a decode measurement.
+    /// Run the DeepSeek-V4.1 host graph: the prompt is one prefill into the KV cache, then one step per token. The
+    /// backbone is read block by block from the file, the Engram tables from their companion file.
     DeepseekRun {
         /// The backbone `.malleus` file (162.45 GB for the 2-bit build)
         #[arg(long)]
@@ -329,6 +328,13 @@ enum Cmd {
         /// a bare continuation is not the prompt it was trained on)
         #[arg(long)]
         raw: bool,
+        /// Re-run the whole prefix at every token instead of stepping the cache: the reference the cached path is
+        /// checked against, and the slowest sampler there is.
+        #[arg(long)]
+        full_prefill: bool,
+        /// Hold every block's non-expert weights resident instead of reading them back from the file per step.
+        #[arg(long)]
+        no_blocks: bool,
     },
 }
 
@@ -629,6 +635,8 @@ fn deepseek_run(
     experts: usize,
     top: usize,
     chat_template: bool,
+    full_prefill: bool,
+    blocks: bool,
 ) -> Result<()> {
     // A `.malleus` file carries its own config; a checkpoint directory is the release's own storage, which is the
     // reference this quantized file is measured against.
@@ -666,14 +674,17 @@ fn deepseek_run(
     let mut s = malleus_model::deepseek_text::Streamer::open(&backbone, &c)?
         .with_engram(&tables, state)
         .with_experts_held(experts);
+    if blocks {
+        s = s.with_blocks()?;
+    }
     eprintln!(
         "resident {:.2} GB, up to {experts} experts of one block held",
         s.resident_bytes() as f64 / 1e9
     );
     let t0 = Instant::now();
-    let out = s.generate(&ids, tokens, |_, out, row| {
+    let mut report = |_: usize, out: &[u32], row: &[f32]| {
         eprintln!(
-            "  token {}: {:.0}s, {:.2} GB read",
+            "  token {}: {:.1}s, {:.2} GB read",
             out.len(),
             t0.elapsed().as_secs_f64(),
             backbone.gb() + tables.gb(),
@@ -693,11 +704,28 @@ fn deepseek_run(
                 .collect();
             eprintln!("    {}", shown.join("  "));
         }
-    })?;
+    };
+    let experts_read;
+    let out = if full_prefill {
+        let out = s.generate(&ids, tokens, &mut report)?;
+        experts_read = s.experts_read;
+        out
+    } else {
+        // The prompt in one prefill into the cache, then one position per token.
+        let mut cache = s.cache(experts);
+        let out = s.generate_cached(&mut cache, &ids, tokens, &mut report)?;
+        experts_read = cache.experts_read;
+        eprintln!(
+            "cache: {} positions, {:.2} GB of experts held",
+            cache.len(),
+            cache.expert_bytes() as f64 / 1e9
+        );
+        out
+    };
     println!("{}", chat.decode(&out)?);
     eprintln!(
         "{} experts read, {:.2} GB read, {:.0}s total",
-        s.experts_read,
+        experts_read,
         backbone.gb() + tables.gb(),
         t0.elapsed().as_secs_f64()
     );
@@ -3759,7 +3787,20 @@ fn main() -> Result<()> {
             experts,
             top,
             raw,
-        } => deepseek_run(&model, &engram, &engram_state, &prompt, tokens, experts, top, !raw)?,
+            full_prefill,
+            no_blocks,
+        } => deepseek_run(
+            &model,
+            &engram,
+            &engram_state,
+            &prompt,
+            tokens,
+            experts,
+            top,
+            !raw,
+            full_prefill,
+            !no_blocks,
+        )?,
         Cmd::Eval {
             model,
             set,

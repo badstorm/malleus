@@ -641,7 +641,7 @@ impl Weights {
         let l = self.layers.get(index).context("no such layer loaded")?;
         let mut shared = Shared::default();
         let mut hook = |_: &str, _: &[f32]| Ok(());
-        self.attention(l, x, t, &mut shared, &mut hook, index)
+        self.attention(l, x, t, &mut shared, None, &mut hook, index)
     }
 
     /// Parameters held on the host, for the load report.
@@ -896,6 +896,11 @@ fn rope_heads(x: &mut [f32], t: usize, heads: usize, head_dim: usize, rope: usiz
     rope_rows(x, t * heads, head_dim, rope, inv, |i| (i / heads) as f32, inverse);
 }
 
+/// The same for a single row at an explicit position: a decode step runs one row whose index is not its position.
+fn rope_heads_at(x: &mut [f32], heads: usize, head_dim: usize, rope: usize, inv: &[f32], pos: f32, inverse: bool) {
+    rope_rows(x, heads, head_dim, rope, inv, |_| pos, inverse);
+}
+
 /// The sliding-window slots each query reads during a prefill of `t` tokens.
 fn window_idxs(t: usize, window: usize) -> (Vec<i32>, usize) {
     let m = window.min(t);
@@ -1017,7 +1022,22 @@ impl Weights {
         &self,
         ids: &[u32],
         engram: Option<&EngramInput>,
+        hook: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        self.forward_impl(ids, engram, hook, None)
+    }
+
+    /// The same prefill, filling `cache` with the KV of every layer: the positions after this one are read as steps.
+    pub fn forward_cached(&self, ids: &[u32], engram: Option<&EngramInput>, cache: &mut Cache) -> Result<Vec<f32>> {
+        self.forward_impl(ids, engram, |_, _| Ok(()), Some(cache))
+    }
+
+    fn forward_impl(
+        &self,
+        ids: &[u32],
+        engram: Option<&EngramInput>,
         mut hook: impl FnMut(&str, &[f32]) -> Result<()>,
+        mut cache: Option<&mut Cache>,
     ) -> Result<Vec<f32>> {
         let d = &self.c;
         let (h_dim, hc, t) = (self.hidden, d.hc_mult, ids.len());
@@ -1049,8 +1069,12 @@ impl Weights {
                 &mut residents,
                 engram,
                 None,
+                cache.as_mut().map(|c| &mut c.layers[layer]),
                 &mut hook,
             )?;
+        }
+        if let Some(c) = cache.as_mut() {
+            c.positions = t;
         }
         Ok(self.head_logits(&h, &pre_mix, t))
     }
@@ -1078,6 +1102,7 @@ impl Weights {
         experts: &mut dyn ExpertBank,
         engram: Option<&EngramInput>,
         image_mask: Option<&[bool]>,
+        cache: Option<&mut LayerCache>,
         hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
     ) -> Result<()> {
         let d = &self.c;
@@ -1098,7 +1123,7 @@ impl Weights {
         let x = hc_pre(h, pre_mix, t, hc, h_dim);
         let mut xn = x.clone();
         rmsnorm(&mut xn, h_dim, &l.attn_norm, self.eps);
-        let attn_out = self.attention(l, &xn, t, shared, hook, layer)?;
+        let attn_out = self.attention(l, &xn, t, shared, cache, hook, layer)?;
         *h = hc_post(&attn_out, h, &am.post, &am.comb, t, hc, h_dim);
         hook(&format!("attn{layer}"), &attn_out)?;
 
@@ -1123,6 +1148,7 @@ impl Weights {
         x: &[f32],
         t: usize,
         shared: &mut Shared,
+        cache: Option<&mut LayerCache>,
         hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
         layer: usize,
     ) -> Result<Vec<f32>> {
@@ -1229,8 +1255,56 @@ impl Weights {
                 hook(&format!("topk{layer}"), &as_f32)?;
             }
         }
+        // The cache takes the rows just computed: the token KV, and on the layer that owns the compressed KV its
+        // latent and its index keys. A consumer's compressed rows come from the source layer's cache.
+        if let Some(lc) = cache {
+            lc.kv.clear();
+            lc.kv.extend_from_slice(&kv_all[..t * hd]);
+            lc.n = t;
+            if a.compressor.is_some() {
+                lc.ckv.clear();
+                lc.ckv.extend_from_slice(&kv_all[t * hd..]);
+                lc.g = n_kv - t;
+                let keep = a.ratio.min(t);
+                lc.xh.clear();
+                lc.xh.extend_from_slice(&x[(t - keep) * self.hidden..]);
+            }
+            if a.indexer.as_ref().is_some_and(|ix| ix.owns_k) {
+                lc.ik.clear();
+                lc.ik.extend_from_slice(&shared.index_k);
+            }
+        }
         let out = sparse_attn(&q, &kv_all, n_kv, &a.sink, &idx, t, m, heads, hd);
         Ok(self.out_projection(a, out, t))
+    }
+
+    /// The grouped output projection for one row at an explicit position.
+    fn out_projection_at(&self, a: &Attn, mut o: Vec<f32>, pos: usize) -> Vec<f32> {
+        let (heads, hd, rd) = (a.heads, a.head_dim, a.rope);
+        let inv = if a.ratio > 0 {
+            rope_inv(
+                rd,
+                self.c.rope_params.compress_theta,
+                self.c.rope_params.original_seq,
+                self.c.rope_params.factor,
+                self.c.rope_params.beta_fast,
+                self.c.rope_params.beta_slow,
+            )
+        } else {
+            rope_inv(rd, self.c.rope_params.theta, 0, 1.0, 0.0, 0.0)
+        };
+        rope_heads_at(&mut o, heads, hd, rd, &inv, pos as f32, true);
+        let per_group = heads * hd / a.o_groups;
+        let mut g = vec![0f32; a.o_groups * a.o_lora];
+        for grp in 0..a.o_groups {
+            let src = &o[grp * per_group..][..per_group];
+            let w = &a.wo_a.w[grp * a.o_lora * per_group..][..a.o_lora * per_group];
+            let out = &mut g[grp * a.o_lora..][..a.o_lora];
+            for r in 0..a.o_lora {
+                out[r] = dot(src, &w[r * per_group..][..per_group], per_group);
+            }
+        }
+        a.wo_b.mat(&g, 1)
     }
 
     /// The grouped output projection: `wo_a` is block-diagonal over the head groups, then `wo_b`.
@@ -1278,6 +1352,10 @@ pub struct Streamer<'a> {
     hold: usize,
     /// Experts read from the file over the whole run.
     pub experts_read: usize,
+    /// The non-expert weights of every block, held resident for decode: 40 blocks of attention and shared experts
+    /// are ~26 GB in f32 against 162 GB of backbone, and a step reads them once per position instead of once per
+    /// prefill.
+    blocks: Option<Vec<Layer>>,
 }
 
 impl<'a> Streamer<'a> {
@@ -1290,7 +1368,114 @@ impl<'a> Streamer<'a> {
             state: None,
             hold: 8,
             experts_read: 0,
+            blocks: None,
         })
+    }
+
+    /// Holds every block's non-expert weights resident, so a decode step does not read the attention back from the
+    /// file. The routed experts stay streamed.
+    pub fn with_blocks(mut self) -> Result<Self> {
+        let mut blocks = Vec::with_capacity(self.config.n_layers);
+        for i in 0..self.config.n_layers {
+            blocks.push(Layer::load(self.src, &self.config, i, false)?);
+        }
+        self.blocks = Some(blocks);
+        Ok(self)
+    }
+
+    /// A decode cache for this model: the per-layer KV and the experts held across positions.
+    pub fn cache(&self, hold: usize) -> Cache {
+        Cache::new(&self.config, hold)
+    }
+
+    /// One position: the logits of the next token against the cache. `ids` is the whole sequence so far, because the
+    /// Engram hashes read the n-grams behind the new position.
+    pub fn step(&mut self, cache: &mut Cache, ids: &[u32]) -> Result<Vec<f32>> {
+        let t = ids.len();
+        ensure!(t > 0, "an empty sequence");
+        ensure!(
+            cache.len() + 1 == t,
+            "the cache holds {} positions, the sequence {t}",
+            cache.len()
+        );
+        let d = self.config.deepseek.clone().context("no deepseek config")?;
+        let h_dim = self.graph.hidden;
+        let hc = d.hc_mult;
+        let mut h = vec![0f32; hc * h_dim];
+        let last = *ids.last().unwrap() as usize;
+        ensure!(last < self.graph.vocab, "token {last} outside the vocabulary");
+        for c in 0..hc {
+            h[c * h_dim..(c + 1) * h_dim].copy_from_slice(&self.graph.embed[last * h_dim..(last + 1) * h_dim]);
+        }
+        let mut pre_mix = identity_mix(1, hc);
+        let mut shared = Shared::default();
+        let hash: Vec<Vec<u64>> = match (&self.table, &self.state, &d.engram) {
+            (Some(_), Some(state), Some(e)) => {
+                // The hash row is `(max_ngram - 1) * heads` wide, the geometry the state carries; the layer's
+                // `head_dim` is the table row's width, not the hash's.
+                let cols = (state.max_ngram - 1) * state.heads;
+                (0..e.layers.len())
+                    .map(|i| {
+                        let all = state.hash_ids(ids, i);
+                        all[all.len() - cols..].to_vec()
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let engram = match (&self.table, hash.is_empty()) {
+            (Some(table), false) => Some(EngramInput {
+                hash: &hash,
+                table: *table,
+            }),
+            _ => None,
+        };
+        for layer in self.graph.selected() {
+            let owned;
+            let l: &Layer = match &self.blocks {
+                Some(b) => b
+                    .get(layer)
+                    .with_context(|| format!("block {layer} outside the stack"))?,
+                None => {
+                    owned = Layer::load(self.src, &self.config, layer, false)?;
+                    &owned
+                }
+            };
+            let source = cache.source_of[layer];
+            let (lc, src_lc) = if source == usize::MAX || source == layer {
+                (&mut cache.layers[layer], None)
+            } else {
+                let (before, after) = cache.layers.split_at_mut(layer);
+                (&mut after[0], Some(&before[source]))
+            };
+            let mut bank = HeldExperts {
+                src: self.src,
+                layer,
+                inter: d.moe_inter,
+                hidden: h_dim,
+                hold: cache.hold,
+                tick: &mut cache.tick,
+                read: &mut cache.experts_read,
+                held: &mut cache.experts[layer],
+            };
+            block_step(
+                &self.graph,
+                l,
+                layer,
+                lc,
+                src_lc,
+                &mut h,
+                &mut pre_mix,
+                t - 1,
+                t,
+                &mut shared,
+                &mut bank,
+                engram.as_ref(),
+                None,
+            )?;
+        }
+        cache.positions += 1;
+        Ok(self.graph.head_logits(&h, &pre_mix, 1))
     }
 
     /// The Engram tables and the addressing they are hashed with: an Engram layer without them cannot run.
@@ -1409,6 +1594,7 @@ impl<'a> Streamer<'a> {
                     &mut experts,
                     engram.as_ref(),
                     None,
+                    None,
                     hook,
                 )?;
                 read = experts.read;
@@ -1446,6 +1632,524 @@ impl<'a> Streamer<'a> {
         }
         Ok(out)
     }
+
+    /// The prefill into the cache: one pass over the prompt, keeping the KV of every layer. The positions after it
+    /// are `step`s, so the prompt costs one pass and each token one position.
+    pub fn prefill_cached(&mut self, cache: &mut Cache, ids: &[u32]) -> Result<Vec<f32>> {
+        let d = self.graph.c.clone();
+        let (h_dim, hc, t) = (self.graph.hidden, d.hc_mult, ids.len());
+        ensure!(t > 0, "an empty prompt");
+        let mut h = vec![0f32; t * hc * h_dim];
+        for (i, &id) in ids.iter().enumerate() {
+            ensure!((id as usize) < self.graph.vocab, "token {id} outside the vocabulary");
+            let row = &self.graph.embed[id as usize * h_dim..(id as usize + 1) * h_dim];
+            for c in 0..hc {
+                h[(i * hc + c) * h_dim..(i * hc + c + 1) * h_dim].copy_from_slice(row);
+            }
+        }
+        let mut pre_mix = identity_mix(t, hc);
+        let mut shared = Shared::default();
+        let hash: Vec<Vec<u64>> = match (&self.state, &d.engram) {
+            (Some(state), Some(e)) => (0..e.layers.len()).map(|k| state.hash_ids(ids, k)).collect(),
+            _ => Vec::new(),
+        };
+        let engram = match (self.table, hash.is_empty()) {
+            (Some(table), false) => Some(EngramInput { hash: &hash, table }),
+            _ => None,
+        };
+        for layer in self.graph.selected() {
+            let owned;
+            let l: &Layer = match &self.blocks {
+                Some(b) => b
+                    .get(layer)
+                    .with_context(|| format!("block {layer} outside the stack"))?,
+                None => {
+                    owned = Layer::load(self.src, &self.config, layer, false)?;
+                    &owned
+                }
+            };
+            let lc = &mut cache.layers[layer];
+            let mut bank = HeldExperts {
+                src: self.src,
+                layer,
+                inter: d.moe_inter,
+                hidden: h_dim,
+                hold: cache.hold,
+                tick: &mut cache.tick,
+                read: &mut cache.experts_read,
+                held: &mut cache.experts[layer],
+            };
+            let mut hook = |_: &str, _: &[f32]| Ok(());
+            self.graph.block(
+                l,
+                layer,
+                &mut h,
+                &mut pre_mix,
+                t,
+                &mut shared,
+                &mut bank,
+                engram.as_ref(),
+                None,
+                Some(lc),
+                &mut hook,
+            )?;
+        }
+        cache.positions = t;
+        Ok(self.graph.head_logits(&h, &pre_mix, t))
+    }
+
+    /// Greedy generation against the cache: the prompt in one pass, then a step per token. This is what the served
+    /// path runs; the full-prefill `generate` stays as the reference it is compared against.
+    pub fn generate_cached(
+        &mut self,
+        cache: &mut Cache,
+        ids: &[u32],
+        tokens: usize,
+        mut on_token: impl FnMut(usize, &[u32], &[f32]),
+    ) -> Result<Vec<u32>> {
+        let vocab = self.graph.vocab;
+        let mut ids = ids.to_vec();
+        let logits = self.prefill_cached(cache, &ids)?;
+        let mut row = logits[(ids.len() - 1) * vocab..].to_vec();
+        let mut out = Vec::with_capacity(tokens);
+        for step in 0..tokens {
+            let mut best = 0;
+            for (i, v) in row.iter().enumerate() {
+                if *v > row[best] {
+                    best = i;
+                }
+            }
+            let next = best as u32;
+            ids.push(next);
+            out.push(next);
+            on_token(step, &out, &row);
+            if step + 1 < tokens {
+                row = self.step(cache, &ids)?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// The decode cache: one position at a time over the same graph.
+// ------------------------------------------------------------------------------------------------------------------
+
+/// What one layer keeps between two positions: the KV rows it has already written, the latent it pooled them into
+/// (only on the layer that owns the compressed KV), and the index keys that go with them.
+#[derive(Default)]
+struct LayerCache {
+    /// Token KV rows, `[n, hd]`, rotated.
+    kv: Vec<f32>,
+    n: usize,
+    /// Compressed latent rows, `[g, hd]`, rotated; empty on a layer that does not own the compressed KV.
+    ckv: Vec<f32>,
+    g: usize,
+    /// The last `ratio` normed sub-layer inputs, `[ratio, hidden]`: the compressor pools them when a group closes.
+    xh: Vec<f32>,
+    /// Index keys, `[g, dim]`, on the layer that owns the compressed KV.
+    ik: Vec<f32>,
+}
+
+/// The decode cache: the per-layer KV of the sequence so far, and the routed experts each layer holds across
+/// positions. A `Cache` is what turns the full-prefill graph into a one-position step.
+/// The routed experts one layer holds, keyed by expert id, with the tick each was last read.
+type Held = std::collections::HashMap<usize, (u64, (Lin, Lin, Lin))>;
+
+pub struct Cache {
+    layers: Vec<LayerCache>,
+    /// For every layer, the layer that owns the compressed KV it reads (itself on a source).
+    source_of: Vec<usize>,
+    /// Experts held per layer, with the tick they were last read.
+    experts: Vec<Held>,
+    /// How many experts one layer holds before the least recently read leaves.
+    hold: usize,
+    tick: u64,
+    /// Bytes of one routed expert in f32.
+    expert_bytes: usize,
+    /// Positions the cache holds, set by the prefill and advanced by every step.
+    positions: usize,
+    /// Experts read from the file over the whole run.
+    pub experts_read: usize,
+}
+
+impl Cache {
+    pub fn new(c: &Config, hold: usize) -> Self {
+        let d = c.deepseek.as_ref().expect("no deepseek config");
+        let n = c.n_layers;
+        // The source of a layer: itself when it owns the compressed KV, otherwise the last source before it. The full
+        // prefill reads whatever the last source published, so the cache does the same. A window layer (ratio 0)
+        // has no source and no index keys.
+        let mut source_of = vec![usize::MAX; n];
+        for (i, s) in source_of.iter_mut().enumerate() {
+            if d.compress_ratios.get(i).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            *s = if d.kv_source_layers.contains(&i) {
+                i
+            } else {
+                (0..i)
+                    .rev()
+                    .find(|&j| d.kv_source_layers.contains(&j))
+                    .unwrap_or(usize::MAX)
+            };
+        }
+        Cache {
+            layers: (0..n).map(|_| LayerCache::default()).collect(),
+            source_of,
+            experts: (0..n).map(|_| std::collections::HashMap::new()).collect(),
+            hold: hold.max(1),
+            tick: 0,
+            expert_bytes: expert_bytes_of(d, c.hidden),
+            positions: 0,
+            experts_read: 0,
+        }
+    }
+
+    /// Positions the cache holds.
+    pub fn len(&self) -> usize {
+        self.positions
+    }
+
+    /// Whether the cache holds no position yet.
+    pub fn is_empty(&self) -> bool {
+        self.positions == 0
+    }
+
+    /// Drops the sequence and the held experts, keeping the allocation.
+    pub fn reset(&mut self) {
+        for l in &mut self.layers {
+            *l = LayerCache::default();
+        }
+        for e in &mut self.experts {
+            e.clear();
+        }
+        self.positions = 0;
+        self.experts_read = 0;
+    }
+
+    /// Bytes the held experts take on the host, in f32.
+    pub fn expert_bytes(&self) -> usize {
+        self.experts.iter().map(|e| e.len()).sum::<usize>() * self.expert_bytes
+    }
+}
+
+/// The three f32 matrices of one routed expert: `2 * inter * hidden + hidden * inter`, four bytes each.
+fn expert_bytes_of(d: &DeepseekConfig, hidden: usize) -> usize {
+    3 * d.moe_inter * hidden * 4
+}
+
+/// The routed experts of one layer, held across positions: a hit costs no dequant, a miss reads the three matrices
+/// and dequantises them. The least recently read expert leaves when the layer is full.
+struct HeldExperts<'a> {
+    src: &'a dyn TensorSource,
+    layer: usize,
+    inter: usize,
+    hidden: usize,
+    hold: usize,
+    tick: &'a mut u64,
+    read: &'a mut usize,
+    held: &'a mut std::collections::HashMap<usize, (u64, (Lin, Lin, Lin))>,
+}
+
+impl ExpertBank for HeldExperts<'_> {
+    fn with_expert(&mut self, e: usize, f: &mut dyn FnMut(&(Lin, Lin, Lin))) -> Result<()> {
+        if !self.held.contains_key(&e) {
+            if self.held.len() >= self.hold {
+                let oldest = self.held.iter().min_by_key(|(_, (tick, _))| *tick).map(|(k, _)| *k);
+                if let Some(k) = oldest {
+                    self.held.remove(&k);
+                }
+            }
+            let p = |s: &str| format!("layers.{}.ffn.experts.{e}.{s}", self.layer);
+            let w = (
+                load_lin(self.src, &p("w1.weight"), self.inter, self.hidden)?,
+                load_lin(self.src, &p("w2.weight"), self.hidden, self.inter)?,
+                load_lin(self.src, &p("w3.weight"), self.inter, self.hidden)?,
+            );
+            *self.read += 1;
+            *self.tick += 1;
+            self.held.insert(e, (*self.tick, w));
+        }
+        let tick = *self.tick;
+        let w = self.held.get_mut(&e).expect("just inserted");
+        w.0 = tick;
+        f(&w.1);
+        Ok(())
+    }
+}
+
+/// Sparse attention over a cached KV: the token rows and the compressed rows are separate buffers, and a slot at or
+/// above `n_tok` addresses the compressed one.
+#[allow(clippy::too_many_arguments)]
+fn sparse_attn_cached(
+    q: &[f32],
+    kv: &[f32],
+    ckv: &[f32],
+    n_tok: usize,
+    sink: &[f32],
+    idx: &[i32],
+    m: usize,
+    heads: usize,
+    hd: usize,
+) -> Vec<f32> {
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut out = vec![0f32; heads * hd];
+    for h in 0..heads {
+        let qr = &q[h * hd..][..hd];
+        let mut scores = vec![f32::NEG_INFINITY; m];
+        for j in 0..m {
+            let at = idx[j];
+            if at < 0 {
+                continue;
+            }
+            let at = at as usize;
+            let row = if at < n_tok {
+                &kv[at * hd..][..hd]
+            } else {
+                &ckv[(at - n_tok) * hd..][..hd]
+            };
+            scores[j] = dot(qr, row, hd) * scale;
+        }
+        let mut max = f32::NEG_INFINITY;
+        for s in &scores {
+            max = max.max(*s);
+        }
+        if max == f32::NEG_INFINITY {
+            continue;
+        }
+        let mut sum = 0f32;
+        for s in scores.iter_mut() {
+            if *s > f32::NEG_INFINITY {
+                *s = (*s - max).exp();
+                sum += *s;
+            } else {
+                *s = 0.0;
+            }
+        }
+        sum += (sink[h] - max).exp();
+        let inv = 1.0 / sum;
+        for j in 0..m {
+            if scores[j] == 0.0 {
+                continue;
+            }
+            let at = idx[j] as usize;
+            let row = if at < n_tok {
+                &kv[at * hd..][..hd]
+            } else {
+                &ckv[(at - n_tok) * hd..][..hd]
+            };
+            let w = scores[j] * inv;
+            for d in 0..hd {
+                out[h * hd + d] += w * row[d];
+            }
+        }
+    }
+    out
+}
+
+/// One layer's attention for one position, against the cache. `t` is the total number of positions including this
+/// one; `src` is the layer that owns the compressed KV when this layer does not.
+#[allow(clippy::too_many_arguments)]
+fn attention_step(
+    graph: &Weights,
+    l: &Layer,
+    lc: &mut LayerCache,
+    src: Option<&LayerCache>,
+    x: &[f32],
+    pos: usize,
+    t: usize,
+    shared: &mut Shared,
+    layer: usize,
+) -> Result<Vec<f32>> {
+    let d = &graph.c;
+    let a = &l.attn;
+    let (heads, hd, rd) = (a.heads, a.head_dim, a.rope);
+    let inv = if a.ratio > 0 {
+        rope_inv(
+            rd,
+            d.rope_params.compress_theta,
+            d.rope_params.original_seq,
+            d.rope_params.factor,
+            d.rope_params.beta_fast,
+            d.rope_params.beta_slow,
+        )
+    } else {
+        rope_inv(rd, d.rope_params.theta, 0, 1.0, 0.0, 0.0)
+    };
+    let mut qr = a.wq_a.mat(x, 1);
+    rmsnorm(&mut qr, a.q_lora, &a.q_norm, graph.eps);
+    let mut q = a.wq_b.mat(&qr, 1);
+    rope_heads_at(&mut q, heads, hd, rd, &inv, pos as f32, false);
+    let mut kv = a.wkv.mat(x, 1);
+    rmsnorm(&mut kv, hd, &a.kv_norm, graph.eps);
+    rope_rows(&mut kv, 1, hd, rd, &inv, |_| pos as f32, false);
+    lc.kv.extend_from_slice(&kv);
+    lc.n += 1;
+
+    // The window slots: the last `window` positions, all of them in the cache by now.
+    let wm = d.window.min(t);
+    let mut idx: Vec<i32> = (t - wm..t).map(|i| i as i32).collect();
+    let mut m = wm;
+
+    // The compressed branch: a source pools its own latent, a consumer reads the source's.
+    let ratio = a.ratio;
+    if ratio > 0 {
+        let compress_len = t.checked_div(ratio).unwrap_or(0);
+        if compress_len > 0
+            && let Some(c) = &a.compressor
+        {
+            // The rolling window of normed inputs the compressor pools: the last `ratio` of them.
+            lc.xh.extend_from_slice(x);
+            if lc.xh.len() > ratio * graph.hidden {
+                lc.xh.drain(..graph.hidden);
+            }
+            if t.is_multiple_of(ratio) {
+                let (lat, groups) = compressor(c, &lc.xh, ratio, hd, graph.eps);
+                let mut rotated = lat.clone();
+                rope_rows(&mut rotated, groups, hd, rd, &inv, |_| (t - ratio) as f32, false);
+                lc.ckv.extend_from_slice(&rotated);
+                lc.g += groups;
+                if let Some(ix) = &a.indexer
+                    && ix.owns_k
+                {
+                    let dim = ix.dim;
+                    let mut k = ix.wk.as_ref().expect("a key owner holds wk").mat(&lat, groups);
+                    rmsnorm(
+                        &mut k,
+                        dim,
+                        ix.k_norm.as_ref().expect("a key owner holds its norm"),
+                        graph.eps,
+                    );
+                    rope_rows(&mut k, groups, dim, rd, &inv, |_| (t - ratio) as f32, false);
+                    lc.ik.extend_from_slice(&k);
+                }
+            }
+        }
+        let src = src.unwrap_or(&*lc);
+        let n_ix = src.g;
+        if n_ix > 0 {
+            // The prefill reaches `(row + 1) / ratio` groups, which for this row is `t / ratio`.
+            let reach = t / ratio;
+            let cidxs = match &a.indexer {
+                Some(ix) => indexer_step(ix, &src.ik, x, &qr, pos, reach, rd, &inv, d, shared, graph.eps, layer)?,
+                None => shared.topk.clone().unwrap_or_default(),
+            };
+            let cm = cidxs.len();
+            if cm > 0 {
+                idx.extend(cidxs.iter().copied());
+                m += cm;
+            }
+        }
+    }
+
+    let src = src.unwrap_or(&*lc);
+    let out = sparse_attn_cached(&q, &lc.kv, &src.ckv, t, &a.sink, &idx, m, heads, hd);
+    Ok(graph.out_projection_at(a, out, pos))
+}
+
+/// The indexer for one position: the second level of the two-level top-k, scored against the source's cached keys.
+#[allow(clippy::too_many_arguments)]
+fn indexer_step(
+    ix: &Indexer,
+    keys: &[f32],
+    x: &[f32],
+    qr: &[f32],
+    pos: usize,
+    reach: usize,
+    rd: usize,
+    inv: &[f32],
+    d: &DeepseekConfig,
+    shared: &mut Shared,
+    eps: f32,
+    layer: usize,
+) -> Result<Vec<i32>> {
+    let (heads, dim) = (ix.heads, ix.dim);
+    let n_ix = keys.len() / dim;
+    if n_ix == 0 {
+        return Ok(Vec::new());
+    }
+    let mut q = ix.wq_b.mat(qr, 1);
+    rope_heads_at(&mut q, heads, dim, rd, inv, pos as f32, false);
+    let w = ix.weights_proj.mat(x, 1);
+    let scale = (dim as f32).powf(-0.5);
+    let mut scores = vec![0f32; n_ix];
+    for h in 0..heads {
+        let qh = &q[h * dim..][..dim];
+        let wh = w[h] * scale;
+        for j in 0..n_ix {
+            scores[j] += dot(qh, &keys[j * dim..][..dim], dim).max(0.0) * wh;
+        }
+    }
+    if ix.is_candidate {
+        let cand = d.candidate.as_ref().expect("a candidate source has a geometry");
+        let keep = select_candidate_blocks(&scores, &[reach], 1, n_ix, cand.topk_blocks, cand.block_size);
+        shared.candidates = Some(keep);
+        shared.candidate_width = n_ix;
+    } else if let Some(cand) = &shared.candidates {
+        for j in 0..n_ix {
+            if !cand[j] {
+                scores[j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let _ = (eps, layer);
+    let topk = ix.topk.min(n_ix);
+    let mut order: Vec<usize> = (0..n_ix).collect();
+    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]).then(a.cmp(b)));
+    let mut picked: Vec<usize> = order.into_iter().take(topk).collect();
+    picked.sort();
+    let mut out = Vec::with_capacity(picked.len());
+    for j in picked {
+        out.push(if j < reach { (j + pos + 1) as i32 } else { -1 });
+    }
+    shared.topk = Some(out.clone());
+    Ok(out)
+}
+
+/// One block for one position: the same sub-layers in the same order as `Weights::block`, against the cache.
+#[allow(clippy::too_many_arguments)]
+fn block_step(
+    graph: &Weights,
+    l: &Layer,
+    layer: usize,
+    lc: &mut LayerCache,
+    src: Option<&LayerCache>,
+    h: &mut Vec<f32>,
+    pre_mix: &mut Vec<f32>,
+    pos: usize,
+    t: usize,
+    shared: &mut Shared,
+    experts: &mut dyn ExpertBank,
+    engram: Option<&EngramInput>,
+    image_mask: Option<&[bool]>,
+) -> Result<()> {
+    let d = &graph.c;
+    let (h_dim, hc) = (graph.hidden, d.hc_mult);
+    if let Some(e) = &l.engram {
+        let input =
+            engram.context("this stack carries an Engram table: it needs its hash ids and its companion file")?;
+        let hash = input
+            .hash
+            .get(e.position)
+            .with_context(|| format!("engram: no hash ids for table {}", e.position))?;
+        e.forward(input.table, h, hash, 1, h_dim, hc, graph.eps, image_mask)?;
+    }
+    let am = l.hc_attn.mixes(h, 1, h_dim, hc, d.hc_iters, d.hc_eps);
+    let x = hc_pre(h, pre_mix, 1, hc, h_dim);
+    let mut xn = x.clone();
+    rmsnorm(&mut xn, h_dim, &l.attn_norm, graph.eps);
+    let attn_out = attention_step(graph, l, lc, src, &xn, pos, t, shared, layer)?;
+    *h = hc_post(&attn_out, h, &am.post, &am.comb, 1, hc, h_dim);
+
+    let fm = l.hc_ffn.mixes(h, 1, h_dim, hc, d.hc_iters, d.hc_eps);
+    let x = hc_pre(h, &am.pre, 1, hc, h_dim);
+    let mut xn = x.clone();
+    rmsnorm(&mut xn, h_dim, &l.ffn_norm, graph.eps);
+    let ffn_out = moe(&l.moe, &xn, 1, h_dim, d, image_mask, experts, &mut |_, _| Ok(()), layer)?;
+    *h = hc_post(&ffn_out, h, &fm.post, &fm.comb, 1, hc, h_dim);
+    *pre_mix = fm.pre;
+    Ok(())
 }
 
 fn identity_mix(t: usize, hc: usize) -> Vec<f32> {
@@ -1999,6 +2703,49 @@ mod tests {
             s.experts_read,
             s.resident_bytes() as f64 / 1e6
         );
+    }
+
+    /// The decode path: a prefill fills the cache, then one step per position. Every step's logits must equal the
+    /// prefill's row for that position — the same graph, read one position at a time.
+    ///   DEEPSEEK_REF=/golden/deepseek-ref/tiny cargo test -p malleus-model the_cached_step -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads the reference checkpoint"]
+    fn the_cached_step_matches_the_prefill() {
+        let dir = std::env::var("DEEPSEEK_REF").expect("DEEPSEEK_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["tokens"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap();
+        let mut s = Streamer::open(&src, &c).unwrap();
+        let vocab = c.vocab;
+        let t = ids.len();
+        // The reference: the whole sequence in one prefill.
+        let mut whole = s.cache(8);
+        let prefill = s.prefill_cached(&mut whole, &ids).unwrap();
+        // The same sequence as a short prefill and then one step per position.
+        let mut cache = s.cache(8);
+        let head = s.prefill_cached(&mut cache, &ids[..2]).unwrap();
+        for pos in 0..2 {
+            let cos = compare(
+                &format!("prefill{pos}"),
+                &head[pos * vocab..(pos + 1) * vocab],
+                &prefill[pos * vocab..(pos + 1) * vocab],
+            );
+            assert!(cos > 0.9999, "prefill {pos}: cosine {cos}");
+        }
+        for pos in 2..t {
+            let row = s.step(&mut cache, &ids[..=pos]).unwrap();
+            let want = &prefill[pos * vocab..(pos + 1) * vocab];
+            let cos = compare(&format!("step{pos}"), &row, want);
+            assert!(cos > 0.9999, "step {pos}: cosine {cos}");
+        }
+        eprintln!("{} positions, {} experts read", t, cache.experts_read);
     }
 
     /// The 4-bit rows are the checkpoint's own rows, up to the quantizer: a table read by row at run time turns a
