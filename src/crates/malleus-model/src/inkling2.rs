@@ -1423,6 +1423,9 @@ pub struct Cache {
 pub struct Draft {
     k: Vec<DeviceBuffer>,
     v: Vec<DeviceBuffer>,
+    /// [`rows`, kv_heads] fp32, one scale per (row, KV head), as the target's cache.
+    ks: Vec<DeviceBuffer>,
+    vs: Vec<DeviceBuffer>,
     rows: usize,
     len: usize,
     base_pos: usize,
@@ -1506,7 +1509,8 @@ pub fn session_bytes(cfg: &Config, ctx: usize) -> u64 {
     // The draft head's context: one K/V row per committed token per draft layer, plus the block's own rows.
     if let Some(m) = i.mtp.as_ref() {
         let d = (m.kv_heads * m.head_dim) as u64;
-        t += m.layers as u64 * 2 * (ctx as u64 + DRAFT_ROWS as u64) * d * 2;
+        t += m.layers as u64 * 2 * (ctx as u64 + DRAFT_ROWS as u64) * d;
+        t += m.layers as u64 * 2 * (ctx as u64 + DRAFT_ROWS as u64) * m.kv_heads as u64 * 4;
         t += (m.heads * (ctx + DRAFT_ROWS) * 4) as u64;
     }
     t
@@ -1541,13 +1545,20 @@ impl Cache {
                 let rows = max_ctx + DRAFT_ROWS;
                 let mut k = Vec::with_capacity(m.layers);
                 let mut v = Vec::with_capacity(m.layers);
+                let mut ks = Vec::with_capacity(m.layers);
+                let mut vs = Vec::with_capacity(m.layers);
                 for _ in 0..m.layers {
-                    k.push(DeviceBuffer::alloc(rows * d * 2)?);
-                    v.push(DeviceBuffer::alloc(rows * d * 2)?);
+                    // int8 codes with one fp32 scale a head: the same cache as the target's, half the bytes.
+                    k.push(DeviceBuffer::alloc(rows * d)?);
+                    v.push(DeviceBuffer::alloc(rows * d)?);
+                    ks.push(f32s(rows * m.kv_heads)?);
+                    vs.push(f32s(rows * m.kv_heads)?);
                 }
                 Some(Draft {
                     k,
                     v,
+                    ks,
+                    vs,
                     rows,
                     len: 0,
                     base_pos: 0,
@@ -3757,7 +3768,7 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
             ],
         )?;
         raw_gemm(model, st, &vb, &mix, &l.v_ctx, rows, kvd, h)?;
-        for (dst, src) in [(&d.k[s], &kb), (&d.v[s], &vb)] {
+        for (dst, dsc, src) in [(&d.k[s], &d.ks[s], &kb), (&d.v[s], &d.vs[s], &vb)] {
             model.k.get("inkling2_kv_store").launch(
                 ((rows * kvd).div_ceil(256) as u32, 1, 1),
                 (256, 1, 1),
@@ -3765,6 +3776,7 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
                 st,
                 &[
                     dst.into(),
+                    dsc.into(),
                     src.into(),
                     (d.base_pos + d.len).into(),
                     rows.into(),
@@ -3983,7 +3995,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
         }
         // The block's own keys go into the same cache the context lives in, after it: row `r` sees every committed
         // token and the rows of the block before it.
-        for (dst, src) in [(&d.k[s], &kb), (&d.v[s], &vb)] {
+        for (dst, dsc, src) in [(&d.k[s], &d.ks[s], &kb), (&d.v[s], &d.vs[s], &vb)] {
             model.k.get("inkling2_kv_store").launch(
                 ((rows * kvd).div_ceil(256) as u32, 1, 1),
                 (256, 1, 1),
@@ -3991,6 +4003,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                 st,
                 &[
                     dst.into(),
+                    dsc.into(),
                     src.into(),
                     base.into(),
                     rows.into(),
@@ -4017,7 +4030,9 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                     Arg::U64(attn.addr() + (r * qd * 4) as u64),
                     Arg::U64(q.addr() + (r * qd * 4) as u64),
                     (&d.k[s]).into(),
+                    (&d.ks[s]).into(),
                     (&d.v[s]).into(),
+                    (&d.vs[s]).into(),
                     (&d.bias).into(),
                     Arg::Ptr(0),
                     Arg::Ptr(0),

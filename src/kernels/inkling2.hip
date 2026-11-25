@@ -698,9 +698,14 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, 
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             const int at = i + u, row = ring > 0 ? (k0 + at >= ring ? k0 + at - ring : k0 + at) : k0 + at;
-            const __half* kp = k + ((size_t)row * nkv + kh) * dim + 4 * lane;
-            const float2 ka = __half22float2(*(const __half2*)kp), kb = __half22float2(*(const __half2*)(kp + 2));
-            d[u] = qv.x * ka.x + qv.y * ka.y + qv.z * kb.x + qv.w * kb.y;
+            // int8 keys with one scale per (position, KV head): four codes a lane, the same dequantization as the
+            // single-key tail below.
+            const float ks = ksc[(size_t)row * nkv + kh];
+            const int kbits = *(const int*)(k + ((size_t)row * nkv + kh) * dim + 4 * lane);
+            d[u] = qv.x * ((float)(signed char)(kbits & 0xff) * ks) +
+                   qv.y * ((float)(signed char)((kbits >> 8) & 0xff) * ks) +
+                   qv.z * ((float)(signed char)((kbits >> 16) & 0xff) * ks) +
+                   qv.w * ((float)(signed char)((kbits >> 24) & 0xff) * ks);
         }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
@@ -712,12 +717,12 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, 
             const int at = i + u, row = ring > 0 ? (k0 + at >= ring ? k0 + at - ring : k0 + at) : k0 + at;
             const float sc = d[u] * scale + bias[(size_t)h * nk + at];
             const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
-            const __half* vp = v + ((size_t)row * nkv + kh) * dim + 4 * lane;
-            const float2 v0 = __half22float2(*(const __half2*)vp), v1 = __half22float2(*(const __half2*)(vp + 2));
-            acc.x = acc.x * corr + p * v0.x;
-            acc.y = acc.y * corr + p * v0.y;
-            acc.z = acc.z * corr + p * v1.x;
-            acc.w = acc.w * corr + p * v1.y;
+            const float vs = vsc[(size_t)row * nkv + kh];
+            const int vbits = *(const int*)(v + ((size_t)row * nkv + kh) * dim + 4 * lane);
+            acc.x = acc.x * corr + p * ((float)(signed char)(vbits & 0xff) * vs);
+            acc.y = acc.y * corr + p * ((float)(signed char)((vbits >> 8) & 0xff) * vs);
+            acc.z = acc.z * corr + p * ((float)(signed char)((vbits >> 16) & 0xff) * vs);
+            acc.w = acc.w * corr + p * ((float)(signed char)((vbits >> 24) & 0xff) * vs);
             l = l * corr + p;
             m = mn;
         }
