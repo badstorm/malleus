@@ -1403,6 +1403,17 @@ impl Weights {
 /// thread, `Sync` because a served run counts the bytes read through a handle shared with the log.
 pub type Source = Box<dyn TensorSource + Send + Sync>;
 
+/// The index of the largest logit of a row.
+fn argmax(row: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, v) in row.iter().enumerate() {
+        if *v > row[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
 /// What the draft did over a generation: how many passes it ran, how many tokens it proposed and how many of its
 /// first proposals the target itself then chose. That number is the acceptance rate a verify would see on the first
 /// row, before any speculative loop exists.
@@ -1950,6 +1961,87 @@ impl Streamer {
         Ok(out)
     }
 
+    /// Greedy speculative generation against the cache: the draft proposes a block, the block is appended and read
+    /// one row at a time (the same per-position arithmetic a serial step runs, so the gate on it is bit-exact), the
+    /// longest prefix that agrees with the target is kept and the cache gives back the rows that were rejected.
+    ///
+    /// Every emitted token is the argmax of the row the serial path would have used, so the text does not depend on
+    /// the draft: drafts propose, they never choose.
+    pub fn generate_spec(
+        &mut self,
+        cache: &mut Cache,
+        ids: &[u32],
+        tokens: usize,
+        span: Option<&Span>,
+        mut on_token: impl FnMut(usize, &[u32], &[f32]),
+    ) -> Result<Vec<u32>> {
+        let vocab = self.graph.vocab;
+        let mut ids = ids.to_vec();
+        let logits = self.prefill_cached_span(cache, &ids, span)?;
+        let mut row = logits[(ids.len() - 1) * vocab..].to_vec();
+        self.draft_stats = DraftStats::default();
+        let main = self.main_hidden.clone();
+        if let Some(d) = self.draft.as_mut() {
+            d.seed(&self.graph, &main, ids.len())?;
+        }
+        let mut pending = self.draft_from(&ids, ids.len() - 1, Some(&main))?;
+        let mut out: Vec<u32> = Vec::with_capacity(tokens);
+        while out.len() < tokens {
+            let block = match &pending {
+                Some(p) => p.ids.len().min(tokens - out.len()),
+                None => 0,
+            };
+            // The rows of the block, and the state before each of them, so the rejected ones can be given back.
+            let mut marks = Vec::with_capacity(block + 1);
+            marks.push(cache.mark());
+            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(block);
+            let mut seq = ids.clone();
+            for i in 0..block {
+                seq.push(pending.as_ref().expect("a block to verify").ids[i]);
+                rows.push(self.step(cache, &seq)?);
+                marks.push(cache.mark());
+            }
+            self.draft_stats.proposed += block;
+            // `row` predicts the first draft; row `i-1` predicts draft `i`.
+            let at = |i: usize, row: &Vec<f32>, rows: &Vec<Vec<f32>>| -> Vec<f32> {
+                if i == 0 { row.clone() } else { rows[i - 1].clone() }
+            };
+            let mut accept = 0;
+            while accept < block && argmax(&at(accept, &row, &rows)) == pending.as_ref().expect("a block").ids[accept] {
+                accept += 1;
+            }
+            // The token that closes the round: the argmax of the row after the last accepted draft.
+            let closing = at(accept, &row, &rows);
+            let closing_token = argmax(&closing);
+            for i in 0..accept {
+                let t = pending.as_ref().expect("a block").ids[i];
+                let r = at(i, &row, &rows);
+                ids.push(t);
+                out.push(t);
+                on_token(out.len() - 1, &out, &r);
+                if out.len() >= tokens {
+                    break;
+                }
+            }
+            self.draft_stats.matched += accept;
+            if out.len() < tokens {
+                ids.push(closing_token);
+                out.push(closing_token);
+                on_token(out.len() - 1, &out, &closing);
+            }
+            // The accepted rows stay; the rejected ones go back.
+            cache.rollback(marks.swap_remove(accept.min(marks.len() - 1)));
+            if out.len() >= tokens {
+                break;
+            }
+            // The closing token is committed but not in the cache yet: one step appends it, exactly as the serial
+            // path does, and its row is what predicts the next round's first draft.
+            row = self.step(cache, &ids)?;
+            pending = self.draft_from(&ids, ids.len() - 1, None)?;
+        }
+        Ok(out)
+    }
+
     /// One draft pass from the last committed token, when a draft is attached: `main` is the hidden of that
     /// position, `[layers * hidden]`, or `None` to take the last row of the step that just ran.
     fn draft_from(
@@ -1992,6 +2084,14 @@ struct LayerCache {
     xh: Vec<f32>,
     /// Index keys, `[g, dim]`, on the layer that owns the compressed KV.
     ik: Vec<f32>,
+}
+
+/// Where a `Cache` was before a draft's rows were appended: the lengths of every buffer, and the last `ratio`
+/// sub-layer inputs of every layer (the compressor's carry, which is replaced rather than appended).
+pub struct Mark {
+    positions: usize,
+    text: usize,
+    layers: Vec<(usize, usize, usize, usize, usize, Vec<f32>)>,
 }
 
 /// The decode cache: the per-layer KV of the sequence so far, and the routed experts each layer holds across
@@ -2074,6 +2174,35 @@ impl Cache {
         self.positions = 0;
         self.experts_read = 0;
         self.text.clear();
+    }
+
+    /// The state a draft's rows would extend, kept so it can be given back: every per-layer buffer only ever grows
+    /// while the rows are verified, so a length is enough for all of them but `xh` (which is *replaced* by the last
+    /// `ratio` rows) and the flips of `ik`.
+    pub fn mark(&self) -> Mark {
+        Mark {
+            positions: self.positions,
+            text: self.text.len(),
+            layers: self
+                .layers
+                .iter()
+                .map(|l| (l.n, l.g, l.kv.len(), l.ckv.len(), l.ik.len(), l.xh.clone()))
+                .collect(),
+        }
+    }
+
+    /// Gives the cache back the state `mark` was taken at, dropping the rows a verify appended.
+    pub fn rollback(&mut self, mark: Mark) {
+        for (l, (n, g, kv, ckv, ik, xh)) in self.layers.iter_mut().zip(mark.layers) {
+            l.n = n;
+            l.g = g;
+            l.kv.truncate(kv);
+            l.ckv.truncate(ckv);
+            l.ik.truncate(ik);
+            l.xh = xh;
+        }
+        self.positions = mark.positions;
+        self.text.truncate(mark.text);
     }
 
     /// Bytes the held experts take on the host, in f32.
@@ -3039,6 +3168,101 @@ mod tests {
             s.experts_read,
             s.resident_bytes() as f64 / 1e6
         );
+    }
+
+    /// The mark and the rollback on the cache itself: the same positions appended twice, once after a rollback,
+    /// have to give the same logits — the KV, the compressed rows, the index keys and the compressor's carry all
+    /// have to come back exactly. This is the half a speculative round relies on when it accepts only a prefix.
+    ///
+    ///   DEEPSEEK_REF=/golden/deepseek-ref/tiny
+    #[test]
+    #[ignore = "reads the reference checkpoint"]
+    fn the_rollback_gives_back_the_appended_rows() {
+        let dir = std::env::var("DEEPSEEK_REF").expect("DEEPSEEK_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["tokens"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
+        let mut s = Streamer::open(Box::new(SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap()), &c).unwrap();
+        // The plain path: the whole prompt, then four positions.
+        let mut plain = s.cache(8);
+        s.prefill_cached(&mut plain, &ids).unwrap();
+        let mut want: Vec<Vec<f32>> = Vec::new();
+        let mut seq = ids.clone();
+        for i in 0..4 {
+            seq.push(ids[i % ids.len()]);
+            want.push(s.step(&mut plain, &seq).unwrap());
+        }
+        // The same, with a mark taken after the second position and the last two given back and redone.
+        let mut marked = s.cache(8);
+        s.prefill_cached(&mut marked, &ids).unwrap();
+        let mut seq = ids.clone();
+        for i in 0..2 {
+            seq.push(ids[i % ids.len()]);
+            s.step(&mut marked, &seq).unwrap();
+        }
+        let mark = marked.mark();
+        for i in 2..4 {
+            seq.push(ids[i % ids.len()]);
+            s.step(&mut marked, &seq).unwrap();
+        }
+        marked.rollback(mark);
+        assert_eq!(marked.len(), ids.len() + 2, "the rollback kept the wrong positions");
+        seq.truncate(ids.len() + 2);
+        for i in 2..4 {
+            seq.push(ids[i % ids.len()]);
+            let got = s.step(&mut marked, &seq).unwrap();
+            let differing = got.iter().zip(&want[i]).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differing, 0,
+                "position {i}: {differing} logits differ after the rollback"
+            );
+        }
+    }
+
+    /// The speculative loop against the serial path, on the tiny checkpoint that carries a draft: the block is
+    /// appended one row at a time, the rows that disagree are given back to the cache, and the tokens must be the
+    /// serial ones — bit for bit, at temperature 0. A wrong rollback would perturb the rows that follow and show up
+    /// here as a different token.
+    ///
+    ///   DEEPSEEK_REF=/golden/deepseek-ref/tiny
+    #[test]
+    #[ignore = "reads the reference checkpoint"]
+    fn the_speculative_loop_emits_the_serial_tokens() {
+        let dir = std::env::var("DEEPSEEK_REF").expect("DEEPSEEK_REF");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = manifest["tokens"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let c = Config::from_hf(std::path::Path::new(&dir)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap();
+        let mut serial = Streamer::open(Box::new(src), &c).unwrap();
+        let draft = crate::deepseek_dspark::Dspark::load(serial.source(), &c).unwrap();
+        let cached = serial
+            .generate_cached(&mut serial.cache(8), &ids, 8, |_, _, _| {})
+            .unwrap();
+        let mut speculative = Streamer::open(Box::new(SafeTensors::open_dir(std::path::Path::new(&dir)).unwrap()), &c)
+            .unwrap()
+            .with_draft(draft);
+        let spec = speculative
+            .generate_spec(&mut speculative.cache(8), &ids, 8, None, |_, _, _| {})
+            .unwrap();
+        let stats = speculative.draft_stats();
+        eprintln!(
+            "serial {:?}\nspec   {:?}\ndraft: {} passes, {} proposals, {} accepted",
+            cached, spec, stats.passes, stats.proposed, stats.matched
+        );
+        assert_eq!(spec, cached, "the speculative loop changed the text");
+        assert!(stats.proposed > 0, "the draft proposed nothing");
     }
 
     /// The span's rows replace the embeddings of the positions it covers, in every hyper-connection copy: the same

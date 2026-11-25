@@ -344,6 +344,10 @@ enum Cmd {
         /// itself chose (the acceptance rate of the first row).
         #[arg(long)]
         draft: bool,
+        /// Speculative generation: the draft proposes a block, the block is verified and the rejected rows are
+        /// given back to the cache. Implies --draft, and the text is the serial one by construction.
+        #[arg(long)]
+        spec: bool,
     },
 }
 
@@ -716,6 +720,7 @@ fn deepseek_run(
     blocks: bool,
     image: Option<&Path>,
     draft: bool,
+    spec: bool,
 ) -> Result<()> {
     // A `.malleus` file carries its own config; a checkpoint directory is the release's own storage, which is the
     // reference this quantized file is measured against.
@@ -821,7 +826,11 @@ fn deepseek_run(
     } else {
         // The prompt in one prefill into the cache, then one position per token.
         let mut cache = s.cache(experts);
-        let out = s.generate_cached_span(&mut cache, &ids, tokens, span.as_ref(), &mut report)?;
+        let out = if spec {
+            s.generate_spec(&mut cache, &ids, tokens, span.as_ref(), &mut report)?
+        } else {
+            s.generate_cached_span(&mut cache, &ids, tokens, span.as_ref(), &mut report)?
+        };
         experts_read = cache.experts_read;
         eprintln!(
             "cache: {} positions, {:.2} GB of experts held",
@@ -834,7 +843,7 @@ fn deepseek_run(
     let stats = s.draft_stats();
     if stats.passes > 0 {
         eprintln!(
-            "draft: {} passes, {} proposals, {} of them the target's own choice ({:.0} %)",
+            "draft: {} passes, {} tokens proposed, {} accepted ({:.0} %)",
             stats.passes,
             stats.proposed,
             stats.matched,
@@ -3964,6 +3973,7 @@ fn main() -> Result<()> {
             no_blocks,
             image,
             draft,
+            spec,
         } => deepseek_run(
             &model,
             &engram,
@@ -3976,7 +3986,8 @@ fn main() -> Result<()> {
             full_prefill,
             !no_blocks,
             image.as_deref(),
-            draft,
+            draft || spec,
+            spec,
         )?,
         Cmd::Eval {
             model,

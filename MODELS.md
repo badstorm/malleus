@@ -525,6 +525,22 @@ A layer's 384 experts are 54 GB in f32, which is why the gates below load **one 
 streamed stack works (issue #120) but it reads the backbone per request, so the numbers above are the price of
 having the graph right, not a speed to compare with the other models.
 
+### The DSpark draft (issues #83, #121)
+
+The file also carries the draft: three stages of 128 experts each under `mtp.*`, 7.93 GB. Held in f32 their experts
+would be 163 GB, so a pass reads the nine it selects; the rest of a stage — attention, shared expert,
+hyper-connections, the Markov and confidence heads — stays resident, about 2.5 GB.
+
+On a chat prompt the draft's first proposal was the token the target itself then chose in **4 of 8 steps (50 %)**,
+measured with `deepseek-run --draft`: that is the acceptance a verify would start from.
+
+The verify and the rollback are wired (`--spec`): a block is appended one row at a time — the same arithmetic a
+serial step runs, which is what makes the gate bit-exact — the accepted prefix stays and the rejected rows are given
+back to the cache, so the text is the serial text by construction. It does **not** pay yet, and by construction: a
+serial verify costs five steps to accept one, so on `Hello` (0 % acceptance) four tokens took 203 s against 63 s for
+three. A verify that reads the weights once for the whole block is what turns acceptance into speed, and that is the
+kernel work of issue #83.
+
 ### The gates on the checkpoint's own weights
 
 One window layer, one compressed layer with its compressor and its two-level indexer, and the Engram tables,
@@ -541,6 +557,9 @@ on the bf16/fp8/fp4 checkpoint (`/mnt/usb/deepseekv41-flash` here, 510 GB, so it
 | `the_hash_matches_the_reference` | the Engram addressing of one prompt, plain and with an image span masked out, integer for integer | exact, both cases |
 | `the_image_span_matches_the_reference` | the span the LLM sees: the delimiters and the aligner rows in the release's layout | exact (no value differs) |
 | `the_image_span_is_spliced_into_the_embeddings` | the tiny graph: the span spliced by the caller and by the graph give the same logits | bit-identical |
+| `the_draft_matches_the_reference` | the draft's tokens, logits, confidence and every stage against the release's `forward_spec` | tokens exact, everything else > 0.999 |
+| `the_rollback_gives_back_the_appended_rows` | the cache's mark and rollback: the same positions appended twice give the same logits | bit-identical |
+| `the_speculative_loop_emits_the_serial_tokens` | a draft's block verified and rolled back: the text is the serial text | bit-identical |
 
 The Engram tables are the low number and it is the quantizer, not the graph: 4-bit rows against the release's
 `IQ4_NL` land at 0.9395 and 0.9591, and that is the precision the file carries (issue #121 scopes the quantizer
