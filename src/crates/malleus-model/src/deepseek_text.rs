@@ -2661,6 +2661,8 @@ mod tests {
     }
 
     /// The text graph against `scripts/deepseek_ref.py`: every stage the reference dumps, on the same weights.
+    /// The reference runs on the values it exports (the file the engine reads is bf16), so what is left between
+    /// the two is the order of their f32 arithmetic.
     #[test]
     #[ignore = "needs the tiny reference dump"]
     fn the_text_graph_matches_the_reference() {
@@ -2699,10 +2701,12 @@ mod tests {
         // The reference's single `topk` dump is the last index source's list.
         compare("topk", &last_topk, &f32_file(&format!("{dir}/topk.f32")));
 
-        // Every smooth stage has to agree, and the whole logits matrix. The selection lists are exact where the
-        // indexer's scores are not within f32 noise (layers 2 and 4); at the other index sources one slot can flip
-        // on a near-tie, and because the filler positions are real keys the layer's output moves a little with it.
-        // That is the order of the dot products, not the graph: the gates below say so.
+        // Every smooth stage has to agree to f32, and so does the whole logits matrix up to one selection: the two
+        // index sources (layers 2 and 4) publish the same lists, while the layers that read their keys (3 and 5)
+        // can flip one slot where two candidates score within the noise of the two dot-product orders. The flipped
+        // slot is a real key, so that layer's output moves by ~1e-3 and the logits land at 0.9994, which is what
+        // the floor below separates from a structural error (a wrong reach, a wrong offset or key land at 0.6).
+        // The checkpoint's own weights are pinned by the gates on the real file.
         let smooth = worst.iter().filter(|(n, _)| !n.starts_with("topk"));
         let worst_cos = smooth.clone().map(|(_, c)| *c).fold(1.0f64, f64::min);
         assert!(

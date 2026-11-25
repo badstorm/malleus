@@ -535,8 +535,8 @@ impl Model {
         let gb = text.resident_bytes() as f64 / 1e9;
         let cache = text.cache(hold);
         eprintln!(
-            "deepseek_v41: host graph, {gb:.1} GB of block weights resident, up to {hold} experts of one block held \
-             per layer, ready in {:.0}s",
+            "deepseek_v41: host graph, {gb:.1} GB of weights resident (the blocks included), up to {hold} experts of \
+             one block held per layer, ready in {:.0}s",
             t0.elapsed().as_secs_f64()
         );
         let mut m = Self::host_only(cfg, kernels, text.resident_bytes(), opts.hadamard_seed)?;
