@@ -73,6 +73,26 @@ pub struct Model {
     /// Inkling-2's weights: its own graph (`crate::inkling2`), read by a standalone forward until the
     /// engine's session plumbing carries the loop.
     pub(crate) inkling2: Option<Box<crate::inkling2::Weights>>,
+    /// DeepSeek-V4.1's host graph (`crate::deepseek_text`): a streamed backbone and a decode cache, both on the
+    /// CPU and both owned here, so a served model outlives the loader that opened the files. Behind a mutex
+    /// because a step borrows the streamer mutably and the engine holds the model behind `&self`.
+    pub(crate) deepseek: Option<std::sync::Mutex<Deepseek>>,
+}
+
+/// DeepSeek-V4.1's host graph, as a served model holds it: the streamer (the backbone, the Engram tables, their
+/// addressing) and the sequence's KV cache. Nothing of it lives on the device.
+pub struct Deepseek {
+    pub text: crate::deepseek_text::Streamer,
+    pub cache: crate::deepseek_text::Cache,
+}
+
+/// The DeepSeek-V4.1 files the host graph reads: the backbone, the companion file with the two Engram tables, and
+/// the prefix of the Engram state (`<prefix>-state.json`, `<prefix>-token-map.i32`).
+#[derive(Clone, Debug)]
+pub struct DeepseekFiles {
+    pub backbone: std::path::PathBuf,
+    pub engram: std::path::PathBuf,
+    pub state: std::path::PathBuf,
 }
 
 pub struct LoadOptions {
@@ -83,6 +103,8 @@ pub struct LoadOptions {
     pub hadamard_seed: u64,
     /// Load the multi-token prediction head (speculative decoding) when the file has it.
     pub mtp: bool,
+    /// DeepSeek-V4.1: its graph owns its sources, so the loader is given the paths instead of an opened backbone.
+    pub deepseek: Option<DeepseekFiles>,
 }
 
 impl Default for LoadOptions {
@@ -93,6 +115,7 @@ impl Default for LoadOptions {
             prefill_families: Vec::new(),
             hadamard_seed: malleus_gguf::quant::HADAMARD_SEED,
             mtp: true,
+            deepseek: None,
         }
     }
 }
@@ -131,12 +154,10 @@ impl Model {
         if c.family == Family::Hy4 {
             return Self::load_hy4(cfg, src, opts, kernels, progress);
         }
-        // DeepSeek-V4.1 has its config and its tensor map (issue #83); the loader and the forward are the next
-        // increments, so a load says so instead of falling through to the Qwen/Ling shape.
+        // DeepSeek-V4.1 has its own graph (`crate::deepseek_text`), which streams the backbone from the file: it
+        // owns its sources, so it opens them itself and none of the device loader below is involved.
         if c.family == Family::Deepseek41 {
-            bail!(
-                "deepseek_v41: the tensor map is checked by `malleus inspect`; the forward is not wired yet (issue #83)"
-            );
+            return Self::load_deepseek(cfg, opts, kernels);
         }
         // Inkling-2 has its own graph (`crate::inkling2`): check the file against the map, load the weights, and
         // hand the model to the standalone forward.
@@ -152,44 +173,9 @@ impl Model {
                 "inkling2: {n} layers loaded, {gb:.1} GiB on the device in {:.0}s",
                 t0.elapsed().as_secs_f64()
             );
-            let dummy = DeviceBuffer::zeroed(4)?;
-            return Ok(Model {
-                cfg,
-                k: kernels,
-                embed: dummy,
-                layers: Vec::new(),
-                norm: None,
-                hc_final: None,
-                ngram: None,
-                lm_head: Linear {
-                    w: crate::weights::Weights::Bf16(DeviceBuffer::zeroed(4)?),
-                    prefill: None,
-                    n: 1,
-                    k: 1,
-                },
-                mtp: None,
-                mtp_post_norm: false,
-                mtp_chain_post: false,
-                draft_head: None,
-                draft_map: None,
-                signs: DeviceBuffer::from_slice(&malleus_gguf::quant::hadamard_signs(opts.hadamard_seed))?,
-                rope_invf: None,
-                scratch_cache: std::sync::Mutex::new(None),
-                stream: Stream::new()?,
-                quant_mode: std::sync::atomic::AtomicU8::new(0),
-                prefill_a8: false,
-                w4_max_t: 0,
-                moe_w4a4: 0,
-                moe_y_half: false,
-                weight_bytes: weights.bytes,
-                expert_stage: None,
-                prefill_copies: false,
-                attn_mass: None,
-                vision: None,
-                hy4: None,
-                hy4_vision: None,
-                inkling2: Some(Box::new(weights)),
-            });
+            let mut m = Self::host_only(cfg, kernels, weights.bytes, opts.hadamard_seed)?;
+            m.inkling2 = Some(Box::new(weights));
+            return Ok(m);
         }
         // Read before `kernels` moves into the model: the int4 default for the MoE prefill depends on the GPU.
         let arch = kernels.arch.clone();
@@ -470,7 +456,92 @@ impl Model {
             hy4: None,
             hy4_vision: None,
             inkling2: None,
+            deepseek: None,
         })
+    }
+
+    /// A model whose graph is not the device stack: every weight field is empty and only the config, the stream and
+    /// the small device buffers the engine expects are real. Inkling-2 and DeepSeek-V4.1 both fill their own field
+    /// afterwards.
+    fn host_only(cfg: Config, kernels: Kernels, weight_bytes: usize, hadamard_seed: u64) -> Result<Self> {
+        Ok(Model {
+            cfg,
+            k: kernels,
+            embed: DeviceBuffer::zeroed(4)?,
+            layers: Vec::new(),
+            norm: None,
+            hc_final: None,
+            ngram: None,
+            lm_head: Linear {
+                w: crate::weights::Weights::Bf16(DeviceBuffer::zeroed(4)?),
+                prefill: None,
+                n: 1,
+                k: 1,
+            },
+            mtp: None,
+            mtp_post_norm: false,
+            mtp_chain_post: false,
+            draft_head: None,
+            draft_map: None,
+            signs: DeviceBuffer::from_slice(&malleus_gguf::quant::hadamard_signs(hadamard_seed))?,
+            rope_invf: None,
+            scratch_cache: std::sync::Mutex::new(None),
+            stream: Stream::new()?,
+            quant_mode: std::sync::atomic::AtomicU8::new(0),
+            prefill_a8: false,
+            w4_max_t: 0,
+            moe_w4a4: 0,
+            moe_y_half: false,
+            weight_bytes,
+            expert_stage: None,
+            prefill_copies: false,
+            attn_mass: None,
+            vision: None,
+            hy4: None,
+            hy4_vision: None,
+            inkling2: None,
+            deepseek: None,
+        })
+    }
+
+    /// DeepSeek-V4.1's host graph (issue #83): the backbone and the Engram tables are owned by the streamer, the
+    /// decode cache is allocated once, and every block's non-expert weights are held resident because a served
+    /// step would otherwise read 40 blocks of attention back from the file per token. `MALLEUS_DEEPSEEK_EXPERTS`
+    /// is how many routed experts of one block the cache holds across positions.
+    fn load_deepseek(cfg: Config, opts: &LoadOptions, kernels: Kernels) -> Result<Self> {
+        let files = opts.deepseek.as_ref().context(
+            "deepseek_v41: the host graph reads its own files; the loader needs the backbone, the Engram tables \
+             (MALLEUS_DEEPSEEK_ENGRAM) and the Engram state (MALLEUS_DEEPSEEK_ENGRAM_STATE)",
+        )?;
+        let t0 = std::time::Instant::now();
+        let backbone = open_source(&files.backbone)?;
+        let engram: crate::deepseek_text::Source = Box::new(
+            malleus_gguf::gguf::Gguf::open(&files.engram).with_context(|| files.engram.display().to_string())?,
+        );
+        let state = crate::deepseek_engram::EngramState::from_json(
+            &std::fs::read_to_string(format!("{}-state.json", files.state.display()))
+                .with_context(|| format!("{}-state.json", files.state.display()))?,
+            &std::fs::read(format!("{}-token-map.i32", files.state.display()))
+                .with_context(|| format!("{}-token-map.i32", files.state.display()))?,
+        )?;
+        let hold = std::env::var("MALLEUS_DEEPSEEK_EXPERTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let text = crate::deepseek_text::Streamer::open(backbone, &cfg)?
+            .with_engram(engram, state)
+            .with_experts_held(hold)
+            .with_blocks()?;
+        let gb = text.resident_bytes() as f64 / 1e9;
+        let cache = text.cache(hold);
+        eprintln!(
+            "deepseek_v41: host graph, {gb:.1} GB of block weights resident, up to {hold} experts of one block held \
+             per layer, ready in {:.0}s",
+            t0.elapsed().as_secs_f64()
+        );
+        let mut m = Self::host_only(cfg, kernels, text.resident_bytes(), opts.hadamard_seed)?;
+        m.deepseek = Some(std::sync::Mutex::new(Deepseek { text, cache }));
+        Ok(m)
     }
 
     /// Hy4-flash: the whole model file is the text graph (plus the vision tower and the DFly2 draft, which this
@@ -530,12 +601,17 @@ impl Model {
             hy4: Some(Box::new(weights)),
             hy4_vision: vision,
             inkling2: None,
+            deepseek: None,
         })
     }
 
     pub fn new_session(&self, max_ctx: usize) -> Result<Session> {
         if self.hy4.is_some() {
             return crate::hy4::new_session(self, max_ctx);
+        }
+        // The DeepSeek-V4.1 host graph keeps its own cache and serves one request at a time: there is no session.
+        if self.deepseek.is_some() {
+            bail!("deepseek_v41: the host graph serves without sessions");
         }
         // Inkling-2 keeps its keys in its own cache, so the generic per-layer state below is not allocated for it:
         // 20 sliding layers of `kv` that the looped graph never read, at 80 KiB a position (issue #110).
@@ -1505,6 +1581,51 @@ impl Model {
     /// own. Returns the generated ids after `tokens`.
     pub fn inkling2_generate(&self, tokens: &[u32], n: usize) -> Result<Vec<u32>> {
         crate::inkling2::generate(self, tokens, n)
+    }
+
+    /// Whether the file is the DeepSeek-V4.1 host graph, which serves without a `Session`.
+    pub fn is_deepseek(&self) -> bool {
+        self.deepseek.is_some()
+    }
+
+    /// Greedy generation on the DeepSeek-V4.1 host graph: the prompt in one prefill into the cache, then one
+    /// position per token. `on_token(step, out, row)` gets each token with the logits row it was chosen from and
+    /// returns false to stop (a stop token, a cancel). The cache is reset first and dropped with the request: a
+    /// host prefill is minutes long, so no prompt is ever reused.
+    pub fn deepseek_generate(
+        &self,
+        ids: &[u32],
+        tokens: usize,
+        mut on_token: impl FnMut(usize, &[u32], &[f32]) -> bool,
+    ) -> Result<Vec<u32>> {
+        let lock = self.deepseek.as_ref().context("not a deepseek model")?;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let d = &mut *guard;
+        let (text, cache) = (&mut d.text, &mut d.cache);
+        let vocab = self.cfg.vocab;
+        let batched = ids.to_vec();
+        let mut seq = batched.clone();
+        let prefill = text.prefill_cached(cache, &seq)?;
+        let mut row = prefill[(seq.len() - 1) * vocab..].to_vec();
+        let mut out: Vec<u32> = Vec::with_capacity(tokens);
+        for step in 0..tokens {
+            let mut best = 0;
+            for (i, v) in row.iter().enumerate() {
+                if *v > row[best] {
+                    best = i;
+                }
+            }
+            let next = best as u32;
+            out.push(next);
+            if !on_token(step, &out, &row) || step + 1 == tokens {
+                break;
+            }
+            seq = batched.clone();
+            seq.extend_from_slice(&out);
+            row = text.step(cache, &seq)?;
+        }
+        cache.reset();
+        Ok(out)
     }
 
     /// Runs `tokens` through the model, appending to the session. Text positions are assigned automatically
@@ -3038,5 +3159,18 @@ impl Model {
             bail!("layer/state mismatch");
         }
         Ok(())
+    }
+}
+
+/// A tensor source opened from a path: a `.malleus` file, or a safetensors directory (the gates' reference
+/// checkpoints are directories). The DeepSeek-V4.1 graph opens its own files because it owns them for the whole
+/// life of the model.
+fn open_source(path: &std::path::Path) -> Result<crate::deepseek_text::Source> {
+    if path.is_dir() {
+        Ok(Box::new(malleus_gguf::safetensors::SafeTensors::open_dir(path)?))
+    } else {
+        Ok(Box::new(
+            malleus_gguf::gguf::Gguf::open(path).with_context(|| path.display().to_string())?,
+        ))
     }
 }

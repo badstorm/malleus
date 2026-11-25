@@ -785,6 +785,58 @@ fn pick_slot(free: &[usize], cached: &[&[u32]], prompt: &[u32]) -> Option<usize>
 }
 
 impl Worker {
+    /// Serves one request on the DeepSeek-V4.1 host graph: the prompt in one prefill, then a position per token,
+    /// with the events the device path emits so the API needs no branch of its own. Greedy, like `deepseek-run`:
+    /// at 12.6 s a token the sampler is not what this path is measuring.
+    fn serve_deepseek(&mut self, req: Request) -> Result<()> {
+        let t0 = Instant::now();
+        let _ = req.events.send(Event::Started {
+            prompt_tokens: req.prompt.len(),
+            cached_tokens: 0,
+        });
+        let mut prefill_s = 0.0;
+        let mut emitted = 0usize;
+        let mut reason = FinishReason::Length;
+        let out = self
+            .model
+            .deepseek_generate(&req.prompt, req.max_tokens, |step, out, row| {
+                if step == 0 {
+                    prefill_s = t0.elapsed().as_secs_f64();
+                }
+                let id = *out.last().expect("a generated token");
+                let top = req.logprobs.then(|| token_probs(row, id, req.top_logprobs));
+                emitted = out.len();
+                if req.stop_tokens.contains(&id) {
+                    reason = FinishReason::Stop;
+                    return false;
+                }
+                if req.events.send(Event::Token { id, top }).is_err() || req.cancel.load(Ordering::Relaxed) {
+                    reason = FinishReason::Cancelled;
+                    return false;
+                }
+                true
+            })?;
+        let decode_s = t0.elapsed().as_secs_f64() - prefill_s;
+        eprintln!(
+            "deepseek_v41: {} prompt + {} tokens, prefill {prefill_s:.0}s, decode {:.1}s a token, {reason:?}",
+            req.prompt.len(),
+            out.len(),
+            if out.is_empty() {
+                0.0
+            } else {
+                decode_s / out.len() as f64
+            },
+        );
+        let _ = req.events.send(Event::Done(Finish {
+            reason,
+            prompt_tokens: req.prompt.len(),
+            completion_tokens: emitted,
+            prefill_s,
+            decode_s,
+        }));
+        Ok(())
+    }
+
     /// Prepares one request on `slot`: expands images, finds the prompt cache and emits `Started`. Nothing runs on
     /// the GPU here; the prefill is `prefill_step`.
     fn begin(&mut self, mut req: Request, slot: usize) -> Result<Active> {
@@ -1306,6 +1358,20 @@ const DEFAULT_PREFILL_QUANTUM: usize = 256;
 fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Result<Model>) -> Result<Worker> {
     let ctx = spec.ctx;
     let model = load(spec)?;
+    // A host graph (DeepSeek-V4.1) runs its own cache on the CPU, one request at a time: no session, no warm-up
+    // and no device memory to plan, so every session below is skipped.
+    if model.is_deepseek() {
+        return Ok(Worker {
+            spec: spec.clone(),
+            drafts: 0,
+            draft_pmin: DEFAULT_DRAFT_PMIN,
+            lookup: false,
+            max_snaps: 0,
+            quantum: 1,
+            model,
+            slots: Vec::new(),
+        });
+    }
     // Sessions resident: `MALLEUS_SLOTS`, one session each, with the context split between them as a batched server
     // does. One slot is what this server always did: one session holding the whole context.
     let slots = malleus_model::memplan::sessions().max(1);
@@ -1511,6 +1577,21 @@ impl Engine {
                     }
                     let req = pending.pop_front().expect("a queued request");
                     let events = req.events.clone();
+                    // A host graph has no session and no interleaving: the one request runs to completion on this
+                    // thread and the queue waits behind it. No watchdog either: 12.6 s a token is the graph's
+                    // speed, not a hang.
+                    if worker
+                        .as_ref()
+                        .expect("a worker is loaded before serving")
+                        .model
+                        .is_deepseek()
+                    {
+                        let w = worker.as_mut().expect("a worker is loaded before serving");
+                        if let Err(e) = w.serve_deepseek(*req) {
+                            let _ = events.send(Event::Error(format!("{e:#}")));
+                        }
+                        continue;
+                    }
                     // The slot whose session already holds the longest prefix of this prompt, else any free one.
                     let busy: Vec<usize> = active.iter().map(|a| a.slot).collect();
                     let free: Vec<usize> = (0..slots).filter(|s| !busy.contains(s)).collect();

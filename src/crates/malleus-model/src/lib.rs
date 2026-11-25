@@ -26,6 +26,6 @@ pub mod vision;
 pub mod weights;
 
 pub use config::{Config, Family, MixerKind};
-pub use engine::{LoadOptions, Model};
+pub use engine::{DeepseekFiles, LoadOptions, Model};
 pub use session::{Session, Snapshot};
 pub use weights::{GEMV_MAX_T, dense_w4a4};
