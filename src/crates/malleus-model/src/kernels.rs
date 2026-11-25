@@ -284,6 +284,7 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "hy4_gate_mul",
         ],
     ),
+    ("dsv", &["dsv_rmsnorm", "dsv_rope", "dsv_win_attn"]),
     (
         "mla",
         &[

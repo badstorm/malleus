@@ -654,10 +654,40 @@ impl Weights {
     /// compressors, the two-level indexer and the sparse attention, which the whole-graph comparison cannot
     /// isolate: an isolated layer is fed a fixed input on both sides.
     pub fn attention_stage(&self, index: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+        self.attention_stage_with(index, x, t, |_, _| Ok(()))
+    }
+
+    /// The same, calling `hook(name, values)` after each stage: what a device kernel is compared against, one
+    /// stage at a time.
+    pub fn attention_stage_with(
+        &self,
+        index: usize,
+        x: &[f32],
+        t: usize,
+        mut hook: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
         let l = self.layers.get(index).context("no such layer loaded")?;
         let mut shared = Shared::default();
-        let mut hook = |_: &str, _: &[f32]| Ok(());
         self.attention(l, x, t, &mut shared, None, &mut hook, index)
+    }
+
+    /// One block without its routed experts, its token table and its head: the host side of a stage gate, which
+    /// runs one layer's attention (or its experts) against the device and never reads 54 GB of experts or 10 GB of
+    /// table. `attention_stage` is then layer 0 of `layers`.
+    pub fn block_only(src: &dyn TensorSource, c: &Config, layer: usize) -> Result<Self> {
+        let d = c.deepseek.as_ref().context("no deepseek config")?.clone();
+        Ok(Weights {
+            hidden: c.hidden,
+            vocab: c.vocab,
+            eps: d.eps,
+            n_layers: c.n_layers,
+            c: d,
+            embed: Vec::new(),
+            head: Vec::new(),
+            norm: Vec::new(),
+            layers: vec![Layer::load(src, c, layer, false)?],
+            target: Vec::new(),
+        })
     }
 
     /// Parameters held on the host, for the load report.
@@ -1229,11 +1259,15 @@ impl Weights {
         };
         let mut qr = a.wq_a.mat(x, t);
         rmsnorm(&mut qr, a.q_lora, &a.q_norm, self.eps);
+        // The stages a device kernel is gated against, one hook each: the host graph is the specification.
+        hook(&format!("q_a{layer}"), &qr)?;
         let mut q = a.wq_b.mat(&qr, t);
         rope_heads(&mut q, t, heads, hd, rd, &inv, false);
+        hook(&format!("q_rope{layer}"), &q)?;
         let mut kv = a.wkv.mat(x, t);
         rmsnorm(&mut kv, hd, &a.kv_norm, self.eps);
         rope_rows(&mut kv, t, hd, rd, &inv, |i| i as f32, false);
+        hook(&format!("kv_rope{layer}"), &kv)?;
         let (win, wm) = window_idxs(t, d.window);
         let mut kv_all = kv.clone();
         let mut n_kv = t;
@@ -1334,6 +1368,7 @@ impl Weights {
             }
         }
         let out = sparse_attn(&q, &kv_all, n_kv, &a.sink, &idx, t, m, heads, hd);
+        hook(&format!("att_raw{layer}"), &out)?;
         Ok(self.out_projection(a, out, t))
     }
 

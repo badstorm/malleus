@@ -96,10 +96,24 @@ impl Uploader {
         buf: &mut DeviceBuffer,
         at: usize,
     ) -> Result<()> {
+        self.copy_range(src, name, 0, size, buf, at)
+    }
+
+    /// The same from byte `from` of the tensor: the rows of a quantized matrix are contiguous, so a window of it
+    /// (the blocks of a grouped projection) is a byte range.
+    pub(crate) fn copy_range(
+        &mut self,
+        src: &dyn TensorSource,
+        name: &str,
+        from: usize,
+        size: usize,
+        buf: &mut DeviceBuffer,
+        at: usize,
+    ) -> Result<()> {
         let mut off = 0;
         while off < size {
             let n = Self::CHUNK.min(size - off);
-            src.read(name, off, &mut self.pinned.as_mut_slice()[..n])?;
+            src.read(name, from + off, &mut self.pinned.as_mut_slice()[..n])?;
             self.pinned.copy_to(n, buf, at + off)?;
             off += n;
         }
@@ -147,6 +161,57 @@ impl Uploader {
             None
         };
         Ok(Linear { w, prefill, n, k })
+    }
+
+    /// Rows `[row0, row0 + n)` of an `[n_total, k]` matrix as a `Linear` of their own. DeepSeek-V4.1's output
+    /// projection is one tensor of `o_groups` blocks that each read a different slice of the same input, so the
+    /// device path needs the blocks apart: a GEMV of `n` rows reads `n` rows of the input. The prefill copy is not
+    /// loaded (a decode step is what these are for).
+    pub(crate) fn linear_rows(
+        &mut self,
+        src: &dyn TensorSource,
+        name: &str,
+        n_total: usize,
+        k: usize,
+        row0: usize,
+        n: usize,
+    ) -> Result<Linear> {
+        let wn = format!("{name}.weight");
+        let info = src.info(&wn).with_context(|| format!("missing tensor {wn}"))?;
+        ensure!(
+            info.shape == [n_total, k],
+            "{wn}: shape {:?}, expected [{n_total}, {k}]",
+            info.shape
+        );
+        ensure!(row0 + n <= n_total, "{wn}: rows {row0}..{} past {n_total}", row0 + n);
+        let groups = k / malleus_gguf::quant::BLOCK;
+        // Bytes one row of the codes takes, and one row of the scales (None: a plain fp16 matrix).
+        let (row_bytes, scale_row) = match info.dtype {
+            DType::BF16 => (2 * k, None),
+            DType::Mls2 => (k / 4, Some(2 * groups)),
+            DType::Mls3 => (k / 8 * 3, Some(2 * groups)),
+            DType::Mls4 => (k / 2, Some(2 * groups)),
+            DType::Mls8 => (k, Some(4)),
+            d => bail!("{wn}: a window of rows of a {d:?} matrix is not supported"),
+        };
+        let mut codes = DeviceBuffer::alloc(n * row_bytes)?;
+        self.copy_range(src, &wn, row0 * row_bytes, n * row_bytes, &mut codes, 0)?;
+        let w = match (info.dtype, scale_row) {
+            (DType::BF16, _) => Weights::Bf16(codes),
+            (dt, Some(sr)) => {
+                let mut s = DeviceBuffer::alloc(n * sr)?;
+                let sn = format!("{wn}.scales");
+                self.copy_range(src, &sn, row0 * sr, n * sr, &mut s, 0)?;
+                match dt {
+                    DType::Mls2 => Weights::Mls2 { q: codes, sc: s },
+                    DType::Mls3 => Weights::Mls3 { q: codes, sc: s },
+                    DType::Mls8 => Weights::Mls8 { q: codes, sc: s },
+                    _ => Weights::Mls4 { q: codes, sc: s },
+                }
+            }
+            (dt, None) => bail!("{wn}: a window of rows of a {dt:?} matrix is not supported"),
+        };
+        Ok(Linear { w, prefill: None, n, k })
     }
 
     /// A norm weight as f32, for the kernels that multiply by it directly instead of going through `rmsnorm`
