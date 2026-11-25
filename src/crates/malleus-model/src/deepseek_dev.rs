@@ -2,15 +2,22 @@
 //! compares it against the host graph stage by stage.
 //!
 //! The host graph (`crate::deepseek_text`) is the specification, gated against the release's own implementation on
-//! real weights (issues #83, #121). A kernel is written against it, one stage at a time: this increment is the
-//! attention of a *window* layer (layer 0: no compressor, no indexer), one position at a time, which is what a decode
-//! step runs. The shapes are `deepseek_text::Attn`: 64 heads of 512, `q_lora` 1280, 8 output groups of 1024, a
-//! 128-row ring of raw latents and a learned sink per head.
+//! real weights (issues #83, #121). A kernel is written against it, one stage at a time, one position at a time —
+//! which is what a decode step runs. Two increments live here:
 //!
-//! What is *not* here yet: the hyper-connections that produce the attention's input, the MoE, the Engram gather, the
-//! compressor and the two-level indexer of the indexed layers, and the prefill (this path takes one position, the
-//! way the decode does). The gate is the host graph itself: the same quantized weights, the same input, a cosine per
-//! stage.
+//! - `WindowAttn`: the attention of a *window* layer (layer 0: no compressor, no indexer). The shapes are
+//!   `deepseek_text::Attn`: 64 heads of 512, `q_lora` 1280, 8 output groups of 1024, a 128-row ring of raw latents and
+//!   a learned sink per head.
+//! - `BlockAttn`: the attention half of a block around it — the sub-layer's hyper-connections (the mixes, the
+//!   collapse of the streams and the write back over them, Sinkhorn included).
+//!
+//! The attention reads 127 MB of weights a position for one layer (5.1 GB over the stack, the number the issue
+//! starts from) and runs at 1.2 ms against a 0.55 ms memory wall: it is launch-bound at twenty launches a step, the
+//! shape the other families hit before their decode was fused.
+//!
+//! What is *not* here yet: the FFN half (the router, the shared expert and the 384 routed experts at 2 bits), the
+//! Engram gather, the compressor and the two-level indexer of the indexed layers, and the prefill. The gate is the
+//! host graph itself: the same quantized weights, the same input, a cosine per stage.
 
 use anyhow::{Context, Result, ensure};
 use malleus_gguf::TensorSource;
@@ -342,6 +349,147 @@ impl WindowAttn {
     }
 }
 
+/// One block's attention half on the device: the hyper-connections of the sub-layer (the mixes, the collapse and
+/// the write back over the streams) and then `WindowAttn`. `step` takes the `hc_mult` streams of one position and
+/// leaves the new streams in `h_out`.
+pub struct BlockAttn {
+    pub attn: WindowAttn,
+    pub hc: usize,
+    pub hidden: usize,
+    /// The mixes of the sub-layer and the three coefficient sets they split into: `pre` (the collapse), `post` (the
+    /// write back) and `comb` (the old streams' share, a doubly stochastic `hc x hc` matrix).
+    pub mix: DeviceBuffer,
+    pub pre: DeviceBuffer,
+    pub post: DeviceBuffer,
+    pub comb: DeviceBuffer,
+    /// The sub-layer's input, collapsed from the streams.
+    pub x: DeviceBuffer,
+    pub h_out: DeviceBuffer,
+    f: DeviceBuffer,
+    base: DeviceBuffer,
+    scale: DeviceBuffer,
+    /// The collapse weights of the previous sub-layer (one value per stream), set by the caller each step.
+    pre_mix: DeviceBuffer,
+    iters: usize,
+    eps: f32,
+}
+
+impl BlockAttn {
+    pub fn load(src: &dyn TensorSource, c: &Config, layer: usize) -> Result<Self> {
+        let d = c.deepseek.as_ref().context("no deepseek config")?;
+        let (hc, hidden) = (d.hc_mult, c.hidden);
+        ensure!(
+            hc * hc <= 64,
+            "the hyper-connection kernel keeps a {hc}x{hc} matrix in shared memory"
+        );
+        let p = |s: &str| format!("layers.{layer}.{s}");
+        let mixes = (2 + hc) * hc;
+        let attn = WindowAttn::load(src, c, layer)?;
+        Ok(BlockAttn {
+            hc,
+            hidden,
+            mix: DeviceBuffer::zeroed(mixes * 4)?,
+            pre: DeviceBuffer::zeroed(hc * 4)?,
+            post: DeviceBuffer::zeroed(hc * 4)?,
+            comb: DeviceBuffer::zeroed(hc * hc * 4)?,
+            x: DeviceBuffer::zeroed(hidden * 4)?,
+            h_out: DeviceBuffer::zeroed(hc * hidden * 4)?,
+            f: DeviceBuffer::from_slice(&crate::deepseek_text::load_mat(
+                src,
+                &p("hc_attn_fn"),
+                mixes,
+                hc * hidden,
+            )?)?,
+            base: DeviceBuffer::from_slice(&crate::deepseek_text::load_vector(src, &p("hc_attn_base"), mixes)?)?,
+            scale: DeviceBuffer::from_slice(&crate::deepseek_text::load_vector(src, &p("hc_attn_scale"), 3)?)?,
+            attn,
+            pre_mix: DeviceBuffer::zeroed(hc * 4)?,
+            iters: d.hc_iters,
+            eps: d.hc_eps,
+        })
+    }
+
+    /// The collapse weights of the previous sub-layer, one per stream (`identity` at the first one).
+    pub fn set_pre_mix(&mut self, pre: &[f32]) -> Result<()> {
+        ensure!(
+            pre.len() == self.hc,
+            "{} pre-mix weights for {} streams",
+            pre.len(),
+            self.hc
+        );
+        self.pre_mix.upload(pre)?;
+        Ok(())
+    }
+
+    /// One position: `h` is the `hc_mult * hidden` streams of the block's input, `pos` the position in the sequence.
+    pub fn step(&mut self, m: &Model, h: &DeviceBuffer, pos: usize) -> Result<()> {
+        let (s, k) = (&m.stream, &m.k);
+        let (hc, hidden) = (self.hc, self.hidden);
+        let mixes = (2 + hc) * hc;
+        k.get("dsv_hc_mixes").launch(
+            (mixes as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            s,
+            &[
+                (&self.mix).into(),
+                h.into(),
+                (&self.f).into(),
+                mixes.into(),
+                (hc * hidden).into(),
+                self.eps.into(),
+            ],
+        )?;
+        k.get("dsv_hc_coef").launch(
+            (1, 1, 1),
+            (32, 1, 1),
+            0,
+            s,
+            &[
+                (&self.pre).into(),
+                (&self.post).into(),
+                (&self.comb).into(),
+                (&self.mix).into(),
+                (&self.base).into(),
+                (&self.scale).into(),
+                hc.into(),
+                self.eps.into(),
+                self.iters.into(),
+            ],
+        )?;
+        k.get("dsv_hc_pre").launch(
+            (hidden.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            s,
+            &[
+                (&self.x).into(),
+                h.into(),
+                (&self.pre_mix).into(),
+                hc.into(),
+                hidden.into(),
+            ],
+        )?;
+        self.attn.step(m, &self.x, pos)?;
+        k.get("dsv_hc_post").launch(
+            ((hc * hidden).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            s,
+            &[
+                (&self.h_out).into(),
+                (&self.attn.out).into(),
+                h.into(),
+                (&self.post).into(),
+                (&self.comb).into(),
+                hc.into(),
+                hidden.into(),
+            ],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +593,17 @@ mod tests {
             .map(|i| DeviceBuffer::from_slice(&x[i * c.hidden..(i + 1) * c.hidden]).unwrap())
             .collect();
         m.stream.synchronize().unwrap();
+        // The steps alone, as a served decode runs them, then the same steps reading the layer's output back.
+        let t0 = std::time::Instant::now();
+        for (pos, row) in rows.iter().enumerate() {
+            dev.step(&m, row, pos).unwrap();
+        }
+        m.stream.synchronize().unwrap();
+        eprintln!(
+            "device: {:.2} ms a position",
+            t0.elapsed().as_secs_f64() / t as f64 * 1e3
+        );
+        dev.reset().unwrap();
         let mut dev_out = vec![0f32; t * c.hidden];
         let t0 = std::time::Instant::now();
         for (pos, row) in rows.iter().enumerate() {
@@ -453,7 +612,7 @@ mod tests {
         }
         m.stream.synchronize().unwrap();
         eprintln!(
-            "device: {:.2} ms a position",
+            "device: {:.2} ms a position with the readback",
             t0.elapsed().as_secs_f64() / t as f64 * 1e3
         );
 
@@ -488,5 +647,140 @@ mod tests {
         let (rms, worst_abs) = rms_and_worst(&host_out, &dev_out);
         eprintln!("out: rms {rms:.4}, max |diff| {worst_abs:.2e}, worst position {worst:.8}, last {last:.8}");
         assert!(worst > 0.9999, "a position's attention diverges: {worst}");
+    }
+
+    /// The attention half of a block — the hyper-connections, the collapse, the attention and the write back over the
+    /// streams — against the host graph, stage by stage. This is what a device block is built on; the FFN half comes
+    /// next. The input is the block's streams (`hc_mult` copies of `hidden`, one position each), synthetic unless
+    /// `DEEPSEEK_H` names a raw f32 file of them.
+    ///
+    ///   DEEPSEEK_FILE=/models/deepseek-v41-flash-mls2.malleus \
+    ///     cargo test -p malleus-model --release -- --ignored --nocapture the_device_attention_half_block
+    #[test]
+    #[ignore = "reads a real layer from the converted file and needs the GPU"]
+    fn the_device_attention_half_block_matches_the_host_graph() {
+        let file = std::env::var("DEEPSEEK_FILE").expect("DEEPSEEK_FILE");
+        let layer: usize = std::env::var("DEEPSEEK_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let g = malleus_gguf::gguf::Gguf::open(std::path::Path::new(&file)).unwrap();
+        let c = Config::from_json(
+            g.meta_str("openmalleus.hf_config").unwrap(),
+            g.meta_str("openmalleus.generation_config").ok(),
+        )
+        .unwrap();
+        let d = c.deepseek.as_ref().unwrap();
+        let (hc, hidden) = (d.hc_mult, c.hidden);
+        let t: usize = std::env::var("DEEPSEEK_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let h: Vec<f32> = match std::env::var("DEEPSEEK_H") {
+            Ok(path) => {
+                let raw = std::fs::read(&path).unwrap();
+                raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
+            }
+            Err(_) => {
+                // Distinct streams, not the copies of a first block: the write-back is what this gate is for.
+                let mut state = 0x9e37_79b9_7f4a_7c15u64;
+                (0..t * hc * hidden)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ((state >> 40) as f32 / 4194304.0) - 2.0
+                    })
+                    .collect()
+            }
+        };
+        let t = h.len() / (hc * hidden);
+        // The collapse weights of the previous sub-layer. The first one is the identity (stream 0 only), which is
+        // what a block starts from; here they are a sigmoid's worth each, so the collapse is not a copy.
+        let pre_mix: Vec<f32> = if std::env::var("DEEPSEEK_H").is_ok() {
+            crate::deepseek_text::identity_mix(t, hc)
+        } else {
+            let mut state = 0x0123_4567_89ab_cdefu64;
+            (0..t * hc)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    0.2 + 0.8 * ((state >> 40) as f32 / 8388608.0)
+                })
+                .collect()
+        };
+
+        let host = crate::deepseek_text::Weights::block_only(&g, &c, layer).unwrap();
+        let mut stages: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+        let host_out = host
+            .attention_block_stage_with(0, &h, &pre_mix, t, |name, values| {
+                stages.insert(name.to_string(), values.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        let kernels = Kernels::load(&select_device().unwrap()).unwrap();
+        let m = Model::host_only(c.clone(), kernels, 0, malleus_gguf::quant::HADAMARD_SEED).unwrap();
+        let mut dev = BlockAttn::load(&g, &c, layer).unwrap();
+        let rows: Vec<DeviceBuffer> = (0..t)
+            .map(|i| DeviceBuffer::from_slice(&h[i * hc * hidden..(i + 1) * hc * hidden]).unwrap())
+            .collect();
+        m.stream.synchronize().unwrap();
+        let steps = |dev: &mut BlockAttn, read_back: bool| -> Vec<f32> {
+            let mut out = vec![0f32; t * hc * hidden];
+            for (pos, row) in rows.iter().enumerate() {
+                dev.set_pre_mix(&pre_mix[pos * hc..(pos + 1) * hc]).unwrap();
+                dev.step(&m, row, pos).unwrap();
+                if read_back {
+                    out[pos * hc * hidden..(pos + 1) * hc * hidden]
+                        .copy_from_slice(&dev.h_out.download::<f32>(hc * hidden).unwrap());
+                }
+            }
+            out
+        };
+        // The steps alone, as a served decode runs them, then the same with the readback of the streams.
+        let t0 = std::time::Instant::now();
+        steps(&mut dev, false);
+        m.stream.synchronize().unwrap();
+        eprintln!(
+            "device: {:.2} ms a position for the whole attention half",
+            t0.elapsed().as_secs_f64() / t as f64 * 1e3
+        );
+        dev.attn.reset().unwrap();
+        let dev_out = steps(&mut dev, true);
+        m.stream.synchronize().unwrap();
+
+        let at = t - 1;
+        let mut worst = 1.0f64;
+        for (stage, buf, width) in [
+            ("hc_attn_pre", &dev.pre, hc),
+            ("hc_attn_post", &dev.post, hc),
+            ("hc_attn_comb", &dev.comb, hc * hc),
+            ("hc_attn_x", &dev.x, hidden),
+            ("attn", &dev.attn.out, hidden),
+        ] {
+            let name = format!("{stage}0");
+            let got = buf.download::<f32>(width).unwrap();
+            let want = stages
+                .get(&name)
+                .unwrap_or_else(|| panic!("the host graph has no {name}"));
+            let want = &want[at * width..(at + 1) * width];
+            let (rms, worst_abs) = rms_and_worst(want, &got);
+            let cos = cos(&got, want);
+            eprintln!("{name}: cosine {cos:.8}, rms {rms:.4}, max |diff| {worst_abs:.2e}");
+            worst = worst.min(cos);
+            assert!(cos > 0.9999, "{name}: {cos}");
+        }
+        let mut stream_worst = 1.0f64;
+        for pos in 0..t {
+            let w = hc * hidden;
+            stream_worst = stream_worst.min(cos(&dev_out[pos * w..(pos + 1) * w], &host_out[pos * w..][..w]));
+        }
+        let (rms, worst_abs) = rms_and_worst(&host_out, &dev_out);
+        eprintln!(
+            "streams: rms {rms:.4}, max |diff| {worst_abs:.2e}, worst position {stream_worst:.8}, stages {worst:.8}"
+        );
+        assert!(stream_worst > 0.9999, "a position's streams diverge: {stream_worst}");
     }
 }

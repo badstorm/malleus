@@ -671,6 +671,23 @@ impl Weights {
         self.attention(l, x, t, &mut shared, None, &mut hook, index)
     }
 
+    /// The attention half of one block on the streams `h` (`hc_mult` copies of `hidden`, per position): the mixes,
+    /// the collapse, the attention and the write back. Returns the new streams; the hook names every stage.
+    pub fn attention_block_stage_with(
+        &self,
+        index: usize,
+        h: &[f32],
+        pre_mix: &[f32],
+        t: usize,
+        mut hook: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        let l = self.layers.get(index).context("no such layer loaded")?;
+        let mut shared = Shared::default();
+        let mut h = h.to_vec();
+        self.attention_sub(l, index, &mut h, pre_mix, t, &mut shared, None, &mut hook)?;
+        Ok(h)
+    }
+
     /// One block without its routed experts, its token table and its head: the host side of a stage gate, which
     /// runs one layer's attention (or its experts) against the device and never reads 54 GB of experts or 10 GB of
     /// table. `attention_stage` is then layer 0 of `layers`.
@@ -1206,13 +1223,7 @@ impl Weights {
         // The draft reads the streams this block starts from, averaged over the copies, before any sub-layer.
         collect_main(self, layer, h, t, h_dim, hc, main);
         // Attention: its mixes come from the streams, the pre-mix from the previous sub-layer.
-        let am = l.hc_attn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
-        let x = hc_pre(h, pre_mix, t, hc, h_dim);
-        let mut xn = x.clone();
-        rmsnorm(&mut xn, h_dim, &l.attn_norm, self.eps);
-        let attn_out = self.attention(l, &xn, t, shared, cache, hook, layer)?;
-        *h = hc_post(&attn_out, h, &am.post, &am.comb, t, hc, h_dim);
-        hook(&format!("attn{layer}"), &attn_out)?;
+        let am = self.attention_sub(l, layer, h, pre_mix, t, shared, cache, hook)?;
 
         // FFN: its own mixes, and the pre-mix the attention just produced.
         let fm = l.hc_ffn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
@@ -1228,6 +1239,37 @@ impl Weights {
         *pre_mix = fm.pre;
         hook(&format!("block{layer}"), h)?;
         Ok(())
+    }
+
+    /// The attention sub-layer of one block: the hyper-connection mixes of the streams, the collapse into the
+    /// sub-layer's input, the attention and the write back over the streams. Split out of `block` because it is a
+    /// stage of its own: a device block reproduces this half first, and `attention_block_stage_with` is its host side.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sub(
+        &self,
+        l: &Layer,
+        layer: usize,
+        h: &mut Vec<f32>,
+        pre_mix: &[f32],
+        t: usize,
+        shared: &mut Shared,
+        cache: Option<&mut LayerCache>,
+        hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Mixes> {
+        let d = &self.c;
+        let (h_dim, hc) = (self.hidden, d.hc_mult);
+        let am = l.hc_attn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
+        hook(&format!("hc_attn_pre{layer}"), &am.pre)?;
+        hook(&format!("hc_attn_post{layer}"), &am.post)?;
+        hook(&format!("hc_attn_comb{layer}"), &am.comb)?;
+        let x = hc_pre(h, pre_mix, t, hc, h_dim);
+        hook(&format!("hc_attn_x{layer}"), &x)?;
+        let mut xn = x.clone();
+        rmsnorm(&mut xn, h_dim, &l.attn_norm, self.eps);
+        let attn_out = self.attention(l, &xn, t, shared, cache, hook, layer)?;
+        *h = hc_post(&attn_out, h, &am.post, &am.comb, t, hc, h_dim);
+        hook(&format!("attn{layer}"), &attn_out)?;
+        Ok(am)
     }
 
     #[allow(clippy::too_many_arguments)]

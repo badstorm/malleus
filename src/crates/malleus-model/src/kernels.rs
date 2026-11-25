@@ -284,7 +284,18 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "hy4_gate_mul",
         ],
     ),
-    ("dsv", &["dsv_rmsnorm", "dsv_rope", "dsv_win_attn"]),
+    (
+        "dsv",
+        &[
+            "dsv_rmsnorm",
+            "dsv_rope",
+            "dsv_win_attn",
+            "dsv_hc_mixes",
+            "dsv_hc_coef",
+            "dsv_hc_pre",
+            "dsv_hc_post",
+        ],
+    ),
     (
         "mla",
         &[

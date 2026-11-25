@@ -112,3 +112,105 @@ extern "C" __global__ void __launch_bounds__(256) dsv_win_attn(float* out, const
     int k = 0;
     for (int d = threadIdx.x; d < hd; d += 256, ++k) oh[d] = acc[k] * inv;
 }
+
+// The hyper-connections of one sub-layer, on one position. The streams are `hc_mult` copies of the residual, mixed by
+// three coefficient sets: `pre` collapses them into the sub-layer's input, `post` writes the sub-layer's output back
+// over all of them, and `comb` (a doubly stochastic matrix, a row softmax followed by Sinkhorn passes) says how the
+// old streams carry into the new ones. The reference of all three is `deepseek_text::Hc::mixes`.
+//
+// The mixes are one projection of the flattened streams: `mix[r] = f[r] . h / sqrt(mean(h^2) + eps)`, one block a
+// row, and every block recomputes the statistic over the same 20480 values rather than synchronise for it.
+extern "C" __global__ void __launch_bounds__(256) dsv_hc_mixes(float* mix, const float* h, const float* f, int n,
+                                                             int hd, float eps) {
+    __shared__ float sh[8];
+    __shared__ float sh2[8];
+    const float* fr = f + (size_t)blockIdx.x * hd;
+    float acc = 0.f, ss = 0.f;
+    for (int i = threadIdx.x; i < hd; i += 256) {
+        const float v = h[i];
+        acc += fr[i] * v;
+        ss += v * v;
+    }
+    acc = dsv_warp_sum(acc);
+    ss = dsv_warp_sum(ss);
+    __syncthreads();
+    if (threadIdx.x % 32 == 0) {
+        sh[threadIdx.x / 32] = acc;
+        sh2[threadIdx.x / 32] = ss;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float ta = 0.f, ts = 0.f;
+        for (int i = 0; i < 8; ++i) {
+            ta += sh[i];
+            ts += sh2[i];
+        }
+        mix[blockIdx.x] = ta * rsqrtf(ts / hd + eps);
+    }
+}
+
+// The coefficients: `pre` and `post` are a sigmoid on their own base and scale, `comb` is a row softmax followed by
+// `iters` rounds of row and column normalisation (the first column pass comes right after the softmax). One thread:
+// the matrix is `hc x hc` (4x4 here) and twenty rounds of it cost less than a block reduction.
+extern "C" __global__ void dsv_hc_coef(float* pre, float* post, float* comb, const float* mix, const float* base,
+                                       const float* scale, int hc, float eps, int iters) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    __shared__ float c[64];
+    for (int j = 0; j < hc; ++j) {
+        pre[j] = 1.f / (1.f + expf(-(mix[j] * scale[0] + base[j]))) + eps;
+        post[j] = 2.f / (1.f + expf(-(mix[j + hc] * scale[1] + base[j + hc])));
+    }
+    for (int j = 0; j < hc; ++j) {
+        float m = -INFINITY;
+        for (int k = 0; k < hc; ++k) {
+            const int idx = 2 * hc + j * hc + k;
+            c[j * hc + k] = mix[idx] * scale[2] + base[idx];
+            m = fmaxf(m, c[j * hc + k]);
+        }
+        float sum = 0.f;
+        for (int k = 0; k < hc; ++k) {
+            c[j * hc + k] = expf(c[j * hc + k] - m);
+            sum += c[j * hc + k];
+        }
+        for (int k = 0; k < hc; ++k) c[j * hc + k] = c[j * hc + k] / sum + eps;
+    }
+    for (int k = 0; k < hc; ++k) {
+        float s = 0.f;
+        for (int j = 0; j < hc; ++j) s += c[j * hc + k];
+        for (int j = 0; j < hc; ++j) c[j * hc + k] /= s + eps;
+    }
+    for (int it = 1; it < iters; ++it) {
+        for (int j = 0; j < hc; ++j) {
+            float s = 0.f;
+            for (int k = 0; k < hc; ++k) s += c[j * hc + k];
+            for (int k = 0; k < hc; ++k) c[j * hc + k] /= s + eps;
+        }
+        for (int k = 0; k < hc; ++k) {
+            float s = 0.f;
+            for (int j = 0; j < hc; ++j) s += c[j * hc + k];
+            for (int j = 0; j < hc; ++j) c[j * hc + k] /= s + eps;
+        }
+    }
+    for (int j = 0; j < hc * hc; ++j) comb[j] = c[j];
+}
+
+// Collapse the streams: `x[d] = sum_c pre[c] * h[c][d]`.
+extern "C" __global__ void dsv_hc_pre(float* x, const float* h, const float* pre, int hc, int hidden) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= hidden) return;
+    float v = 0.f;
+    for (int c = 0; c < hc; ++c) v += pre[c] * h[(size_t)c * hidden + d];
+    x[d] = v;
+}
+
+// Write the sub-layer output back over the streams, mixing the old ones in:
+// `out[e][d] = post[e] * x[d] + sum_c comb[c][e] * res[c][d]`.
+extern "C" __global__ void dsv_hc_post(float* out, const float* x, const float* res, const float* post,
+                                       const float* comb, int hc, int hidden) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hc * hidden) return;
+    const int e = i / hidden, d = i % hidden;
+    float v = post[e] * x[d];
+    for (int c = 0; c < hc; ++c) v += comb[c * hc + e] * res[(size_t)c * hidden + d];
+    out[i] = v;
+}
