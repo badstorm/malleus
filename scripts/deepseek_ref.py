@@ -113,7 +113,7 @@ ARGS = dict(
     dim=256,
     moe_inter_dim=128,
     n_layers=6,
-    n_mtp_layers=0,
+    n_mtp_layers=3,
     n_heads=8,
     n_routed_experts=8,
     n_shared_experts=1,
@@ -131,7 +131,8 @@ ARGS = dict(
     window_size=8,
     # Two window-only layers, two that compress 2:1, and two at 1:1 where the last reads the candidate blocks of
     # the one before it: the same shape the release has, scaled down.
-    compress_ratios=(0, 0, 2, 2, 1, 1),
+    # One entry per backbone layer plus one per draft stage (they are window-only, like the release's 43 for 40+3).
+    compress_ratios=(0, 0, 2, 2, 1, 1, 0, 0, 0),
     kv_source_layers=(2, 4),
     index_source_layers=(2, 3, 4, 5),
     compress_rope_theta=40000.0,
@@ -154,7 +155,14 @@ ARGS = dict(
     engram_num_embeddings=(),
     vision_n_layers=0,
     image_token_id=0,
-    dspark_block_size=0,
+    # The DSpark draft: three stages over a short window, a Markov head and a confidence head. The tiny model
+    # carries them, so the draft has a reference like the rest of the graph.
+    dspark_block_size=2,
+    dspark_noise_token_id=7,
+    dspark_target_layer_ids=(3, 4, 5),
+    dspark_markov_rank=16,
+    dspark_n_routed_experts=4,
+    dspark_n_activated_experts=2,
 )
 
 
@@ -228,6 +236,11 @@ def export_safetensors(model, tokenizer_free_args, out: Path) -> dict[str, "torc
             for part in ("w1", "w2", "w3"):
                 add(p + f"ffn.experts.{e}.{part}.weight", getattr(expert, part).weight)
 
+    # The DSpark stages are a ModuleList under `mtp.`, which is already the checkpoint's namespace.
+    for name, tensor in model.state_dict().items():
+        if name.startswith("mtp."):
+            add(name, tensor)
+
     out.mkdir(parents=True, exist_ok=True)
     save_file(sd, str(out / "model.safetensors"))
     cfg = {
@@ -274,7 +287,13 @@ def export_safetensors(model, tokenizer_free_args, out: Path) -> dict[str, "torc
             "hc_eps": ARGS["hc_eps"],
             "engram_layer_ids": [],
             "engram_num_embeddings": [],
-            "num_nextn_predict_layers": 0,
+            "num_nextn_predict_layers": ARGS["n_mtp_layers"],
+            "dspark_block_size": ARGS["dspark_block_size"],
+            "dspark_noise_token_id": ARGS["dspark_noise_token_id"],
+            "dspark_target_layer_ids": list(ARGS["dspark_target_layer_ids"]),
+            "dspark_markov_rank": ARGS["dspark_markov_rank"],
+            "dspark_n_routed_experts": ARGS["dspark_n_routed_experts"],
+            "dspark_num_experts_per_tok": ARGS["dspark_n_activated_experts"],
             "eos_token_id": 1,
         },
     }
@@ -316,7 +335,8 @@ def main() -> None:
     dumps = {}
 
     def dump(name, tensor):
-        dumps[name] = tensor.detach().float().reshape(-1).contiguous()
+        # A copy: some of these are views into buffers the next forward overwrites (the shared attention slots).
+        dumps[name] = tensor.detach().float().reshape(-1).clone()
 
     def hook(name, pick=lambda out: out):
         def f(_module, _inputs, output):
@@ -351,7 +371,7 @@ def main() -> None:
         handles.append(layer.ffn.register_forward_hook(hook(f"ffn{i}")))
     tops = {}
     with torch.inference_mode():
-        output_ids, logits, _ = model(ids, 0)
+        output_ids, logits, main_hidden = model(ids, 0)
         logits_all = model.head(final["h"], full_logits=True)
         # `shared_attn` keeps one slot per kind, so it has to be read after each layer rather than through a hook.
         tops = {"topk": model_topk_after(model)}
@@ -361,6 +381,20 @@ def main() -> None:
     dump("logits_all", logits_all)
     dump("ids", ids)
     dump("topk", tops["topk"].float())
+
+    # The DSpark draft: the release only ever forwards it (`generate` never calls `forward_spec`), so what is
+    # dumped here is the draft alone — the block it proposes, its logits and its confidence — not a spec loop.
+    # The prefill seeds the stages' window caches from the target layers' hidden states; the step one position
+    # later is what proposes.
+    model.forward_spec(output_ids, main_hidden, 0)
+    start = ids.size(1) - 1
+    step = ids[:, -1:]
+    with torch.inference_mode():
+        _, _, step_hidden = model(step, start)
+        spec_ids, spec_logits, spec_conf = model.forward_spec(step, step_hidden, start)
+    dump("spec_ids", spec_ids.float())
+    dump("spec_logits", spec_logits.float())
+    dump("spec_conf", spec_conf.float())
 
     for name, tensor in dumps.items():
         tensor.numpy().astype("<f4").tofile(str(a.out / f"{name}.f32"))
