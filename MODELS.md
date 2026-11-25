@@ -35,6 +35,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Hy4-flash (text + images) | `hy4-flash-mls4-mls8-dense.malleus` | 121.9 GB | **dense only** (406 tensors) | The 1M-window model. 90.5 GB on the device; golden 18/21, 89.95 % all-position, worst KL 1.247. The routed experts have no MLS8 copy: they do not fit. `MALLEUS_PREFILL_WEIGHTS=none` leaves the copies on the host. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
+| DeepSeek-V4.1-flash (text) | `deepseek-v41-flash-mls2.malleus` + `deepseek-v41-flash-engram.malleus` | 162.5 GB + 99.8 GB | no | Host graph only (issues #83, #121): no kernels yet, so it runs in f32 on the CPU at 6.5-13.6 s a token. 2-bit backbone (MLS2), the two Engram tables at 4 bits a row (`RowI4`). Served, not production. |
 | Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | **Production model since 2026-11-24**, at `MALLEUS_CTX=65536`: 16.7 GiB live after the warm-up (measured), decode 18.9 tok/s on a fresh session, 11.2 at 32K and 7.6 at 64K. The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring and the keys and values are fp16. The vision tower runs (issue #74); the MTP head is not wired yet. 256K fits the memory since issue #110 (22.7 GiB live) but not the clock: the fill is still ~2 h. |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
@@ -501,6 +502,82 @@ scripts/dev.sh /target/release/malleus convert --model /models/hy4-flash \
 # the gate
 scripts/dev.sh /target/release/malleus golden --model /models/hy4-flash-mls4-mls8-dense.malleus \
   --golden /golden/hy4-flash-21/golden.json --blobs /golden/hy4-flash-21 --ctx 8192
+```
+
+## DeepSeek-V4.1-flash — the host graph (2026-11-25)
+
+A 510 GB checkpoint (the 2.00 bpw build) in two files: 162.5 GB of backbone at 2 bits, and 99.8 GB of Engram
+tables at 4 bits a row. **Nothing of it runs on the GPU yet** (issue #83, point 4): the graph is written once, in
+f32, on the host, block by block, so that every stage can be compared with the release's own implementation
+before any of it moves onto kernels. It serves (`malleus serve`, issue #121) but it is not a production model.
+
+| gfx1151, 2026-11-25 | value |
+|---|---|
+| resident on the host | 32.8 GB: the embedding, the head and the 40 blocks' non-expert weights |
+| routed experts held | 8 a block across positions, 141.6 MB each: 45.3 GB |
+| ready | 17-18 s (reads ~26 GB of blocks and dequantises them) |
+| prefill | 12.7-13.6 s a position |
+| decode | 6.5-10.4 s a token |
+| a served request | 42 prompt + 4 generated: 572 s of prefill, 10.4 s a token |
+| what a step reads | a 1-token prompt plus 3 tokens: 561 experts, 14.4 GB |
+
+A layer's 384 experts are 54 GB in f32, which is why the gates below load **one layer at a time**: the whole
+streamed stack works (issue #120) but it reads the backbone per request, so the numbers above are the price of
+having the graph right, not a speed to compare with the other models.
+
+### The gates on the checkpoint's own weights
+
+One window layer, one compressed layer with its compressor and its two-level indexer, and the Engram tables,
+against `scripts/deepseek_ref_layer.py` and `scripts/deepseek_ref_engram.py`, which run the release's own modules
+on the bf16/fp8/fp4 checkpoint (`/mnt/usb/deepseekv41-flash` here, 510 GB, so it is not in the repo).
+
+| gate | what it pins | cosine |
+|---|---|---|
+| `layer_zero_matches_the_reference_on_the_real_weights` | layer 0: embedding, attention, MoE, block, all logits (15.1B parameters, 437 s to load) | embedding exact, `attn0` 0.99999999 (max 2e-6), `ffn0` 0.99999994, `logits_all` 0.99999995 |
+| `an_isolated_layer_attention_matches` | layer 2's attention alone: the compressor, the indexer, the sparse attention over window + compressed KV | 0.99999994 |
+| `the_engram_table_matches_the_checkpoint` | the 4-bit rows against the checkpoint's fp8, both layers | 0.9395 (layer 1), 0.9591 (layer 14) |
+| `the_engram_forward_matches_the_reference` | the Engram gate on the release's module: rows, `wkv`, the signed sqrt and the sigmoid (layers 1 and 14) | rows exact, `kv` 1.0000000 (max 1.2e-4), gate 1.0000000 (max 4e-6) |
+| `the_text_graph_matches_the_reference` | the whole graph on the tiny checkpoint | every stage ≥ 0.99696, `logits_all` 0.99937 |
+
+The Engram tables are the low number and it is the quantizer, not the graph: 4-bit rows against the release's
+`IQ4_NL` land at 0.9395 and 0.9591, and that is the precision the file carries (issue #121 scopes the quantizer
+out). The two index sources publish the same lists as the reference; on the **tiny** checkpoint one slot flips in
+each of the two layers that read another layer's index keys, because there two candidates score within the noise
+of torch's dot-product order and ours, and a flipped slot is a real key: that is the 0.99937, with the stages
+around it above 0.9969. The real-weight gates load one layer, so they pin the source's own selection (layer 2) and
+not that handoff; the tiny graph is what covers it.
+
+The tiny gate used to sit at 0.9978 because the reference ran on f32 weights while the file it exports is bf16:
+`scripts/deepseek_ref.py` now reloads the values it wrote, so the comparison is about the graph and not about the
+storage.
+
+```sh
+# the dumps, once (the release's own model.py under torch, in the golden image)
+scripts/golden.sh python3 scripts/deepseek_ref.py --reference /models/deepseekv41-flash/inference --out /golden/deepseek-ref/tiny
+scripts/golden.sh python3 scripts/deepseek_ref_layer.py --checkpoint /models/deepseekv41-flash \
+  --reference /models/deepseekv41-flash/inference --out /golden/deepseek-ref/layer0 --prompt "The capital of France is"
+scripts/golden.sh python3 scripts/deepseek_ref_layer.py --checkpoint /models/deepseekv41-flash --layer 2 \
+  --reference /models/deepseekv41-flash/inference --out /golden/deepseek-ref/layer2
+scripts/golden.sh python3 scripts/deepseek_ref_engram.py --checkpoint /models/deepseekv41-flash \
+  --reference /models/deepseekv41-flash/inference --table /models/deepseek-v41-flash-engram.malleus \
+  --hash /golden/deepseek-engram-hash --layer 1 --out /golden/deepseek-ref/engram1
+
+# the gates: one layer at a time, with the checkpoint on the host under MALLEUS_MODELS
+MALLEUS_MODELS=/mnt/usb scripts/dev.sh env MALLEUS_DEEPSEEK_LAYERS=0 DEEPSEEK_CKPT=/models/deepseekv41-flash \
+  DEEPSEEK_REF_LAYER=/golden/deepseek-ref/layer0 \
+  cargo test -p malleus-model --release -- layer_zero_matches_the_reference_on_the_real_weights -- --ignored --nocapture
+MALLEUS_MODELS=/mnt/usb scripts/dev.sh env MALLEUS_DEEPSEEK_LAYERS=2 DEEPSEEK_LAYER=2 \
+  DEEPSEEK_CKPT=/models/deepseekv41-flash DEEPSEEK_REF_LAYER=/golden/deepseek-ref/layer2 \
+  cargo test -p malleus-model --release -- an_isolated_layer_attention_matches -- --ignored --nocapture
+MALLEUS_MODELS=/mnt/usb scripts/dev.sh env DEEPSEEK_CKPT=/models/deepseekv41-flash \
+  DEEPSEEK_ENGRAM=/golden/deepseek-engram DEEPSEEK_ENGRAM_TABLE=/models/deepseek-v41-flash-engram.malleus \
+  DEEPSEEK_REF_ENGRAM=/golden/deepseek-ref/engram1 \
+  cargo test -p malleus-model --release -- the_engram -- --ignored --nocapture
+
+# serving it (issue #121): the host graph is CPU-only, so no device is needed, and the Engram companion file is
+# skipped from the catalog on its own (it has no `embed.weight`); the state comes from the environment.
+MALLEUS_DEEPSEEK_ENGRAM_STATE=/golden/deepseek-engram /target/release/malleus serve \
+  --models-dir /models --host 0.0.0.0 --port 8090 --ctx 4096
 ```
 
 ## How these numbers are produced

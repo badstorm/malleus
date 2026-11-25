@@ -172,11 +172,11 @@ def init_weights(model: torch.nn.Module) -> None:
                 p.normal_(0.0, 0.05)
 
 
-def export_safetensors(model, tokenizer_free_args, out: Path) -> None:
+def export_safetensors(model, tokenizer_free_args, out: Path) -> dict[str, "torch.Tensor"]:
     """Writes the module's parameters under the release's names (the same names `deepseek::expected` lists)."""
     from safetensors.torch import save_file
 
-    sd = {}
+    sd: dict[str, torch.Tensor] = {}
     t = model
 
     def add(name, tensor):
@@ -279,6 +279,7 @@ def export_safetensors(model, tokenizer_free_args, out: Path) -> None:
         },
     }
     (out / "config.json").write_text(json.dumps(cfg, indent=1) + "\n")
+    return sd
 
 
 def main() -> None:
@@ -301,7 +302,12 @@ def main() -> None:
     init_weights(model)
     model.eval()
     a.out.mkdir(parents=True, exist_ok=True)
-    export_safetensors(model, args, a.out)
+    sd = export_safetensors(model, args, a.out)
+    # The engine reads the file this script just wrote, and that file is bf16: run the reference on the same
+    # rounded values. Otherwise the comparison below measures the storage, not the graph — on a random model a
+    # near-tie in the indexer then flips a slot and the logits land at 0.997 instead of at f32 noise.
+    unexpected = model.load_state_dict({k: v.float() for k, v in sd.items()}, strict=False).unexpected_keys
+    assert not unexpected, unexpected
 
     # The prompt: a fixed sequence, so the Rust side reads the same token ids from the manifest.
     g = torch.Generator().manual_seed(a.seed)
