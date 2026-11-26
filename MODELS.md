@@ -36,7 +36,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Hy4-flash (text + images) | `hy4-flash-mls4-mls8-dense.malleus` | 121.9 GB | **dense only** (406 tensors) | The 1M-window model. 90.5 GB on the device; golden 18/21, 89.95 % all-position, worst KL 1.247. The routed experts have no MLS8 copy: they do not fit. `MALLEUS_PREFILL_WEIGHTS=none` leaves the copies on the host. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
 | DeepSeek-V4.1-flash (text) | `deepseek-v41-flash-mls2.malleus` + `deepseek-v41-flash-engram.malleus` | 162.5 GB + 99.8 GB | no | Host graph only (issues #83, #121): no kernels yet, so it runs in f32 on the CPU at 6.5-13.6 s a token. 2-bit backbone (MLS2), the two Engram tables at 4 bits a row (`RowI4`). Served, not production. |
-| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | **Production model since 2026-11-24**, at `MALLEUS_CTX=65536`: 16.7 GiB live after the warm-up (measured), decode 18.9 tok/s on a fresh session, 11.2 at 32K and 7.6 at 64K. The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring and the keys and values are fp16. The vision tower runs (issue #74); the MTP head is not wired yet. 256K fits the memory since issue #110 (22.7 GiB live) but not the clock: the fill is still ~2 h. |
+| Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.3 GB | no | **Production model since 2026-11-24**, at `MALLEUS_CTX=65536`: 16.7 GiB live after the warm-up (measured), decode 18.9 tok/s on a fresh session, **14.3 at 32K and 12.5 at 64K** (2026-11-26, the decode of #124 and the int8 cache of #131). The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring and the keys and values are int8 with one fp32 scale a (position, KV head) since #131. The vision tower runs (issue #74); the MTP head runs and is opt-in (`MALLEUS_MTP=1`), accepts ~40-50 % of first drafts and stays off. 256K fits the memory since issue #110 (22.7 GiB live) and the fill is ~50 min since the prefill staging of #139, not 2 h. |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
@@ -217,13 +217,19 @@ same `slot_shape` (issue #110):
 so the estimate and the allocator are compared on every run rather than argued about. 8-bit K/V is still worth
 another 4 GiB at 256K (issue #106).
 
-The depth curve behind that decision (`bench --depth 32768,65536,131072 --chunk 512`, 2026-11-24, single runs):
+The depth curve behind that decision (`bench --depth 32768,65536,131072 --chunk 512`, single runs). Both columns
+moved on 2026-11-26: the decode with the four-key dot of #124 and the int8 K/V of #131, the fill with the vectorized
+staging of the prefill attention (#139), which took the attention from one element at a time to a key's sixteen dims a
+lane and was bit-identical on both `golden` columns.
 
 | depth | `pp512` | `tg4` | fill |
 |---|---|---|---|
-| 32 768 | 116.4 | 11.19 | 165 tok/s |
-| 65 536 | 65.2 | 7.62 | 64.7 |
-| 131 072 | 39.0 | 5.70 | 49.4 |
+| 32 768 | **165.1** (116.4) | **14.27** (11.19) | **215.7** tok/s (165) |
+| 65 536 | **111.4** (65.2) | **12.48** (7.62) | **132.3** (64.7) |
+| 131 072 | **66.8** (39.0) | **8.97** (5.70) | **83.6** (49.4) |
+
+The parenthesized numbers are the 2026-11-24 ones: `pp512` **+42/+71/+71 %**, the fill **+31/+104/+69 %**, `tg4`
+**+28/+64/+57 %**.
 
 A decode step at depth costs `~45 ms + 1.34 µs per position`, i.e. the eight full streams read 32 KiB a position at
 ~24 GB/s of effective traffic. `rocprofv3` on a step at 32K: attention **40 %**, the grouped experts 26 %, the dense
