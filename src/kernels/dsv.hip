@@ -214,3 +214,56 @@ extern "C" __global__ void dsv_hc_post(float* out, const float* x, const float* 
     for (int c = 0; c < hc; ++c) v += comb[c * hc + e] * res[(size_t)c * hidden + d];
     out[i] = v;
 }
+
+// The SwiGLU of a DeepSeek expert: the gate is clamped *before* its silu (the reference's
+// `min(gate, limit)` then `silu`), the up path is clamped symmetrically, and the router's weight folds into the
+// product so the down projection is one GEMV per expert and one accumulation. `limit` of 0 is no clamp at all.
+extern "C" __global__ void dsv_swiglu(float* out, const float* gate, const float* up, int n, float limit,
+                                      float weight) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i], u = up[i];
+    if (limit > 0.f) {
+        g = fminf(g, limit);
+        u = fmaxf(fminf(u, limit), -limit);
+    }
+    out[i] = weight * (g / (1.f + expf(-g))) * u;
+}
+
+// The router of one position, one thread: `sqrt(softplus(score))` on every expert, the top-k by that score plus the
+// steering bias (which does *not* enter the weights), then the optional renormalisation and the route scale. The host
+// graph is `deepseek_text::moe`; the bias only steers, so the weights come from the raw scores.
+extern "C" __global__ void dsv_route(int* ids, float* wts, const float* scores, const float* bias, int experts,
+                                     int top_k, int renorm, float scale, int scratch) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    extern __shared__ float s[];
+    float* sc = s;
+    int* used = (int*)(s + scratch);
+    for (int e = 0; e < experts; ++e) {
+        const float x = scores[e];
+        // torch's softplus threshold: above 20 the exponential would only add noise (and overflow past 88).
+        sc[e] = x > 20.f ? sqrtf(x) : sqrtf(log1pf(expf(x)));
+        used[e] = 0;
+    }
+    for (int j = 0; j < top_k; ++j) {
+        int best = -1;
+        float bestv = -INFINITY;
+        for (int e = 0; e < experts; ++e) {
+            if (used[e]) continue;
+            const float v = sc[e] + (bias ? bias[e] : 0.f);
+            if (v > bestv) {
+                bestv = v;
+                best = e;
+            }
+        }
+        ids[j] = best;
+        wts[j] = best >= 0 ? sc[best] : 0.f;
+        if (best >= 0) used[best] = 1;
+    }
+    if (renorm && top_k > 1) {
+        float sum = 1e-20f;
+        for (int j = 0; j < top_k; ++j) sum += wts[j];
+        for (int j = 0; j < top_k; ++j) wts[j] /= sum;
+    }
+    for (int j = 0; j < top_k; ++j) wts[j] *= scale;
+}

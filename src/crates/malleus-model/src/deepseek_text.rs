@@ -688,6 +688,41 @@ impl Weights {
         Ok(h)
     }
 
+    /// One block on the streams `h`, the way the stack runs it: the Engram lookup, the attention sub-layer between its
+    /// hyper-connections, then the FFN. `bank` is where the routed experts come from (`StreamedExperts` reads them
+    /// from the file). This is the host side of the device block's gate; a block with an Engram table needs its hash
+    /// ids and is not served by it.
+    pub fn block_stage_with(
+        &self,
+        index: usize,
+        h: &[f32],
+        pre_mix: &[f32],
+        t: usize,
+        bank: &mut dyn ExpertBank,
+        mut hook: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        let l = self.layers.get(index).context("no such layer loaded")?;
+        let mut shared = Shared::default();
+        let mut h = h.to_vec();
+        let mut pre_mix = pre_mix.to_vec();
+        let mut main = Vec::new();
+        self.block(
+            l,
+            index,
+            &mut h,
+            &mut pre_mix,
+            t,
+            &mut shared,
+            bank,
+            None,
+            None,
+            None,
+            &mut main,
+            &mut hook,
+        )?;
+        Ok(h)
+    }
+
     /// One block without its routed experts, its token table and its head: the host side of a stage gate, which
     /// runs one layer's attention (or its experts) against the device and never reads 54 GB of experts or 10 GB of
     /// table. `attention_stage` is then layer 0 of `layers`.
@@ -2927,6 +2962,8 @@ pub(crate) fn moe(
     }
     // The bias steers the selection only; the weights come from the raw scores.
     let mut out = vec![0f32; t * hidden];
+    // The selection of every position, for the device gate: the ids it takes and the weights it gives them.
+    let (mut all_ids, mut all_w) = (Vec::with_capacity(t * top_k), Vec::with_capacity(t * top_k));
     for i in 0..t {
         // An image-span token routes with the VL bias (`noaux_tc_for_vl`): it steers the selection only.
         let bias = match (&m.bias_vl, image_mask) {
@@ -2946,6 +2983,8 @@ pub(crate) fn moe(
         for v in w.iter_mut() {
             *v *= d.route_scale;
         }
+        all_ids.extend(top.iter().map(|&e| e as f32));
+        all_w.extend(w.iter().copied());
         let xi = &x[i * hidden..(i + 1) * hidden];
         let limit = d.swiglu_limit;
         for (slot, &e) in top.iter().enumerate() {
@@ -2963,6 +3002,8 @@ pub(crate) fn moe(
             *o += v;
         }
     }
+    hook(&format!("ffn_ids{layer}"), &all_ids)?;
+    hook(&format!("ffn_w{layer}"), &all_w)?;
     Ok(out)
 }
 
