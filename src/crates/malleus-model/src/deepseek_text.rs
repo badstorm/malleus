@@ -125,7 +125,7 @@ pub fn load_matrix(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Re
         }
         // Our own quantized formats. The codes are rotated with the Hadamard signs, so a row is dequantised
         // group by group and then unrotated; RowI4 is the Engram table, which is never rotated.
-        DType::Mls2 | DType::Mls3 | DType::Mls4 | DType::Mls8 | DType::RowI4 => {
+        DType::Mls1 | DType::Mls2 | DType::Mls3 | DType::Mls4 | DType::Mls8 | DType::RowI4 => {
             ensure!(
                 info.shape == [n, k],
                 "{name}: shape {:?}, expected [{n}, {k}]",
@@ -136,24 +136,42 @@ pub fn load_matrix(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Re
             let signs = malleus_gguf::quant::hadamard_signs(malleus_gguf::quant::HADAMARD_SEED);
             let mut w = vec![0f32; n * k];
             match info.dtype {
+                DType::Mls1 => {
+                    // One e4m3 scale per 32 values, one sign bit each.
+                    ensure!(
+                        raw.len() == n * k.div_ceil(malleus_gguf::quant::INT1_GROUP),
+                        "{name}: scale of {} bytes for a {n}x{k} group grid",
+                        raw.len()
+                    );
+                    let groups = k / malleus_gguf::quant::INT1_GROUP;
+                    parallel_chunks(&mut w, k, |r, row| {
+                        for g in 0..groups {
+                            let s = malleus_gguf::fpquant::e4m3(raw[r * groups + g]);
+                            let mut out = [0f32; malleus_gguf::quant::INT1_GROUP];
+                            let at = r * k / 8 + g * malleus_gguf::quant::INT1_GROUP_BYTES;
+                            malleus_gguf::quant::dequant_int1(&codes[at..], s, &mut out);
+                            row[g * malleus_gguf::quant::INT1_GROUP..][..malleus_gguf::quant::INT1_GROUP]
+                                .copy_from_slice(&out);
+                        }
+                        malleus_gguf::quant::unrotate_row(row, &signs);
+                    });
+                }
                 DType::RowI4 => {
                     let scales = f16_scales(&raw)?;
                     ensure!(scales.len() == n, "{name}: {} row scales", scales.len());
-                    for r in 0..n {
-                        let row = &mut w[r * k..(r + 1) * k];
+                    parallel_chunks(&mut w, k, |r, row| {
                         malleus_gguf::quant::dequant_rows_i4(&codes[r * k / 2..(r + 1) * k / 2], scales[r], row);
-                    }
+                    });
                 }
                 DType::Mls8 => {
                     let scales = f32_scales(&raw)?;
                     ensure!(scales.len() == n, "{name}: {} row scales", scales.len());
-                    for r in 0..n {
-                        let row = &mut w[r * k..(r + 1) * k];
+                    parallel_chunks(&mut w, k, |r, row| {
                         for (o, &b) in row.iter_mut().zip(&codes[r * k..(r + 1) * k]) {
                             *o = b as i8 as f32 * scales[r];
                         }
                         malleus_gguf::quant::unrotate_row(row, &signs);
-                    }
+                    });
                 }
                 DType::Mls2 | DType::Mls3 | DType::Mls4 => {
                     let scales = f16_scales(&raw)?;
@@ -165,8 +183,7 @@ pub fn load_matrix(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Re
                         DType::Mls3 => malleus_gguf::quant::BLOCK / 8 * 3,
                         _ => malleus_gguf::quant::BLOCK / 2,
                     };
-                    for r in 0..n {
-                        let row = &mut w[r * k..(r + 1) * k];
+                    parallel_chunks(&mut w, k, |r, row| {
                         for g in 0..groups {
                             let at = r * groups * per + g * per;
                             let mut out = [0f32; malleus_gguf::quant::BLOCK];
@@ -192,7 +209,7 @@ pub fn load_matrix(src: &dyn TensorSource, name: &str, n: usize, k: usize) -> Re
                                 .copy_from_slice(&out);
                         }
                         malleus_gguf::quant::unrotate_row(row, &signs);
-                    }
+                    });
                 }
                 _ => unreachable!(),
             }
@@ -3160,6 +3177,33 @@ mod tests {
         );
         assert!(cos > 0.999, "attn{layer} diverges: {cos}");
         let _ = manifest;
+    }
+
+    /// One bit per expert weight against the checkpoint: what the leanest format costs on the real weights, which
+    /// is the number the "how much can the backbone lose" experiment starts from.
+    ///
+    ///   DEEPSEEK_FILE=/golden/deepseek-1bit-slice.malleus DEEPSEEK_CKPT=/models/deepseekv41-flash
+    #[test]
+    #[ignore = "reads one real layer of a converted file and the checkpoint"]
+    fn a_one_bit_expert_round_trips() {
+        let file = std::env::var("DEEPSEEK_FILE").expect("DEEPSEEK_FILE");
+        let ckpt = std::env::var("DEEPSEEK_CKPT").expect("DEEPSEEK_CKPT");
+        let g = Gguf::open(std::path::Path::new(&file)).unwrap();
+        let src = SafeTensors::open_dir(std::path::Path::new(&ckpt)).unwrap();
+        for suffix in [
+            "ffn.experts.0.w1.weight",
+            "ffn.experts.0.w2.weight",
+            "ffn.experts.0.w3.weight",
+        ] {
+            let name = format!("layers.0.{suffix}");
+            let info = g.info(&name).unwrap();
+            let (n, k) = (info.shape[0], info.shape[1]);
+            assert_eq!(info.dtype, malleus_gguf::DType::Mls1, "{name}: {:?}", info.dtype);
+            let got = load_matrix(&g, &name, n, k).unwrap();
+            let want = load_matrix(&src, &name, n, k).unwrap();
+            let cos = compare(&name, &got, &want);
+            assert!(cos > 0.5, "{name}: {cos}");
+        }
     }
 
     /// A sample across the stack, through the loader: every layer has its own rotation and its own scales, and

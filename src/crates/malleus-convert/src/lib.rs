@@ -661,6 +661,36 @@ pub(crate) fn quantize_mls3(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>)
     (q, s)
 }
 
+/// 1 bit per value: the sign of each, one e4m3 scale per 32. Rows are rotated like every other MLS format, so the
+/// codes are the signs of a rotated Gaussian — which is what makes a single bit carry as much as it can.
+pub(crate) fn quantize_mls1(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    use malleus_gguf::quant::{INT1_GROUP, hadamard_signs, quantize_group_int1, rotate_row};
+    let signs = hadamard_signs(HADAMARD_SEED);
+    let groups = k / INT1_GROUP;
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+        .into_par_iter()
+        .map(|r| {
+            let mut row = w[r * k..(r + 1) * k].to_vec();
+            rotate_row(&mut row, &signs);
+            let mut q = Vec::with_capacity(k / 8);
+            let mut s = Vec::with_capacity(groups);
+            for grp in row.as_chunks::<INT1_GROUP>().0 {
+                let (bits, sc) = quantize_group_int1(grp);
+                q.extend_from_slice(&bits);
+                s.push(malleus_gguf::fpquant::e4m3_code(sc));
+            }
+            (q, s)
+        })
+        .collect();
+    let mut q = Vec::with_capacity(n * k / 8);
+    let mut s = Vec::with_capacity(n * groups);
+    for (a, b) in rows {
+        q.extend(a);
+        s.extend(b);
+    }
+    (q, s)
+}
+
 pub(crate) fn quantize_mls2(w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     let signs = quant::hadamard_signs(HADAMARD_SEED);
     let g = k / BLOCK;

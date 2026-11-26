@@ -17,6 +17,32 @@ pub const E2M1: [f32; 16] = [
 /// Columns covered by one NVFP4 scale.
 pub const NVFP4_BLOCK: usize = 16;
 /// Columns covered by one MXFP8 scale.
+/// The e4m3 byte nearest to `v`, saturating at the largest finite code (448). Used by the 1-bit format, whose
+/// groups share one of these instead of an fp16: four bits of scale per 32 values is what a sign-only code can
+/// afford, and it tracks the amplitude where it moves.
+pub fn e4m3_code(v: f32) -> u8 {
+    let sign: u8 = if v < 0.0 { 0x80 } else { 0 };
+    let a = v.abs().min(448.0);
+    if a == 0.0 {
+        return sign;
+    }
+    if a < 1.0 / 64.0 {
+        return sign | (a * 512.0).round().clamp(0.0, 7.0) as u8;
+    }
+    let mut e = a.log2().floor() as i32;
+    let mut m = ((a / 2f32.powi(e) - 1.0) * 8.0).round() as i32;
+    if m == 8 {
+        e += 1;
+        m = 0;
+    }
+    let biased = e + 7;
+    // The largest finite code is 448 (exponent 15, mantissa 6); a full mantissa at that exponent is the NaN.
+    if biased > 15 || (biased == 15 && m > 6) {
+        return sign | 0x7e;
+    }
+    sign | ((biased as u8) << 3) | (m as u8)
+}
+
 pub const MXFP8_BLOCK: usize = 32;
 /// What an e2m1 code and an e4m3 scale can hold together: the outer scale of an NVFP4 expert is `amax / this`.
 pub const NVFP4_FULL_SCALE: f32 = 6.0 * 448.0;
@@ -90,6 +116,49 @@ pub fn mxfp8_rows(values: &[u8], scales: &[u8], cols: usize, out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e4m3_code_round_trips_every_byte() {
+        // Every finite code must encode back to itself, or the 1-bit format's scales drift.
+        for code in 0u16..=0xfe {
+            let code = code as u8;
+            // The NaN, and the negative zero (which is a zero, so its sign is not carried by the value).
+            if code & 0x7f == 0x7f || code & 0x7f == 0 {
+                continue;
+            }
+            let v = e4m3(code);
+            assert_eq!(e4m3_code(v), code, "code {code:#x} ({v}) does not round-trip");
+        }
+        assert_eq!(
+            e4m3(e4m3_code(1e-7)),
+            0.0,
+            "a vanishing scale is the smallest subnormal, not a NaN"
+        );
+        assert_eq!(e4m3(e4m3_code(1e9)), 448.0, "a huge scale saturates");
+    }
+
+    #[test]
+    fn an_int1_group_keeps_the_signs_and_the_least_squares_scale() {
+        // One scale for the whole group: the error it cannot avoid is the magnitudes', so what the test pins is that
+        // the scale is the group's mean magnitude (e4m3-rounded) and that no nearby scale does better.
+        let g: Vec<f32> = (0..32).map(|i| if i % 3 == 0 { -0.25 } else { 0.75 }).collect();
+        let (bits, s) = crate::quant::quantize_group_int1(&g);
+        let mean = g.iter().map(|v| v.abs()).sum::<f32>() / 32.0;
+        assert!((s - mean).abs() / mean < 0.07, "scale {s} against a mean of {mean}");
+        let mut back = [0f32; 32];
+        crate::quant::dequant_int1(&bits, s, &mut back);
+        let err = |scale: f32| -> f32 { g.iter().zip(&back).map(|(a, b)| (a - b.signum() * scale).powi(2)).sum() };
+        for step in [-0.12f32, 0.12] {
+            assert!(
+                err(s) <= err(s * (1.0 + step)) * 1.02,
+                "the scale is not at the minimum"
+            );
+            let _ = step;
+        }
+        for (a, b) in g.iter().zip(&back) {
+            assert_eq!(a.signum(), b.signum(), "{a} came back as {b}");
+        }
+    }
 
     #[test]
     fn e4m3_covers_its_range() {
