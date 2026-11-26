@@ -1372,11 +1372,15 @@ fn argmax(v: &[f32], n: usize) -> u32 {
 /// are fp16, so at 8 KV heads x 128 that is 4 KiB per token per slot: 34.5 KiB a position over the 8 slots of the
 /// full layers, which are the ones that keep the whole context.
 pub struct Slot {
-    /// [`rows`, kv_heads * head_dim] fp16, the keys after the convolution, the clip and the L2 norm: half the bytes
-    /// of fp32 and the same rounding the reference uses for its own cache. The convolution histories below stay
-    /// fp32 — they are inputs, not the cache.
+    /// [`rows`, kv_heads * head_dim] int8, the keys after the convolution, the clip and the L2 norm, with one fp32
+    /// scale per (row, KV head) in `ks`: half the bytes of the fp16 cache, and eight bits of mantissa instead of the
+    /// four an e4m3 code carries (issue #106, item 2). The convolution histories below stay fp32 — they are inputs,
+    /// not the cache.
     k: DeviceBuffer,
     v: DeviceBuffer,
+    /// [`rows`, kv_heads] fp32, the scale of each head's 128 values, in the row's own (ring-wrapped) index.
+    ks: DeviceBuffer,
+    vs: DeviceBuffer,
     /// Rows of `k`/`v`, and the ring they are indexed with: a sliding layer only ever reads the last `window` keys,
     /// so its cache is a ring of `slot_shape` rows and position `p` lives at `p % ring`. A full-attention layer has no
     /// ring (0) and position `p` is row `p`, with `rows == max`.
@@ -1419,6 +1423,9 @@ pub struct Cache {
 pub struct Draft {
     k: Vec<DeviceBuffer>,
     v: Vec<DeviceBuffer>,
+    /// [`rows`, kv_heads] fp32, one scale per (row, KV head), as the target's cache.
+    ks: Vec<DeviceBuffer>,
+    vs: Vec<DeviceBuffer>,
     rows: usize,
     len: usize,
     base_pos: usize,
@@ -1477,8 +1484,8 @@ fn slot_shape(i: &Inkling2Config, full: bool, ctx: usize) -> (usize, usize) {
     (rows, if rows == ctx { 0 } else { rows })
 }
 
-/// Bytes the cache of a session of `ctx` tokens asks the device for: the keys and values of every slot, the four
-/// three-row convolution histories, the bias row of the decode query, `tau` and the MTP rows.
+/// Bytes the cache of a session of `ctx` tokens asks the device for: the int8 keys and values of every slot with
+/// their scales, the four three-row convolution histories, the bias row of the decode query, `tau` and the MTP rows.
 ///
 /// This is `Cache::new` priced, not an estimate: both go through `slot_shape`, so the pre-flight and the allocator
 /// cannot drift (`memplan::session_bytes` returns this for the family).
@@ -1487,12 +1494,13 @@ pub fn session_bytes(cfg: &Config, ctx: usize) -> u64 {
         return 0;
     };
     let kvd = (i.kv_heads * i.head_dim) as u64;
-    // The histories are fp32: inputs of the short convolutions, not the cache.
+    // The histories are fp32: inputs of the short convolutions, not the cache. Keys and values are int8 with one
+    // fp32 scale per (row, KV head), which the SSA/DS buffer sizing below mirrors.
     let hist = 2 * (3 * kvd * 4) + 2 * (3 * cfg.hidden as u64 * 4);
     let mut t = 0u64;
     for s in 0..n_slots(i, cfg.n_layers) {
         let (rows, _) = slot_shape(i, cfg.kind[slot_layer(i, cfg.n_layers, s)] == MixerKind::AttnFull, ctx);
-        t += rows as u64 * kvd * 2 * 2 + hist;
+        t += rows as u64 * kvd * 2 + rows as u64 * i.kv_heads as u64 * 8 + hist;
     }
     t += (i.heads * ctx * 4) as u64;
     t += 4;
@@ -1501,7 +1509,8 @@ pub fn session_bytes(cfg: &Config, ctx: usize) -> u64 {
     // The draft head's context: one K/V row per committed token per draft layer, plus the block's own rows.
     if let Some(m) = i.mtp.as_ref() {
         let d = (m.kv_heads * m.head_dim) as u64;
-        t += m.layers as u64 * 2 * (ctx as u64 + DRAFT_ROWS as u64) * d * 2;
+        t += m.layers as u64 * 2 * (ctx as u64 + DRAFT_ROWS as u64) * d;
+        t += m.layers as u64 * 2 * (ctx as u64 + DRAFT_ROWS as u64) * m.kv_heads as u64 * 4;
         t += (m.heads * (ctx + DRAFT_ROWS) * 4) as u64;
     }
     t
@@ -1517,8 +1526,10 @@ impl Cache {
             let full = c.kind[slot_layer(i, c.n_layers, s)] == MixerKind::AttnFull;
             let (rows, ring) = slot_shape(i, full, max_ctx);
             out.push(Slot {
-                k: DeviceBuffer::alloc(rows * kvd * 2)?,
-                v: DeviceBuffer::alloc(rows * kvd * 2)?,
+                k: DeviceBuffer::alloc(rows * kvd)?,
+                v: DeviceBuffer::alloc(rows * kvd)?,
+                ks: f32s(rows * i.kv_heads)?,
+                vs: f32s(rows * i.kv_heads)?,
                 rows,
                 ring,
                 // Zeroed: the taps before the first token are the reference's left padding.
@@ -1534,13 +1545,20 @@ impl Cache {
                 let rows = max_ctx + DRAFT_ROWS;
                 let mut k = Vec::with_capacity(m.layers);
                 let mut v = Vec::with_capacity(m.layers);
+                let mut ks = Vec::with_capacity(m.layers);
+                let mut vs = Vec::with_capacity(m.layers);
                 for _ in 0..m.layers {
-                    k.push(DeviceBuffer::alloc(rows * d * 2)?);
-                    v.push(DeviceBuffer::alloc(rows * d * 2)?);
+                    // int8 codes with one fp32 scale a head: the same cache as the target's, half the bytes.
+                    k.push(DeviceBuffer::alloc(rows * d)?);
+                    v.push(DeviceBuffer::alloc(rows * d)?);
+                    ks.push(f32s(rows * m.kv_heads)?);
+                    vs.push(f32s(rows * m.kv_heads)?);
                 }
                 Some(Draft {
                     k,
                     v,
+                    ks,
+                    vs,
                     rows,
                     len: 0,
                     base_pos: 0,
@@ -2171,20 +2189,25 @@ impl Graph {
         clip(model, st, &self.r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
         // The keys and values of this layer, as attention reads them, across every position the session holds.
         if let Some(p) = place.as_mut() {
-            for (dst, src) in [(&p.slot.k, &self.k), (&p.slot.v, &self.v)] {
+            for (dst, dsc, src) in [
+                (&p.slot.k, &p.slot.ks, &self.k),
+                (&p.slot.v, &p.slot.vs, &self.v),
+            ] {
                 model.k.get("inkling2_kv_store").launch(
-                    ((t * kvd).div_ceil(256) as u32, 1, 1),
+                    (((t * kv).div_ceil(8)) as u32, 1, 1),
                     (256, 1, 1),
                     0,
                     st,
                     &[
                         dst.into(),
+                        dsc.into(),
                         src.into(),
                         p.pos.into(),
                         t.into(),
                         p.slot.rows.into(),
                         p.slot.ring.into(),
                         kvd.into(),
+                        hd.into(),
                     ],
                 )?;
             }
@@ -2221,7 +2244,15 @@ impl Graph {
                 &self.q,
                 &self.k,
                 &self.v,
-                Some((&p.slot.k, &p.slot.v, p.slot.rows, p.slot.ring, p.pos)),
+                Some((
+                    &p.slot.k,
+                    &p.slot.ks,
+                    &p.slot.v,
+                    &p.slot.vs,
+                    p.slot.rows,
+                    p.slot.ring,
+                    p.pos,
+                )),
                 &self.r,
                 &layer.rel_logits,
                 &self.sink,
@@ -2278,7 +2309,9 @@ impl Graph {
                         Arg::U64(self.attn_out.addr() + qd),
                         Arg::U64(self.q.addr() + qd),
                         (&p.slot.k).into(),
+                        (&p.slot.ks).into(),
                         (&p.slot.v).into(),
+                        (&p.slot.vs).into(),
                         p.bias.into(),
                         Arg::U64(self.sink.addr() + (j * heads * 4) as u64),
                         Arg::U64(self.gate.addr() + qd),
@@ -3504,7 +3537,15 @@ fn attn_wmma(
     q: &DeviceBuffer,
     k: &DeviceBuffer,
     v: &DeviceBuffer,
-    cache: Option<(&DeviceBuffer, &DeviceBuffer, usize, usize, usize)>,
+    cache: Option<(
+        &DeviceBuffer,
+        &DeviceBuffer,
+        &DeviceBuffer,
+        &DeviceBuffer,
+        usize,
+        usize,
+        usize,
+    )>,
     rel: &DeviceBuffer,
     proj: &DeviceBuffer,
     sink: &DeviceBuffer,
@@ -3523,7 +3564,9 @@ fn attn_wmma(
     } else {
         "inkling2_attn_wmma"
     };
-    let (ck, cv, rows, ring, pos) = cache.unwrap_or((k, v, 0, 0, 0));
+    // Without a cache the tile reads this call's own keys and values (`CACHED == false`) and never touches the four
+    // cache pointers, so they can point at anything valid.
+    let (ck, cks, cv, cvs, rows, ring, pos) = cache.unwrap_or((k, sink, v, sink, 0, 0, 0));
     model.k.get(name).launch(
         ((t.div_ceil(16) * heads) as u32, 1, 1),
         (128, 1, 1),
@@ -3537,6 +3580,8 @@ fn attn_wmma(
             v.into(),
             ck.into(),
             cv.into(),
+            cks.into(),
+            cvs.into(),
             rows.into(),
             ring.into(),
             pos.into(),
@@ -3723,7 +3768,7 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
             ],
         )?;
         raw_gemm(model, st, &vb, &mix, &l.v_ctx, rows, kvd, h)?;
-        for (dst, src) in [(&d.k[s], &kb), (&d.v[s], &vb)] {
+        for (dst, dsc, src) in [(&d.k[s], &d.ks[s], &kb), (&d.v[s], &d.vs[s], &vb)] {
             model.k.get("inkling2_kv_store").launch(
                 ((rows * kvd).div_ceil(256) as u32, 1, 1),
                 (256, 1, 1),
@@ -3731,6 +3776,7 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
                 st,
                 &[
                     dst.into(),
+                    dsc.into(),
                     src.into(),
                     (d.base_pos + d.len).into(),
                     rows.into(),
@@ -3949,7 +3995,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
         }
         // The block's own keys go into the same cache the context lives in, after it: row `r` sees every committed
         // token and the rows of the block before it.
-        for (dst, src) in [(&d.k[s], &kb), (&d.v[s], &vb)] {
+        for (dst, dsc, src) in [(&d.k[s], &d.ks[s], &kb), (&d.v[s], &d.vs[s], &vb)] {
             model.k.get("inkling2_kv_store").launch(
                 ((rows * kvd).div_ceil(256) as u32, 1, 1),
                 (256, 1, 1),
@@ -3957,6 +4003,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                 st,
                 &[
                     dst.into(),
+                    dsc.into(),
                     src.into(),
                     base.into(),
                     rows.into(),
@@ -3983,7 +4030,9 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                     Arg::U64(attn.addr() + (r * qd * 4) as u64),
                     Arg::U64(q.addr() + (r * qd * 4) as u64),
                     (&d.k[s]).into(),
+                    (&d.ks[s]).into(),
                     (&d.v[s]).into(),
+                    (&d.vs[s]).into(),
                     (&d.bias).into(),
                     Arg::Ptr(0),
                     Arg::Ptr(0),
