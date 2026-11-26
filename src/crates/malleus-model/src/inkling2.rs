@@ -2222,10 +2222,7 @@ impl Graph {
         clip(model, st, &self.r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
         // The keys and values of this layer, as attention reads them, across every position the session holds.
         if let Some(p) = place.as_mut() {
-            for (dst, dsc, src) in [
-                (&p.slot.k, &p.slot.ks, &self.k),
-                (&p.slot.v, &p.slot.vs, &self.v),
-            ] {
+            for (dst, dsc, src) in [(&p.slot.k, &p.slot.ks, &self.k), (&p.slot.v, &p.slot.vs, &self.v)] {
                 model.k.get("inkling2_kv_store").launch(
                     (((t * kv).div_ceil(8)) as u32, 1, 1),
                     (256, 1, 1),
