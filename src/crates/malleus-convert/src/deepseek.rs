@@ -329,6 +329,10 @@ pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&s
             .info(name)
             .ok_or_else(|| anyhow::anyhow!("{name}: not in the checkpoint"))?;
         let pick = alloc.pick(&allocation_key(name));
+        if pick == Pick::Skip {
+            // Named in the map as `SKIP`: a tensor another file already carries (the Engram tables).
+            continue;
+        }
         let companion = format!("{}.scale", name.trim_end_matches(".weight"));
         let scale = st.info(&companion).map(|_| companion.clone());
         if pick == Pick::Keep || scale.is_none() {
@@ -439,6 +443,7 @@ pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&s
                         bytes += tensor_size(DType::RowI4, shape) + lead.iter().product::<usize>() * 2;
                     }
                     Pick::Keep => unreachable!("Keep is planned as Raw"),
+                    Pick::Skip => unreachable!("skipped in the plan"),
                 }
             }
         }
@@ -491,6 +496,7 @@ pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&s
                         Pick::Mls4 => quantize_mls4(&w32, block, k),
                         Pick::Mls8 => quantize_mls8(&w32, block, k),
                         Pick::RowI4 => quantize_rows_i4(&w32, block, k),
+                        Pick::Skip => unreachable!("skipped in the plan"),
                         Pick::Keep => unreachable!(),
                     };
                     sink.write(&q)?;

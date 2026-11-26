@@ -39,6 +39,9 @@ pub enum Pick {
     Mls8,
     /// 4-bit codes per row, for the Engram lookup tables.
     RowI4,
+    /// Leave the tensor out: the Engram tables are read from their own file (`malleus split`), and an experiment
+    /// that only changes the experts should not write 100 GB of a table it already has.
+    Skip,
 }
 
 impl Pick {
@@ -52,6 +55,7 @@ impl Pick {
             Pick::Mls4 => 4.0,
             Pick::Mls8 => 8.0,
             Pick::RowI4 => 4.0,
+            Pick::Skip => 0.0,
         }
     }
 
@@ -64,6 +68,7 @@ impl Pick {
             Pick::Mls4 => "mls4",
             Pick::Mls8 => "mls8",
             Pick::RowI4 => "rowi4",
+            Pick::Skip => "skip",
         }
     }
 
@@ -88,6 +93,7 @@ impl Pick {
             "IQ1_S" => Pick::Mls1,
             "IQ2_XXS" | "IQ2_XS" | "IQ2_S" | "IQ1_M" => Pick::Mls2,
             "IQ4_NL" => Pick::RowI4,
+            "SKIP" => Pick::Skip,
             other => bail!("unknown quantization type `{other}`"),
         })
     }
@@ -259,6 +265,7 @@ pub fn tensor_bytes(pick: Pick, dtype: DType, shape: &[usize], packed: bool) -> 
             let rows = shape.first().copied().unwrap_or(1) as u64;
             elems / 2 + rows * 2
         }
+        Pick::Skip => 0,
     }
 }
 
