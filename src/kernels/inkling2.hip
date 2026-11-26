@@ -273,25 +273,55 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
     for (int kc = k0; kc <= qlast; kc += IKA_KB) {
         // A B fragment is one column of the product's right operand, sixteen elements along the contraction: the
         // score's is a key's sixteen dims (K as it is), the output's is a dim's sixteen keys (V transposed).
-        for (int e = threadIdx.x; e < IKA_KB * dim; e += 128) {
-            const int j = e / dim, d = e % dim, s = kc + j;
-            const bool live = s <= qlast;
-            _Float16 kv = (_Float16)0.f, vv = (_Float16)0.f;
-            if (CACHED) {
-                const int row = live ? (ring > 0 ? s % ring : s) : 0;
-                if (live) {
-                    // int8 with one scale per (position, KV head): the staging into shared is where the prefill
-                    // reads the cache, so this is the only place the format shows there (issue #106, item 2).
+        // One thread takes sixteen contiguous dims of one key and writes them as one half vector: the same chunk of
+        // shared, staged with a sixteenth of the instructions. A 16-byte `int4` of int8 codes a lane is what the cache
+        // holds (issue #106, item 2); a fresh prefill's own keys and values are f32, four `float4` loads a lane. Per
+        // element the old loop was a one-byte load, two converts and a multiply, and `rocprofv3` put ~40 % of this
+        // kernel's time in it (issue #110, item 5).
+        const int units = IKA_KB * (dim / 16);
+        for (int e = threadIdx.x; e < units; e += 128) {
+            const int j = e / (dim / 16), d0 = (e % (dim / 16)) * 16, s = kc + j;
+            _Float16 kv16[16], vv16[16];
+            if (s <= qlast) {
+                if (CACHED) {
+                    const int row = ring > 0 ? s % ring : s;
                     const int at = (int)((size_t)row * nkv + kh);
-                    kv = (_Float16)((float)ck[at * dim + d] * cks[at]);
-                    vv = (_Float16)((float)cv[at * dim + d] * cvs[at]);
+                    const int4 kb4 = *(const int4*)(ck + (size_t)at * dim + d0);
+                    const int4 vb4 = *(const int4*)(cv + (size_t)at * dim + d0);
+                    const signed char* kc8 = (const signed char*)&kb4;
+                    const signed char* vc8 = (const signed char*)&vb4;
+                    const float ksc = cks[at], vsc = cvs[at];
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        kv16[i] = (_Float16)((float)kc8[i] * ksc);
+                        vv16[i] = (_Float16)((float)vc8[i] * vsc);
+                    }
+                } else {
+                    const size_t at = ((size_t)s * nkv + kh) * dim + d0;
+                    const float4 k4[4] = {*(const float4*)(k + at), *(const float4*)(k + at + 4),
+                                          *(const float4*)(k + at + 8), *(const float4*)(k + at + 12)};
+                    const float4 v4[4] = {*(const float4*)(v + at), *(const float4*)(v + at + 4),
+                                          *(const float4*)(v + at + 8), *(const float4*)(v + at + 12)};
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        kv16[4 * i] = (_Float16)k4[i].x;
+                        kv16[4 * i + 1] = (_Float16)k4[i].y;
+                        kv16[4 * i + 2] = (_Float16)k4[i].z;
+                        kv16[4 * i + 3] = (_Float16)k4[i].w;
+                        vv16[4 * i] = (_Float16)v4[i].x;
+                        vv16[4 * i + 1] = (_Float16)v4[i].y;
+                        vv16[4 * i + 2] = (_Float16)v4[i].z;
+                        vv16[4 * i + 3] = (_Float16)v4[i].w;
+                    }
                 }
-            } else if (live) {
-                kv = (_Float16)k[((size_t)s * nkv + kh) * dim + d];
-                vv = (_Float16)v[((size_t)s * nkv + kh) * dim + d];
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) kv16[i] = vv16[i] = (_Float16)0.f;
             }
-            ks[j][d] = kv;
-            vt[d][j] = vv;
+            *(ik_h16*)&ks[j][d0] = *(const ik_h16*)kv16;
+            // V goes into shared transposed, which is the layout the product's B fragment reads.
+#pragma unroll
+            for (int i = 0; i < 16; ++i) vt[d0 + i][j] = vv16[i];
         }
         // The bias tile, as in the fp32 kernel: rel[q0+iq] . proj[:, (q0+iq) - (kc+j)], zero outside the extent or
         // the causal window of that row.
