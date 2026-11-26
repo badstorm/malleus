@@ -288,3 +288,135 @@ extern "C" __global__ void dsv_compress(float* out, const float* kv, const float
         out[g * hd + d] = acc / sum;
     }
 }
+
+// The indexer of an indexed layer: the keys are one row per compressed position (they come from the latent, through
+// `wk`, a norm and the rotation at the compressed base), and the score of a query against a key is the sum over the
+// indexer's heads of `relu(q . k)` weighted by a per-head projection of the layer's input. `deepseek_text::indexer`
+// is the reference: the mask of unreachable compressed rows is the caller's, and the top-k is the next kernel.
+extern "C" __global__ void dsv_ix_score(float* score, const float* q, const float* k, const float* w, int t, int heads,
+                                        int dim, int n_ix, float scale) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= t * n_ix) return;
+    const int pos = i / n_ix, j = i % n_ix;
+    const float* kj = k + (size_t)j * dim;
+    float acc = 0.f;
+    for (int h = 0; h < heads; ++h) {
+        const float* qh = q + ((size_t)pos * heads + h) * dim;
+        float d = 0.f;
+        for (int c = 0; c < dim; ++c) d += qh[c] * kj[c];
+        acc += fmaxf(d, 0.f) * w[(size_t)pos * heads + h] * scale;
+    }
+    score[(size_t)pos * n_ix + j] = acc;
+}
+
+// The selection of one position: the `topk` compressed rows that score highest, ties by ascending row, and then the
+// ones the position can actually reach (`compress_lens = (pos + 1) / ratio`) — the reference takes exactly `topk`
+// and keeps the reachable ones, so an unreachable row still occupies a slot. The list written is the one the
+// attention reads: the window slots first (as ring slots, `at % cap`), then the compressed rows as `cap + j`, and
+// `-1` where nothing is left to read.
+extern "C" __global__ void dsv_ix_topk(int* sel, const float* score, int pos, int n_ix, int topk, int ratio, int cap,
+                                       int window_slots) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 1) return;
+    extern __shared__ int used_s[];
+    int* used = used_s;
+    for (int j = 0; j < n_ix; ++j) used[j] = 0;
+    // One position a step: the scores and the list are this position's own, at offset zero. The layout the
+    // attention reads is `[window_slots window slots][topk compressed rows]`.
+    const int reach = (pos + 1) / ratio;
+    const float* sc = score;
+    int* out = sel;
+    for (int j = 0; j < window_slots; ++j) {
+        const int at = pos - window_slots + 1 + j;
+        out[j] = at >= 0 ? at % cap : -1;
+    }
+    // The `topk` rows the scores prefer, then the reachable ones in ascending order: the reference sorts what it
+    // picked, and the order of the sum the attention runs is the order of this list.
+    int taken = 0;
+    for (int slot = 0; slot < topk; ++slot) {
+        int best = -1;
+        float bestv = -INFINITY;
+        for (int j = 0; j < n_ix; ++j) {
+            if (used[j]) continue;
+            const float v = j < reach ? sc[j] : -INFINITY;
+            if (v > bestv) {
+                bestv = v;
+                best = j;
+            }
+        }
+        if (best < 0) break;
+        used[best] = 1;
+        if (best < reach) out[window_slots + taken++] = cap + best;
+    }
+    for (int i = 1; i < taken; ++i) {
+        const int v = out[window_slots + i];
+        int j = i - 1;
+        while (j >= 0 && out[window_slots + j] > v) {
+            out[window_slots + j + 1] = out[window_slots + j];
+            --j;
+        }
+        out[window_slots + j + 1] = v;
+    }
+    for (int i = taken; i < topk; ++i) out[window_slots + i] = -1;
+}
+
+// The sparse attention of one position over two buffers: the window's ring (`cap` rows, `at % cap`) and the
+// compressed latent (`n_ix` rows, `cap + j`). `sel` is the list `dsv_ix_topk` wrote, `-1` for a slot that is not
+// there; the sink joins the denominator exactly as it does in the window-only kernel.
+extern "C" __global__ void __launch_bounds__(256) dsv_attn_cached(float* out, const float* q, const float* ring,
+                                                                const float* ckv, const float* sink, const int* sel,
+                                                                int cap, int heads, int hd, int m, float scale) {
+    __shared__ float sh[8];
+    extern __shared__ float sc[]; // m scores and the denominator at sc[m]
+    const int h = blockIdx.x;
+    const float* qh = q + (size_t)h * hd;
+    const int* idx = sel;
+    for (int j = 0; j < m; ++j) {
+        const int at = idx[j];
+        if (at < 0) {
+            sc[j] = -INFINITY;
+            continue;
+        }
+        const float* row = at < cap ? ring + (size_t)at * hd : ckv + (size_t)(at - cap) * hd;
+        float acc = 0.f;
+        for (int d = threadIdx.x; d < hd; d += 256) acc += qh[d] * row[d];
+        acc = dsv_warp_sum(acc);
+        __syncthreads();
+        if (threadIdx.x % 32 == 0) sh[threadIdx.x / 32] = acc;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float tot = 0.f;
+            for (int r = 0; r < 8; ++r) tot += sh[r];
+            sc[j] = tot * scale;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float mx = -INFINITY;
+        for (int j = 0; j < m; ++j) mx = fmaxf(mx, sc[j]);
+        float sum = mx == -INFINITY ? 0.f : __expf(sink[h] - mx);
+        for (int j = 0; j < m; ++j) {
+            const float e = sc[j] == -INFINITY ? 0.f : __expf(sc[j] - mx);
+            sc[j] = e;
+            sum += e;
+        }
+        sc[m] = sum > 0.f ? 1.f / sum : 0.f;
+    }
+    __syncthreads();
+    float acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc[i] = 0.f;
+    for (int j = 0; j < m; ++j) {
+        const float w = sc[j];
+        if (w == 0.f) continue;
+        const int at = idx[j];
+        if (at < 0) continue;
+        const float* row = at < cap ? ring + (size_t)at * hd : ckv + (size_t)(at - cap) * hd;
+        int c = 0;
+        for (int d = threadIdx.x; d < hd; d += 256, ++c) acc[c] += w * row[d];
+    }
+    float* oh = out + (size_t)h * hd;
+    const float inv = sc[m];
+    int c = 0;
+    for (int d = threadIdx.x; d < hd; d += 256, ++c) oh[d] = acc[c] * inv;
+}

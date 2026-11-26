@@ -148,6 +148,15 @@ impl Uploader {
                 q: self.typed(src, &wn, DType::Mls8, &[n, k])?,
                 sc: self.typed(src, &format!("{wn}.scales"), DType::F32, &[n])?,
             },
+            // A release's blocked fp8 — DeepSeek-V4.1's indexer query, eight tensors of five million weights. There is
+            // no device path for that block format, and a kernel for it would serve nothing else: the host
+            // dequantises once and the weights go up as bf16, which every GEMV here reads.
+            DType::F8E4M3 => {
+                let w = crate::deepseek_text::load_matrix(src, &wn, n, k)?;
+                let b: Vec<half::bf16> = w.iter().map(|v| half::bf16::from_f32(*v)).collect();
+                self.bytes += b.len() * 2;
+                Weights::Bf16(DeviceBuffer::from_slice(&b)?)
+            }
             d => bail!("{wn}: unsupported dtype {d:?}"),
         };
         let family_ok = self.want_prefill(name);
