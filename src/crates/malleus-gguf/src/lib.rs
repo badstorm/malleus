@@ -23,6 +23,9 @@ pub enum DType {
     F4E2M1,
     I32,
     I64,
+    /// One bit per value with an e4m3 scale per 32 (1.25 bpw): the leanest format the engine reads, and the one a
+    /// test of "how much a DeepSeek backbone can lose" is run on.
+    Mls1,
     Mls2,
     Mls3,
     Mls4,
@@ -40,6 +43,7 @@ impl DType {
             DType::I8 | DType::U8 | DType::F8E4M3 | DType::F8E8M0 | DType::F4E2M1 => n,
             // MLS2 packs 4 codes per byte, MLS3 8 codes per 3 bytes; quantized tensors always have a K that is a
             // multiple of 128.
+            DType::Mls1 => n / 8,
             DType::Mls2 => n / 4,
             DType::Mls3 => n / 8 * 3,
             DType::Mls4 => n / 2,

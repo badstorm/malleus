@@ -27,6 +27,8 @@ use crate::DType;
 pub enum Pick {
     /// The type the checkpoint already uses: f32, bf16 or an fp8 block format.
     Keep,
+    /// 1 bit per value with an e4m3 scale per 32: 1.25 bpw.
+    Mls1,
     /// 2-bit codes with an fp16 scale per group of 128.
     Mls2,
     /// 3-bit codes with an fp16 scale per group of 128.
@@ -44,6 +46,7 @@ impl Pick {
     pub fn bits(self) -> f64 {
         match self {
             Pick::Keep => 0.0,
+            Pick::Mls1 => 1.0,
             Pick::Mls2 => 2.0,
             Pick::Mls3 => 3.0,
             Pick::Mls4 => 4.0,
@@ -55,6 +58,7 @@ impl Pick {
     pub fn as_str(self) -> &'static str {
         match self {
             Pick::Keep => "keep",
+            Pick::Mls1 => "mls1",
             Pick::Mls2 => "mls2",
             Pick::Mls3 => "mls3",
             Pick::Mls4 => "mls4",
@@ -79,7 +83,10 @@ impl Pick {
                     Pick::Mls4
                 }
             }
-            "IQ2_XXS" | "IQ2_XS" | "IQ2_S" | "IQ1_M" | "IQ1_S" => Pick::Mls2,
+            // The 1-bit type of the ladder is the only one that lands on MLS1: every other 1- and 2-bit type is a
+            // 2-bit code here, which is what the 2.00 bpw build asks for. A map that wants 1.25 bpw names IQ1_S.
+            "IQ1_S" => Pick::Mls1,
+            "IQ2_XXS" | "IQ2_XS" | "IQ2_S" | "IQ1_M" => Pick::Mls2,
             "IQ4_NL" => Pick::RowI4,
             other => bail!("unknown quantization type `{other}`"),
         })
@@ -234,6 +241,10 @@ pub fn tensor_bytes(pick: Pick, dtype: DType, shape: &[usize], packed: bool) -> 
     }
     match pick {
         Pick::Keep => dtype.size_of_elems(elems as usize) as u64,
+        Pick::Mls1 => {
+            // One sign bit per value, one e4m3 scale per 32 values, i.e. 1.25 bits.
+            elems / 8 + elems / 32
+        }
         Pick::Mls2 | Pick::Mls3 | Pick::Mls4 | Pick::Mls8 => {
             let q = match pick {
                 Pick::Mls2 => elems / 4,

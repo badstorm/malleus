@@ -257,7 +257,7 @@ use malleus_gguf::gguf::{ARCH_PREFIX, GgufWriter, Value};
 use malleus_gguf::safetensors::SafeTensors;
 use malleus_gguf::{DType, TensorSource};
 
-use crate::{bf16_rows, quantize_mls2, quantize_mls4, quantize_mls8, quantize_rows_i4};
+use crate::{bf16_rows, quantize_mls1, quantize_mls2, quantize_mls4, quantize_mls8, quantize_rows_i4};
 
 /// A tensor the file will carry, and how to produce it.
 enum Out {
@@ -419,6 +419,13 @@ pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&s
                         w.add_tensor(&s, DType::F16, &dims(&[k / 128]));
                         bytes += tensor_size(dt, shape) + dims(&[k / 128]).iter().product::<usize>() * 2;
                     }
+                    Pick::Mls1 => {
+                        // One sign bit per value and one e4m3 scale per 32: 1.25 bits.
+                        w.add_tensor(name, DType::Mls1, shape);
+                        let s = format!("{name}.scales");
+                        w.add_tensor(&s, DType::F8E4M3, &dims(&[k / 32]));
+                        bytes += tensor_size(DType::Mls1, shape) + dims(&[k / 32]).iter().product::<usize>();
+                    }
                     Pick::Mls8 => {
                         w.add_tensor(name, DType::Mls8, shape);
                         let s = format!("{name}.scales");
@@ -478,6 +485,7 @@ pub fn convert(model_dir: &Path, out: &Path, alloc: &Allocation, log: &dyn Fn(&s
                     let mut w32 = vec![0f32; block * k];
                     read_weight_rows(&st, src, info.dtype, scale.as_deref(), r0, block, k, &mut w32)?;
                     let (q, s) = match pick {
+                        Pick::Mls1 => quantize_mls1(&w32, block, k),
                         Pick::Mls2 => quantize_mls2(&w32, block, k),
                         Pick::Mls3 => crate::quantize_mls3(&w32, block, k),
                         Pick::Mls4 => quantize_mls4(&w32, block, k),

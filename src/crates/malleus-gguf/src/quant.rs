@@ -11,6 +11,13 @@ pub const INT3_GROUP_BYTES: usize = BLOCK * 3 / 8;
 /// MLS3 codes are the 8 levels -4..3 stored as `value + 4`.
 pub const INT3_OFFSET: i32 = 4;
 
+/// Values of one 1-bit group. MLS1 shares a scale over 32 values rather than 128: with one bit per value the
+/// amplitude is all a group's codes carry, so it has to be tracked where it moves.
+pub const INT1_GROUP: usize = 32;
+
+/// Bytes of 1-bit codes of one group: 8 signs per byte, LSB-first, the bit set when the value is negative.
+pub const INT1_GROUP_BYTES: usize = INT1_GROUP / 8;
+
 /// Bytes of 2-bit codes of one group: 4 codes per byte, LSB-first.
 pub const INT2_GROUP_BYTES: usize = BLOCK / 4;
 
@@ -257,6 +264,29 @@ pub fn quantize_group_int2(g: &[f32], grid: Int2Grid) -> ([u8; INT2_GROUP_BYTES]
         out[i / 4] |= (code as u8) << ((i % 4) * 2);
     }
     (out, s)
+}
+
+/// One group of `INT1_GROUP` values at one bit each, with the scale they share. The signs do not move with the
+/// scale, so the least-squares scale of a sign-only code is the group's mean magnitude; it is stored as an e4m3
+/// byte, and the value returned is the one that byte holds (not the ideal mean).
+pub fn quantize_group_int1(g: &[f32]) -> ([u8; INT1_GROUP_BYTES], f32) {
+    debug_assert_eq!(g.len(), INT1_GROUP);
+    let mean = g.iter().map(|v| v.abs()).sum::<f32>() / INT1_GROUP as f32;
+    let scale = crate::fpquant::e4m3(crate::fpquant::e4m3_code(mean));
+    let mut out = [0u8; INT1_GROUP_BYTES];
+    for (i, &v) in g.iter().enumerate() {
+        if v < 0.0 {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    (out, scale)
+}
+
+pub fn dequant_int1(bytes: &[u8], s: f32, out: &mut [f32; INT1_GROUP]) {
+    debug_assert!(bytes.len() >= INT1_GROUP_BYTES);
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = if (bytes[i / 8] >> (i % 8)) & 1 == 1 { -s } else { s };
+    }
 }
 
 /// Inverse of `quantize_group_int2`: 32 bytes and a scale into 128 values.
