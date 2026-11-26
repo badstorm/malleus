@@ -98,10 +98,10 @@ enum Cmd {
         /// Comma-separated layer indices whose FFN stays MLS8 in decode
         #[arg(long, value_delimiter = ',')]
         keep_int8_layers: Vec<usize>,
-        /// Keep the attention projections at MLS8 instead of 4 bits (the published 4-bit layouts for this class of
-        /// model leave only the routed experts at 4 bits)
-        #[arg(long)]
-        int8_attn: bool,
+        /// Which attention projections to keep at MLS8 instead of 4 bits: `all`, or a comma list of `qkv`, `out`,
+        /// `gate` (the published 4-bit layouts for this class of model leave only the routed experts at 4 bits)
+        #[arg(long, value_name = "WHICH")]
+        int8_attn: Option<String>,
         /// Directory with GPTQ-calibrated MLS4 tensors written by scripts/calibrate.py
         #[arg(long)]
         mls4_from: Option<PathBuf>,
@@ -3775,6 +3775,10 @@ fn main() -> Result<()> {
             if no_prefill_int8 {
                 eprintln!("note: --no-prefill-int8 is the default now, the flag does nothing");
             }
+            let int8_attn = match &int8_attn {
+                Some(spec) => malleus_convert::Int8Attn::parse(spec)?,
+                None => malleus_convert::Int8Attn::default(),
+            };
             let opts = malleus_convert::Options {
                 prefill_int8,
                 no_prefill_int8_experts,

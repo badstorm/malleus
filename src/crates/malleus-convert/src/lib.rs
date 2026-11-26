@@ -84,11 +84,12 @@ pub struct Options {
     pub no_prefill_int8_experts: bool,
     /// Layers whose FFN stays MLS8 in decode too.
     pub keep_int8_layers: Vec<usize>,
-    /// Keep the attention projections at MLS8 in decode and prefill instead of 4 bits. The published 4-bit layouts of
-    /// this class of model leave only the routed experts at 4 bits and the rest at 8 (`unsloth/Inkling-2-Mini-GGUF`'s
-    /// `UD-Q4_K_XL` is 17.63 GB against our 15.3 GB, and reports 0.0107 KLD / 98.0 % top-token agreement against its
-    /// own 8-bit reference); this is the switch that reproduces that choice, at ~1 bit per attention weight.
-    pub int8_attn: bool,
+    /// Which attention projections stay at MLS8 in decode and prefill instead of 4 bits. The published 4-bit layouts
+    /// of this class of model leave only the routed experts at 4 bits and the rest at 8
+    /// (`unsloth/Inkling-2-Mini-GGUF`'s `UD-Q4_K_XL` is 17.63 GB against our 15.3 GB, and reports 0.0107 KLD / 98.0 %
+    /// top-token agreement against its own 8-bit reference); this is the switch that reproduces that choice, and it
+    /// takes a subset because the whole class is not equally sensitive.
+    pub int8_attn: Int8Attn,
     /// Directory with calibrated MLS4 nibbles and scales (scripts/calibrate.py), used instead of round-to-nearest.
     pub mls4_from: Option<std::path::PathBuf>,
     /// Layers whose MoE `gate`/`up` go to MLS3; MLS3 tensors are always round-to-nearest, calibration is MLS4 only.
@@ -104,6 +105,60 @@ pub struct Options {
     /// Decode then reads 4 bit per weight instead of 8 on the 0.78 GB per token the mixing costs; `prefill` keeps
     /// working unchanged because `gemm_i8_hcmix` and `gemm_i8_sk` have no int4 form.
     pub hc_mls4: bool,
+}
+
+/// The attention projections `--int8-attn` keeps at 8 bits: `all`, or the subset that reads the residual stream
+/// differently — `qkv` (`wq_du`, `wk_dv`, `wv_dv`), `out` (`wo_ud`) and `gate` (`gate_attn`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Int8Attn {
+    pub qkv: bool,
+    pub out: bool,
+    pub gate: bool,
+}
+
+impl Int8Attn {
+    /// The four names a 4-bit file may carry for the attention of this family.
+    pub const SUFFIXES: &'static [(&'static str, &'static str)] = &[
+        ("attn.wq_du.weight", "qkv"),
+        ("attn.wk_dv.weight", "qkv"),
+        ("attn.wv_dv.weight", "qkv"),
+        ("attn.wo_ud.weight", "out"),
+        ("attn.gate_attn.weight", "gate"),
+        ("attn.wr_du.weight", "qkv"),
+    ];
+
+    pub fn keeps(self, name: &str) -> bool {
+        Self::SUFFIXES.iter().any(|(suffix, class)| {
+            name.ends_with(suffix)
+                && match *class {
+                    "qkv" => self.qkv,
+                    "out" => self.out,
+                    _ => self.gate,
+                }
+        })
+    }
+
+    /// `all`, or a comma list of `qkv`, `out`, `gate`.
+    pub fn parse(spec: &str) -> anyhow::Result<Self> {
+        let mut out = Self::default();
+        for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match part {
+                "all" => {
+                    out = Self {
+                        qkv: true,
+                        out: true,
+                        gate: true,
+                    };
+                }
+                "qkv" => out.qkv = true,
+                "out" => out.out = true,
+                "gate" => out.gate = true,
+                "none" => {}
+                other => anyhow::bail!("--int8-attn `{other}`: expected `all`, `qkv`, `out`, `gate` or a comma list"),
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A model family `convert` can write: it fixes `general.architecture`, the name mapping and which tensor class
@@ -245,7 +300,7 @@ impl Family {
         {
             return Kind::Mls8;
         }
-        if opts.int8_attn && mls4.iter().any(|s| name.ends_with(s)) && name.contains(".attn.") {
+        if opts.int8_attn.keeps(name) {
             return Kind::Mls8;
         }
         // MLS2 is the routed-expert format. A family that stacks its shared expert into the same matrix (Qwen's
@@ -1423,7 +1478,7 @@ mod tests {
             prefill_int8: false,
             no_prefill_int8_experts: false,
             keep_int8_layers: vec![],
-            int8_attn: false,
+            int8_attn: Int8Attn::default(),
             mls4_from: None,
             mls3_layers: Mls3Layers::Off,
             mls2_layers: Mls2Layers::Off,
@@ -1450,27 +1505,50 @@ mod tests {
     }
 
     /// `--int8-attn` keeps the attention projections at 8 bits, which is what the published 4-bit layout of this
-    /// class of model does: only the routed experts stay at 4.
+    /// class of model does: only the routed experts stay at 4. It takes a subset, and the classes are the three ways
+    /// the attention touches the residual stream.
     #[test]
     fn int8_attn_leaves_only_the_experts_at_four_bits() {
         let mut o = opts();
-        o.int8_attn = true;
+        o.int8_attn = Int8Attn {
+            qkv: true,
+            out: true,
+            gate: true,
+        };
         let c = |name: &str, shape: &[usize]| Family::Inkling2.classify(name, shape, &o, None, None);
-        assert_eq!(c("model.llm.layers.3.attn.wq_du.weight", &[3072, 2304]), Kind::Mls8);
-        assert_eq!(c("model.llm.layers.3.attn.wk_dv.weight", &[1024, 2304]), Kind::Mls8);
-        assert_eq!(c("model.llm.layers.3.attn.wv_dv.weight", &[1024, 2304]), Kind::Mls8);
-        assert_eq!(c("model.llm.layers.3.attn.wo_ud.weight", &[2304, 3072]), Kind::Mls8);
-        assert_eq!(c("model.llm.layers.3.attn.gate_attn.weight", &[2304, 2304]), Kind::Mls8);
+        for (name, shape) in [
+            ("model.llm.layers.3.attn.wq_du.weight", vec![3072, 2304]),
+            ("model.llm.layers.3.attn.wk_dv.weight", vec![1024, 2304]),
+            ("model.llm.layers.3.attn.wv_dv.weight", vec![1024, 2304]),
+            ("model.llm.layers.3.attn.wo_ud.weight", vec![2304, 3072]),
+            ("model.llm.layers.3.attn.gate_attn.weight", vec![2304, 2304]),
+        ] {
+            assert_eq!(c(name, &shape), Kind::Mls8, "{name}");
+        }
         assert_eq!(
             c("model.llm.layers.3.mlp.experts.gate_up_proj", &[128, 18432, 2304]),
             Kind::Mls4
         );
-        assert_eq!(c("model.llm.layers.3.attn.wq_du.weight", &[3072, 2304]), Kind::Mls8);
         let off = opts();
         assert_eq!(
             Family::Inkling2.classify("model.llm.layers.3.attn.wq_du.weight", &[3072, 2304], &off, None, None),
             Kind::Mls4
         );
+        // Subsets: `qkv` leaves `wo_ud` at 4 bits.
+        let mut qkv = opts();
+        qkv.int8_attn = Int8Attn::parse("qkv").unwrap();
+        let q = |name: &str, shape: &[usize]| Family::Inkling2.classify(name, shape, &qkv, None, None);
+        assert_eq!(q("model.llm.layers.3.attn.wq_du.weight", &[3072, 2304]), Kind::Mls8);
+        assert_eq!(q("model.llm.layers.3.attn.wo_ud.weight", &[2304, 3072]), Kind::Mls4);
+        assert_eq!(
+            Int8Attn::parse("all").unwrap(),
+            Int8Attn {
+                qkv: true,
+                out: true,
+                gate: true
+            }
+        );
+        assert!(Int8Attn::parse("everything").is_err());
     }
 
     /// Inkling-2: the text stack's linears go to 4 bits, the MTP head's own layers stay bf16 (it is the draft, and
@@ -1658,7 +1736,7 @@ mod tests {
         assert_eq!(c("model.visual.patch_embed.proj.weight"), Kind::Raw);
         let keep = Options {
             keep_int8_layers: vec![3],
-            int8_attn: false,
+            int8_attn: Int8Attn::default(),
             ..opts()
         };
         assert_eq!(

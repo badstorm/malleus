@@ -2222,10 +2222,7 @@ impl Graph {
         clip(model, st, &self.r, &layer.rel_clip, tau, t, heads, d_rel, i.rel_clip)?;
         // The keys and values of this layer, as attention reads them, across every position the session holds.
         if let Some(p) = place.as_mut() {
-            for (dst, dsc, src) in [
-                (&p.slot.k, &p.slot.ks, &self.k),
-                (&p.slot.v, &p.slot.vs, &self.v),
-            ] {
+            for (dst, dsc, src) in [(&p.slot.k, &p.slot.ks, &self.k), (&p.slot.v, &p.slot.vs, &self.v)] {
                 model.k.get("inkling2_kv_store").launch(
                     (((t * kv).div_ceil(8)) as u32, 1, 1),
                     (256, 1, 1),
@@ -3803,7 +3800,7 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
         raw_gemm(model, st, &vb, &mix, &l.v_ctx, rows, kvd, h)?;
         for (dst, dsc, src) in [(&d.k[s], &d.ks[s], &kb), (&d.v[s], &d.vs[s], &vb)] {
             model.k.get("inkling2_kv_store").launch(
-                ((rows * kvd).div_ceil(256) as u32, 1, 1),
+                ((rows * nkv).div_ceil(8) as u32, 1, 1),
                 (256, 1, 1),
                 0,
                 st,
@@ -3816,6 +3813,7 @@ fn draft_commit(model: &Model, k: &mut Cache, pos: usize, rows: usize) -> Result
                     d.rows.into(),
                     0i32.into(),
                     kvd.into(),
+                    hd.into(),
                 ],
             )?;
         }
@@ -4030,7 +4028,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
         // token and the rows of the block before it.
         for (dst, dsc, src) in [(&d.k[s], &d.ks[s], &kb), (&d.v[s], &d.vs[s], &vb)] {
             model.k.get("inkling2_kv_store").launch(
-                ((rows * kvd).div_ceil(256) as u32, 1, 1),
+                ((rows * nkv).div_ceil(8) as u32, 1, 1),
                 (256, 1, 1),
                 0,
                 st,
@@ -4043,6 +4041,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                     d.rows.into(),
                     0i32.into(),
                     kvd.into(),
+                    hd.into(),
                 ],
             )?;
         }
