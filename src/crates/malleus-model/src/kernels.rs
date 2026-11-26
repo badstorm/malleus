@@ -296,6 +296,7 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "dsv_hc_post",
             "dsv_swiglu",
             "dsv_route",
+            "dsv_compress",
         ],
     ),
     (

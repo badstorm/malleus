@@ -281,11 +281,13 @@ impl WindowAttn {
                 (&self.q).into(),
                 (&self.kv).into(),
                 (&self.inv).into(),
+                1i32.into(),
                 self.heads.into(),
                 self.hd.into(),
                 self.rope.into(),
                 1i32.into(),
                 pos.into(),
+                1i32.into(),
                 1i32.into(),
             ],
         )?;
@@ -321,11 +323,13 @@ impl WindowAttn {
                 (&self.or).into(),
                 (&self.kv).into(),
                 (&self.inv).into(),
+                1i32.into(),
                 self.heads.into(),
                 self.hd.into(),
                 self.rope.into(),
                 0i32.into(),
                 pos.into(),
+                1i32.into(),
                 (-1i32).into(),
             ],
         )?;
@@ -774,6 +778,176 @@ impl BlockDev {
     }
 }
 
+/// The compressor of an indexed layer on the device: every `ratio` positions pool into one latent row — a
+/// per-dimension softmax of the gate over the group weighting the `kv` rows — then an RMSNorm and the rotation at the
+/// compressed base. `deepseek_text::compressor` is the reference, and `ckv{layer}` in its dump is `ckv` here.
+pub struct Compressor {
+    pub ratio: usize,
+    pub hd: usize,
+    pub groups: usize,
+    /// The two projections of the input (`[t, hd]`), the pooled rows, and the rows after the norm and the rotation.
+    pub kv: DeviceBuffer,
+    pub gate: DeviceBuffer,
+    pub lat: DeviceBuffer,
+    pub ckv: DeviceBuffer,
+    wkv: Linear,
+    wgate: Option<Linear>,
+    norm: DeviceBuffer,
+    /// The compressed base: the indexed layers rotate at the longer theta, with YaRN.
+    inv: DeviceBuffer,
+    rope: usize,
+    xr: DeviceBuffer,
+    xh: DeviceBuffer,
+    xsc: DeviceBuffer,
+    eps: f32,
+}
+
+impl Compressor {
+    pub fn load(src: &dyn TensorSource, c: &Config, layer: usize) -> Result<Self> {
+        let d = c.deepseek.as_ref().context("no deepseek config")?;
+        let (hd, ratio) = (d.head_dim, d.compress_ratios[layer] as usize);
+        ensure!(ratio > 0, "layer {layer} is a window layer: it has no compressor");
+        let p = |s: &str| format!("layers.{layer}.{s}");
+        let mut up = Uploader::new()?;
+        up.use_prefill = false;
+        let wkv = up.linear(src, &p("attn.compressor.wkv"), hd, c.hidden)?;
+        let wgate = if ratio > 1 {
+            Some(up.linear(src, &p("attn.compressor.wgate"), hd, c.hidden)?)
+        } else {
+            None
+        };
+        let r = &d.rope_params;
+        let inv = crate::deepseek_text::rope_inv(
+            d.rope,
+            r.compress_theta,
+            r.original_seq,
+            r.factor,
+            r.beta_fast,
+            r.beta_slow,
+        );
+        Ok(Compressor {
+            ratio,
+            hd,
+            groups: 0,
+            kv: DeviceBuffer::zeroed(4)?,
+            gate: DeviceBuffer::zeroed(4)?,
+            lat: DeviceBuffer::zeroed(4)?,
+            ckv: DeviceBuffer::zeroed(4)?,
+            wkv,
+            wgate,
+            norm: DeviceBuffer::from_slice(&crate::deepseek_text::load_vector(
+                src,
+                &p("attn.compressor.norm.weight"),
+                hd,
+            )?)?,
+            inv: DeviceBuffer::from_slice(&inv)?,
+            rope: d.rope,
+            xr: DeviceBuffer::alloc(c.hidden * 4)?,
+            xh: DeviceBuffer::alloc(c.hidden * 2)?,
+            xsc: DeviceBuffer::alloc(c.hidden.div_ceil(128) * 4)?,
+            eps: d.eps,
+        })
+    }
+
+    /// Pools `t` positions of the layer's normed input `xn` into `t / ratio` latent rows. Returns the row count; a
+    /// prefix shorter than one group has nothing to compress, which is what the host graph does too.
+    pub fn compress(&mut self, m: &Model, xn: &DeviceBuffer, t: usize) -> Result<usize> {
+        let groups = t / self.ratio;
+        self.groups = groups;
+        if groups == 0 {
+            return Ok(0);
+        }
+        let (s, k) = (&m.stream, &m.k);
+        let (hd, ratio) = (self.hd, self.ratio);
+        // The two projections run the whole chunk at once, so the GEMM scratch grows with `t`.
+        let k_max = self.wkv.k;
+        if self.xr.len() < t * k_max * 4 {
+            self.xr = DeviceBuffer::zeroed(t * k_max * 4)?;
+            self.xh = DeviceBuffer::zeroed(t * k_max * 2)?;
+            self.xsc = DeviceBuffer::zeroed(t * k_max.div_ceil(128) * 4)?;
+        }
+        if self.kv.len() < t * hd * 4 {
+            self.kv = DeviceBuffer::zeroed(t * hd * 4)?;
+            self.gate = DeviceBuffer::zeroed(t * hd * 4)?;
+        }
+        if self.lat.len() < groups * hd * 4 {
+            self.lat = DeviceBuffer::zeroed(groups * hd * 4)?;
+            self.ckv = DeviceBuffer::zeroed(groups * hd * 4)?;
+        }
+        let wgate = self.wgate.as_ref().context("a ratio above 1 pools with a gate")?;
+        m.gemm(
+            s,
+            &self.xr,
+            &self.xh,
+            &self.xsc,
+            &self.kv,
+            Act::X(xn),
+            &self.wkv,
+            t,
+            false,
+        )?;
+        m.gemm(
+            s,
+            &self.xr,
+            &self.xh,
+            &self.xsc,
+            &self.gate,
+            Act::X(xn),
+            wgate,
+            t,
+            false,
+        )?;
+        k.get("dsv_compress").launch(
+            (groups as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            s,
+            &[
+                (&self.lat).into(),
+                (&self.kv).into(),
+                (&self.gate).into(),
+                hd.into(),
+                ratio.into(),
+            ],
+        )?;
+        k.get("dsv_rmsnorm").launch(
+            (groups as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            s,
+            &[
+                (&self.lat).into(),
+                (&self.lat).into(),
+                (&self.norm).into(),
+                hd.into(),
+                self.eps.into(),
+            ],
+        )?;
+        self.ckv.copy_from(0, &self.lat, 0, groups * hd * 4, s)?;
+        let rotary = (groups * self.rope / 2).div_ceil(256) as u32;
+        k.get("dsv_rope").launch(
+            (rotary.max(1), 1, 1),
+            (256, 1, 1),
+            0,
+            s,
+            &[
+                (&self.ckv).into(),
+                (&self.ckv).into(),
+                (&self.inv).into(),
+                (groups as i32).into(),
+                0i32.into(),
+                hd.into(),
+                self.rope.into(),
+                1i32.into(),
+                0i32.into(),
+                (ratio as i32).into(),
+                1i32.into(),
+            ],
+        )?;
+        Ok(groups)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,5 +1373,70 @@ mod tests {
         let cos = cos(&dev_out, &host_out);
         eprintln!("block0: cosine {cos:.8}, rms {rms:.4}, max |diff| {worst:.2e}");
         assert!(cos > 0.999, "the block diverges: {cos}");
+    }
+
+    /// The compressor of an indexed layer against the host graph: the pooled latent, normed and rotated at the
+    /// compressed base (`ckv` in the host's dump). Layer 2 is the first one with a compressor, and it is a source for
+    /// both the compressed KV and its index keys.
+    ///
+    ///   DEEPSEEK_FILE=/models/deepseek-v41-flash-mls2.malleus \
+    ///     cargo test -p malleus-model --release -- --ignored --nocapture the_device_compressor
+    #[test]
+    #[ignore = "reads a real layer from the converted file and needs the GPU"]
+    fn the_device_compressor_matches_the_host_graph() {
+        let file = std::env::var("DEEPSEEK_FILE").expect("DEEPSEEK_FILE");
+        let layer: usize = std::env::var("DEEPSEEK_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let g = malleus_gguf::gguf::Gguf::open(std::path::Path::new(&file)).unwrap();
+        let c = Config::from_json(
+            g.meta_str("openmalleus.hf_config").unwrap(),
+            g.meta_str("openmalleus.generation_config").ok(),
+        )
+        .unwrap();
+        let d = c.deepseek.as_ref().unwrap().clone();
+        let t: usize = std::env::var("DEEPSEEK_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let x: Vec<f32> = {
+            let mut state = 0x1234_5678_9abc_def0u64;
+            (0..t * c.hidden)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ((state >> 40) as f32 / 8388608.0) - 1.0
+                })
+                .collect()
+        };
+        // The compressor reads the attention's normed input.
+        let attn_norm =
+            crate::deepseek_text::load_vector(&g, &format!("layers.{layer}.attn_norm.weight"), c.hidden).unwrap();
+        let mut xn = x.clone();
+        crate::hostmath::rmsnorm(&mut xn, c.hidden, &attn_norm, d.eps);
+
+        let host = crate::deepseek_text::Weights::block_only(&g, &c, layer).unwrap();
+        let mut stages: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+        host.attention_stage_with(0, &xn, t, |name, values| {
+            stages.insert(name.to_string(), values.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        let want = stages.get("ckv0").expect("the host graph publishes ckv0");
+
+        let kernels = Kernels::load(&select_device().unwrap()).unwrap();
+        let m = Model::host_only(c.clone(), kernels, 0, malleus_gguf::quant::HADAMARD_SEED).unwrap();
+        let mut dev = Compressor::load(&g, &c, layer).unwrap();
+        let xn_dev = DeviceBuffer::from_slice(&xn).unwrap();
+        let groups = dev.compress(&m, &xn_dev, t).unwrap();
+        m.stream.synchronize().unwrap();
+        let got = dev.ckv.download::<f32>(groups * d.head_dim).unwrap();
+        assert_eq!(got.len(), want.len(), "{groups} groups against {} values", want.len());
+        let (rms, worst) = rms_and_worst(want, &got);
+        let cos = cos(&got, want);
+        eprintln!("ckv{layer}: {groups} groups, cosine {cos:.8}, rms {rms:.4}, max |diff| {worst:.2e}");
+        assert!(cos > 0.9999, "the compressor diverges: {cos}");
     }
 }

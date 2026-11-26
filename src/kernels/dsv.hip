@@ -34,19 +34,22 @@ extern "C" __global__ void __launch_bounds__(256) dsv_rmsnorm(float* out, const 
     for (int i = threadIdx.x; i < n; i += 256) yr[i] = xr[i] * inv * w[i];
 }
 
-// Interleaved RoPE on the last `rd` values of the `nh` heads of `q` and, when `nkv` is 1, of the single row of `kv`
-// — the same rotation on the query heads and on the shared key the host graph applies before its cache write.
-// `inv` is the table of `rd / 2` inverse frequencies (the plain base on a window layer, YaRN's on a compressed
-// one), `dir` is +1 on the way in and -1 for the inverse the output projection needs.
-extern "C" __global__ void __launch_bounds__(256) dsv_rope(float* q, float* kv, const float* inv, int nh, int hd,
-                                                          int rd, int nkv, int pos, int dir) {
+// Interleaved RoPE on the last `rd` values of the `nh` heads of each of `rows` rows of `q` and, when `nkv` is 1, of
+// each row of `kv` — the same rotation on the query heads and on the shared key the host graph applies before its
+// cache write. `inv` is the table of `rd / 2` inverse frequencies (the plain base on a window layer, YaRN's on a
+// compressed one), `pos` the first row's position, `stride` what the next row adds (one position for a token, the
+// ratio for a compressed latent) and `dir` is +1 on the way in and -1 for the inverse the output projection needs.
+extern "C" __global__ void __launch_bounds__(256) dsv_rope(float* q, float* kv, const float* inv, int rows, int nh,
+                                                          int hd, int rd, int nkv, int pos, int stride, int dir) {
     const int half = rd / 2;
     const int lanes = nh + nkv;
-    const int total = lanes * half;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
-        const int h = i / half, f = i % half;
-        float* p = h < nh ? q + (size_t)h * hd + hd - rd + 2 * f : kv + hd - rd + 2 * f;
-        const float ang = (float)pos * inv[f];
+    const long long total = (long long)rows * lanes * half;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {
+        const int r = (int)(i / (lanes * half));
+        const int rem = (int)(i % (lanes * half));
+        const int h = rem / half, f = rem % half;
+        float* p = h < nh ? q + ((size_t)r * nh + h) * hd + hd - rd + 2 * f : kv + (size_t)r * hd + hd - rd + 2 * f;
+        const float ang = (float)(pos + r * stride) * inv[f];
         const float c = cosf(ang), s = (float)dir * sinf(ang);
         const float x0 = p[0], x1 = p[1];
         p[0] = x0 * c - x1 * s;
@@ -266,4 +269,22 @@ extern "C" __global__ void dsv_route(int* ids, float* wts, const float* scores, 
         for (int j = 0; j < top_k; ++j) wts[j] /= sum;
     }
     for (int j = 0; j < top_k; ++j) wts[j] *= scale;
+}
+
+// The compressor of an indexed layer: every `ratio` positions of the layer's input pool into one latent row, a
+// per-dimension softmax of the gate over the group weighting the `kv` rows. `kv` and `gate` are [rows, hd], `out` is
+// [rows / ratio, hd]; the norm and the rotation the host applies afterwards are separate kernels.
+extern "C" __global__ void dsv_compress(float* out, const float* kv, const float* gate, int hd, int ratio) {
+    const int g = blockIdx.x;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float m = -INFINITY;
+        for (int j = 0; j < ratio; ++j) m = fmaxf(m, gate[(g * ratio + j) * hd + d]);
+        float sum = 0.f, acc = 0.f;
+        for (int j = 0; j < ratio; ++j) {
+            const float w = expf(gate[(g * ratio + j) * hd + d] - m);
+            sum += w;
+            acc += w * kv[(g * ratio + j) * hd + d];
+        }
+        out[g * hd + d] = acc / sum;
+    }
 }
