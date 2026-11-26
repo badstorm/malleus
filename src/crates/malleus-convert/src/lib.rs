@@ -84,6 +84,11 @@ pub struct Options {
     pub no_prefill_int8_experts: bool,
     /// Layers whose FFN stays MLS8 in decode too.
     pub keep_int8_layers: Vec<usize>,
+    /// Keep the attention projections at MLS8 in decode and prefill instead of 4 bits. The published 4-bit layouts of
+    /// this class of model leave only the routed experts at 4 bits and the rest at 8 (`unsloth/Inkling-2-Mini-GGUF`'s
+    /// `UD-Q4_K_XL` is 17.63 GB against our 15.3 GB, and reports 0.0107 KLD / 98.0 % top-token agreement against its
+    /// own 8-bit reference); this is the switch that reproduces that choice, at ~1 bit per attention weight.
+    pub int8_attn: bool,
     /// Directory with calibrated MLS4 nibbles and scales (scripts/calibrate.py), used instead of round-to-nearest.
     pub mls4_from: Option<std::path::PathBuf>,
     /// Layers whose MoE `gate`/`up` go to MLS3; MLS3 tensors are always round-to-nearest, calibration is MLS4 only.
@@ -238,6 +243,9 @@ impl Family {
             && !name.starts_with("mtp.")
             && layer_index(name).is_some_and(|i| opts.keep_int8_layers.contains(&i))
         {
+            return Kind::Mls8;
+        }
+        if opts.int8_attn && mls4.iter().any(|s| name.ends_with(s)) && name.contains(".attn.") {
             return Kind::Mls8;
         }
         // MLS2 is the routed-expert format. A family that stacks its shared expert into the same matrix (Qwen's
@@ -1385,6 +1393,7 @@ mod tests {
             prefill_int8: false,
             no_prefill_int8_experts: false,
             keep_int8_layers: vec![],
+            int8_attn: false,
             mls4_from: None,
             mls3_layers: Mls3Layers::Off,
             mls2_layers: Mls2Layers::Off,
@@ -1408,6 +1417,30 @@ mod tests {
         assert!(Family::Qwen35.prefill_copy(true) && !Family::Ling3.prefill_copy(true));
         assert!(Family::Qwen4Exp.prefill_copy(false) && !Family::Qwen4Exp.prefill_copy(true));
         assert!(Family::from_model_type("llama").is_err());
+    }
+
+    /// `--int8-attn` keeps the attention projections at 8 bits, which is what the published 4-bit layout of this
+    /// class of model does: only the routed experts stay at 4.
+    #[test]
+    fn int8_attn_leaves_only_the_experts_at_four_bits() {
+        let mut o = opts();
+        o.int8_attn = true;
+        let c = |name: &str, shape: &[usize]| Family::Inkling2.classify(name, shape, &o, None, None);
+        assert_eq!(c("model.llm.layers.3.attn.wq_du.weight", &[3072, 2304]), Kind::Mls8);
+        assert_eq!(c("model.llm.layers.3.attn.wk_dv.weight", &[1024, 2304]), Kind::Mls8);
+        assert_eq!(c("model.llm.layers.3.attn.wv_dv.weight", &[1024, 2304]), Kind::Mls8);
+        assert_eq!(c("model.llm.layers.3.attn.wo_ud.weight", &[2304, 3072]), Kind::Mls8);
+        assert_eq!(c("model.llm.layers.3.attn.gate_attn.weight", &[2304, 2304]), Kind::Mls8);
+        assert_eq!(
+            c("model.llm.layers.3.mlp.experts.gate_up_proj", &[128, 18432, 2304]),
+            Kind::Mls4
+        );
+        assert_eq!(c("model.llm.layers.3.attn.wq_du.weight", &[3072, 2304]), Kind::Mls8);
+        let off = opts();
+        assert_eq!(
+            Family::Inkling2.classify("model.llm.layers.3.attn.wq_du.weight", &[3072, 2304], &off, None, None),
+            Kind::Mls4
+        );
     }
 
     /// Inkling-2: the text stack's linears go to 4 bits, the MTP head's own layers stay bf16 (it is the draft, and
@@ -1595,6 +1628,7 @@ mod tests {
         assert_eq!(c("model.visual.patch_embed.proj.weight"), Kind::Raw);
         let keep = Options {
             keep_int8_layers: vec![3],
+            int8_attn: false,
             ..opts()
         };
         assert_eq!(

@@ -98,6 +98,10 @@ enum Cmd {
         /// Comma-separated layer indices whose FFN stays MLS8 in decode
         #[arg(long, value_delimiter = ',')]
         keep_int8_layers: Vec<usize>,
+        /// Keep the attention projections at MLS8 instead of 4 bits (the published 4-bit layouts for this class of
+        /// model leave only the routed experts at 4 bits)
+        #[arg(long)]
+        int8_attn: bool,
         /// Directory with GPTQ-calibrated MLS4 tensors written by scripts/calibrate.py
         #[arg(long)]
         mls4_from: Option<PathBuf>,
@@ -3741,6 +3745,7 @@ fn main() -> Result<()> {
             no_prefill_int8,
             no_prefill_int8_experts,
             keep_int8_layers,
+            int8_attn,
             mls4_from,
             expert_mls3,
             expert_mls2,
@@ -3774,6 +3779,7 @@ fn main() -> Result<()> {
                 prefill_int8,
                 no_prefill_int8_experts,
                 keep_int8_layers,
+                int8_attn,
                 mls4_from,
                 mls3_layers,
                 mls2_layers,
