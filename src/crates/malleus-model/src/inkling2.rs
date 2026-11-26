@@ -376,11 +376,44 @@ pub fn map(c: &Config) -> Result<Vec<Expected>> {
 pub fn check(src: &dyn TensorSource, c: &Config) -> Result<Vec<String>> {
     let expected = map(c)?;
     let mut lines = Vec::new();
+    // A map entry says the *narrowest* form a linear may take: the file may carry a wider copy of the same tensor
+    // (`--int8-attn`, `--keep-int8-layers`, and the MLS8 copies `--prefill-int8` writes), and then the weight is MLS8
+    // and its scale is one f32 per row instead of one f16 per 128 weights. The loader reads what it finds
+    // (`Uploader::linear`), so the check takes the pair the file actually holds.
+    let wide: Vec<&str> = src
+        .names()
+        .into_iter()
+        .filter(|n| n.ends_with(".weight") && src.info(n).is_some_and(|i| i.dtype == DType::Mls8))
+        .filter_map(|n| n.strip_suffix(".weight"))
+        .collect();
     let mut claimed: Vec<&str> = Vec::with_capacity(expected.len());
     for e in &expected {
         let info = src
             .info(&e.name)
             .with_context(|| format!("{}: not in the file", e.name))?;
+        // `.scales` hangs off the weight's name, so both have to reduce to the tensor's own name.
+        let base = e
+            .name
+            .strip_suffix(".scales")
+            .or_else(|| e.name.strip_suffix(".weight"))
+            .map(|b| b.strip_suffix(".weight").unwrap_or(b));
+        if base.is_some_and(|b| wide.contains(&b)) {
+            // The weight in its 8-bit form, one f32 scale a row.
+            let ok = if e.name.ends_with(".weight") {
+                info.dtype == DType::Mls8 && info.shape == e.shape
+            } else {
+                info.dtype == DType::F32 && info.shape == [e.shape[0]]
+            };
+            ensure!(
+                ok,
+                "{}: the file has {:?} {:?} for an 8-bit copy",
+                e.name,
+                info.dtype,
+                info.shape
+            );
+            claimed.push(&e.name);
+            continue;
+        }
         ensure!(
             info.dtype == e.dtype && info.shape == e.shape,
             "{}: expected {:?} {:?}, the file has {:?} {:?}",
