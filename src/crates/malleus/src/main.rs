@@ -798,6 +798,77 @@ fn deepseek_run(
         "resident {:.2} GB, up to {experts} experts of one block held",
         s.resident_bytes() as f64 / 1e9
     );
+    // `MALLEUS_DEEPSEEK_ROUTER=<file>`: the router's choice over a prompt, per layer, and how much of it a resident
+    // set of the experts would cover. The decision the expert format rests on (issue #134): a token takes six of 384
+    // a layer, and what fraction of those six a fixed, calibrated subset covers is the difference between 2-3 tok/s
+    // and something usable.
+    if let Ok(path) = std::env::var("MALLEUS_DEEPSEEK_ROUTER") {
+        let n: usize = std::env::var("MALLEUS_DEEPSEEK_ROUTER_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32);
+        // The tail, not the head: the chat template's boilerplate is a page long and the user's text is what a
+        // router measurement is about.
+        let ids = &ids[ids.len().saturating_sub(n)..];
+        let (layers, experts) = (c.n_layers, c.deepseek.as_ref().context("no deepseek config")?.experts);
+        let top_k = c.deepseek.as_ref().unwrap().top_k;
+        let mut counts = vec![vec![0u64; experts]; layers];
+        let t0 = Instant::now();
+        s.run_with(ids, |_, _| {}, &mut |name: &str, values: &[f32]| {
+            if let Some(rest) = name.strip_prefix("ffn_ids")
+                && let Ok(l) = rest.parse::<usize>()
+                && l < layers
+            {
+                for &v in values {
+                    counts[l][v as usize] += 1;
+                }
+            }
+            Ok(())
+        })?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        let slots: u64 = ids.len() as u64 * top_k as u64;
+        eprintln!(
+            "router: {} positions, {slots} slots a layer, in {elapsed:.0}s",
+            ids.len()
+        );
+        // The order of the experts by how often this prompt took them, per layer.
+        let order: Vec<Vec<usize>> = counts
+            .iter()
+            .map(|c| {
+                let mut o: Vec<usize> = (0..experts).collect();
+                o.sort_by_key(|&e| std::cmp::Reverse(c[e]));
+                o
+            })
+            .collect();
+        for (l, c) in counts.iter().enumerate() {
+            let unused = c.iter().filter(|&&v| v == 0).count();
+            eprintln!("  layer {l:2}: {unused} of {experts} experts never taken");
+        }
+        // Coverage against a resident budget: `per_layer` experts of each layer's 384, the most used ones.
+        let bytes_per_expert = 9.4e6; // MLS2, the file in use
+        eprintln!("  per layer  resident GB  slots covered");
+        for per_layer in [64usize, 128, 192, 232, 256, 280, 320, 384] {
+            let mut covers = Vec::new();
+            for (l, o) in order.iter().enumerate() {
+                let taken: u64 = o[..per_layer].iter().map(|&e| counts[l][e]).sum();
+                covers.push(taken as f64 / slots as f64);
+            }
+            covers.sort_by(|a, b| a.total_cmp(b));
+            let median = covers[layers / 2];
+            let gb = per_layer as f64 * bytes_per_expert * layers as f64 / 1e9;
+            eprintln!("  {per_layer:9}  {gb:10.1}  {:5.1} %", median * 100.0);
+        }
+        let json = serde_json::json!({
+            "positions": ids.len(),
+            "top_k": top_k,
+            "seconds": elapsed,
+            "counts": counts,
+            "order": order,
+        });
+        std::fs::write(&path, serde_json::to_string(&json)?)?;
+        eprintln!("histogram written to {path}");
+        return Ok(());
+    }
     let t0 = Instant::now();
     let mut report = |_: usize, out: &[u32], row: &[f32]| {
         eprintln!(
