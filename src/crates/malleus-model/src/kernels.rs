@@ -285,6 +285,20 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "dsv",
+        &[
+            "dsv_rmsnorm",
+            "dsv_rope",
+            "dsv_win_attn",
+            "dsv_hc_mixes",
+            "dsv_hc_coef",
+            "dsv_hc_pre",
+            "dsv_hc_post",
+            "dsv_swiglu",
+            "dsv_route",
+        ],
+    ),
+    (
         "mla",
         &[
             "mla_cache_write",

@@ -654,10 +654,92 @@ impl Weights {
     /// compressors, the two-level indexer and the sparse attention, which the whole-graph comparison cannot
     /// isolate: an isolated layer is fed a fixed input on both sides.
     pub fn attention_stage(&self, index: usize, x: &[f32], t: usize) -> Result<Vec<f32>> {
+        self.attention_stage_with(index, x, t, |_, _| Ok(()))
+    }
+
+    /// The same, calling `hook(name, values)` after each stage: what a device kernel is compared against, one
+    /// stage at a time.
+    pub fn attention_stage_with(
+        &self,
+        index: usize,
+        x: &[f32],
+        t: usize,
+        mut hook: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
         let l = self.layers.get(index).context("no such layer loaded")?;
         let mut shared = Shared::default();
-        let mut hook = |_: &str, _: &[f32]| Ok(());
         self.attention(l, x, t, &mut shared, None, &mut hook, index)
+    }
+
+    /// The attention half of one block on the streams `h` (`hc_mult` copies of `hidden`, per position): the mixes,
+    /// the collapse, the attention and the write back. Returns the new streams; the hook names every stage.
+    pub fn attention_block_stage_with(
+        &self,
+        index: usize,
+        h: &[f32],
+        pre_mix: &[f32],
+        t: usize,
+        mut hook: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        let l = self.layers.get(index).context("no such layer loaded")?;
+        let mut shared = Shared::default();
+        let mut h = h.to_vec();
+        self.attention_sub(l, index, &mut h, pre_mix, t, &mut shared, None, &mut hook)?;
+        Ok(h)
+    }
+
+    /// One block on the streams `h`, the way the stack runs it: the Engram lookup, the attention sub-layer between its
+    /// hyper-connections, then the FFN. `bank` is where the routed experts come from (`StreamedExperts` reads them
+    /// from the file). This is the host side of the device block's gate; a block with an Engram table needs its hash
+    /// ids and is not served by it.
+    pub fn block_stage_with(
+        &self,
+        index: usize,
+        h: &[f32],
+        pre_mix: &[f32],
+        t: usize,
+        bank: &mut dyn ExpertBank,
+        mut hook: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        let l = self.layers.get(index).context("no such layer loaded")?;
+        let mut shared = Shared::default();
+        let mut h = h.to_vec();
+        let mut pre_mix = pre_mix.to_vec();
+        let mut main = Vec::new();
+        self.block(
+            l,
+            index,
+            &mut h,
+            &mut pre_mix,
+            t,
+            &mut shared,
+            bank,
+            None,
+            None,
+            None,
+            &mut main,
+            &mut hook,
+        )?;
+        Ok(h)
+    }
+
+    /// One block without its routed experts, its token table and its head: the host side of a stage gate, which
+    /// runs one layer's attention (or its experts) against the device and never reads 54 GB of experts or 10 GB of
+    /// table. `attention_stage` is then layer 0 of `layers`.
+    pub fn block_only(src: &dyn TensorSource, c: &Config, layer: usize) -> Result<Self> {
+        let d = c.deepseek.as_ref().context("no deepseek config")?.clone();
+        Ok(Weights {
+            hidden: c.hidden,
+            vocab: c.vocab,
+            eps: d.eps,
+            n_layers: c.n_layers,
+            c: d,
+            embed: Vec::new(),
+            head: Vec::new(),
+            norm: Vec::new(),
+            layers: vec![Layer::load(src, c, layer, false)?],
+            target: Vec::new(),
+        })
     }
 
     /// Parameters held on the host, for the load report.
@@ -1176,13 +1258,7 @@ impl Weights {
         // The draft reads the streams this block starts from, averaged over the copies, before any sub-layer.
         collect_main(self, layer, h, t, h_dim, hc, main);
         // Attention: its mixes come from the streams, the pre-mix from the previous sub-layer.
-        let am = l.hc_attn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
-        let x = hc_pre(h, pre_mix, t, hc, h_dim);
-        let mut xn = x.clone();
-        rmsnorm(&mut xn, h_dim, &l.attn_norm, self.eps);
-        let attn_out = self.attention(l, &xn, t, shared, cache, hook, layer)?;
-        *h = hc_post(&attn_out, h, &am.post, &am.comb, t, hc, h_dim);
-        hook(&format!("attn{layer}"), &attn_out)?;
+        let am = self.attention_sub(l, layer, h, pre_mix, t, shared, cache, hook)?;
 
         // FFN: its own mixes, and the pre-mix the attention just produced.
         let fm = l.hc_ffn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
@@ -1198,6 +1274,37 @@ impl Weights {
         *pre_mix = fm.pre;
         hook(&format!("block{layer}"), h)?;
         Ok(())
+    }
+
+    /// The attention sub-layer of one block: the hyper-connection mixes of the streams, the collapse into the
+    /// sub-layer's input, the attention and the write back over the streams. Split out of `block` because it is a
+    /// stage of its own: a device block reproduces this half first, and `attention_block_stage_with` is its host side.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sub(
+        &self,
+        l: &Layer,
+        layer: usize,
+        h: &mut Vec<f32>,
+        pre_mix: &[f32],
+        t: usize,
+        shared: &mut Shared,
+        cache: Option<&mut LayerCache>,
+        hook: &mut impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<Mixes> {
+        let d = &self.c;
+        let (h_dim, hc) = (self.hidden, d.hc_mult);
+        let am = l.hc_attn.mixes(h, t, h_dim, hc, d.hc_iters, d.hc_eps);
+        hook(&format!("hc_attn_pre{layer}"), &am.pre)?;
+        hook(&format!("hc_attn_post{layer}"), &am.post)?;
+        hook(&format!("hc_attn_comb{layer}"), &am.comb)?;
+        let x = hc_pre(h, pre_mix, t, hc, h_dim);
+        hook(&format!("hc_attn_x{layer}"), &x)?;
+        let mut xn = x.clone();
+        rmsnorm(&mut xn, h_dim, &l.attn_norm, self.eps);
+        let attn_out = self.attention(l, &xn, t, shared, cache, hook, layer)?;
+        *h = hc_post(&attn_out, h, &am.post, &am.comb, t, hc, h_dim);
+        hook(&format!("attn{layer}"), &attn_out)?;
+        Ok(am)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1229,11 +1336,15 @@ impl Weights {
         };
         let mut qr = a.wq_a.mat(x, t);
         rmsnorm(&mut qr, a.q_lora, &a.q_norm, self.eps);
+        // The stages a device kernel is gated against, one hook each: the host graph is the specification.
+        hook(&format!("q_a{layer}"), &qr)?;
         let mut q = a.wq_b.mat(&qr, t);
         rope_heads(&mut q, t, heads, hd, rd, &inv, false);
+        hook(&format!("q_rope{layer}"), &q)?;
         let mut kv = a.wkv.mat(x, t);
         rmsnorm(&mut kv, hd, &a.kv_norm, self.eps);
         rope_rows(&mut kv, t, hd, rd, &inv, |i| i as f32, false);
+        hook(&format!("kv_rope{layer}"), &kv)?;
         let (win, wm) = window_idxs(t, d.window);
         let mut kv_all = kv.clone();
         let mut n_kv = t;
@@ -1334,6 +1445,7 @@ impl Weights {
             }
         }
         let out = sparse_attn(&q, &kv_all, n_kv, &a.sink, &idx, t, m, heads, hd);
+        hook(&format!("att_raw{layer}"), &out)?;
         Ok(self.out_projection(a, out, t))
     }
 
@@ -2850,6 +2962,8 @@ pub(crate) fn moe(
     }
     // The bias steers the selection only; the weights come from the raw scores.
     let mut out = vec![0f32; t * hidden];
+    // The selection of every position, for the device gate: the ids it takes and the weights it gives them.
+    let (mut all_ids, mut all_w) = (Vec::with_capacity(t * top_k), Vec::with_capacity(t * top_k));
     for i in 0..t {
         // An image-span token routes with the VL bias (`noaux_tc_for_vl`): it steers the selection only.
         let bias = match (&m.bias_vl, image_mask) {
@@ -2869,6 +2983,8 @@ pub(crate) fn moe(
         for v in w.iter_mut() {
             *v *= d.route_scale;
         }
+        all_ids.extend(top.iter().map(|&e| e as f32));
+        all_w.extend(w.iter().copied());
         let xi = &x[i * hidden..(i + 1) * hidden];
         let limit = d.swiglu_limit;
         for (slot, &e) in top.iter().enumerate() {
@@ -2886,6 +3002,8 @@ pub(crate) fn moe(
             *o += v;
         }
     }
+    hook(&format!("ffn_ids{layer}"), &all_ids)?;
+    hook(&format!("ffn_w{layer}"), &all_w)?;
     Ok(out)
 }
 

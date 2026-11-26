@@ -463,7 +463,7 @@ impl Model {
     /// A model whose graph is not the device stack: every weight field is empty and only the config, the stream and
     /// the small device buffers the engine expects are real. Inkling-2 and DeepSeek-V4.1 both fill their own field
     /// afterwards.
-    fn host_only(cfg: Config, kernels: Kernels, weight_bytes: usize, hadamard_seed: u64) -> Result<Self> {
+    pub(crate) fn host_only(cfg: Config, kernels: Kernels, weight_bytes: usize, hadamard_seed: u64) -> Result<Self> {
         Ok(Model {
             cfg,
             k: kernels,
