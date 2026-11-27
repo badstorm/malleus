@@ -684,7 +684,10 @@ impl BlockDev {
                 | Weights::Mls8 { q, sc } => q.len() + sc.len(),
             }
         }
-        let experts: usize = self.cache.map.values().map(|w| lin(&w.0) + lin(&w.1) + lin(&w.2)).sum();
+        let experts: usize = match &self.stack {
+            Some(v) => v.iter().map(|w| lin(&w.0) + lin(&w.1) + lin(&w.2)).sum(),
+            None => self.cache.map.values().map(|w| lin(&w.0) + lin(&w.1) + lin(&w.2)).sum(),
+        };
         let attn = match &self.attn {
             Attn::Window(a) => a.bytes(),
             Attn::Indexed(a) => a.bytes(),
@@ -760,7 +763,14 @@ impl BlockDev {
 
     /// One position of the whole block: the attention half, then the FFN half (the router, the six routed experts the
     /// position takes and the shared one), written back over the streams into `h_out`.
-    pub fn step(&mut self, m: &Model, h: &DeviceBuffer, src: &dyn TensorSource, pos: usize, lat: &mut Latent) -> Result<()> {
+    pub fn step(
+        &mut self,
+        m: &Model,
+        h: &DeviceBuffer,
+        src: &dyn TensorSource,
+        pos: usize,
+        lat: &mut Latent,
+    ) -> Result<()> {
         self.step_attention(m, h, pos, lat)?;
         let (s, k) = (&m.stream, &m.k);
         let (hc, hidden, inter) = (self.hc, self.hidden, self.inter);
@@ -881,6 +891,8 @@ impl BlockDev {
 /// per-dimension softmax of the gate over the group weighting the `kv` rows — then an RMSNorm and the rotation at the
 /// compressed base. `deepseek_text::compressor` is the reference, and `ckv{layer}` in its dump is `ckv` here.
 pub struct Compressor {
+    /// The layer it belongs to, for the diagnostics of a load that went wrong.
+    pub layer: usize,
     pub ratio: usize,
     pub hd: usize,
     pub groups: usize,
@@ -925,6 +937,7 @@ impl Compressor {
             r.beta_slow,
         );
         Ok(Compressor {
+            layer,
             ratio,
             hd,
             groups: 0,
@@ -989,7 +1002,6 @@ impl Compressor {
             self.lat = DeviceBuffer::zeroed(groups * hd * 4)?;
             self.ckv = DeviceBuffer::zeroed(groups * hd * 4)?;
         }
-        let wgate = self.wgate.as_ref().context("a ratio above 1 pools with a gate")?;
         m.gemm(
             s,
             &self.xr,
@@ -1001,30 +1013,40 @@ impl Compressor {
             t,
             false,
         )?;
-        m.gemm(
-            s,
-            &self.xr,
-            &self.xh,
-            &self.xsc,
-            &self.gate,
-            Act::X(xn),
-            wgate,
-            t,
-            false,
-        )?;
-        k.get("dsv_compress").launch(
-            (groups as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            s,
-            &[
-                (&self.lat).into(),
-                (&self.kv).into(),
-                (&self.gate).into(),
-                hd.into(),
-                ratio.into(),
-            ],
-        )?;
+        // A ratio of one compresses nothing: the row is the projection itself, normed and rotated at its position.
+        // Above it, the group pools with the gate.
+        if ratio == 1 {
+            self.lat.copy_from(0, &self.kv, 0, groups * hd * 4, s)?;
+        } else {
+            let wgate = self
+                .wgate
+                .as_ref()
+                .with_context(|| format!("layer {} pools with ratio {ratio} and has no gate", self.layer))?;
+            m.gemm(
+                s,
+                &self.xr,
+                &self.xh,
+                &self.xsc,
+                &self.gate,
+                Act::X(xn),
+                wgate,
+                t,
+                false,
+            )?;
+            k.get("dsv_compress").launch(
+                (groups as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                s,
+                &[
+                    (&self.lat).into(),
+                    (&self.kv).into(),
+                    (&self.gate).into(),
+                    hd.into(),
+                    ratio.into(),
+                ],
+            )?;
+        }
         k.get("dsv_rmsnorm").launch(
             (groups as u32, 1, 1),
             (256, 1, 1),
@@ -1106,6 +1128,8 @@ pub struct CompressedAttn {
     pub dim: usize,
     pub ix_heads: usize,
     pub topk: usize,
+    /// Whether this layer has an indexer of its own, or reads the one its source published.
+    pub has_ix: bool,
     /// This position's scores over the latent, and the list the attention reads (window slots, then `cap + row`).
     pub score: DeviceBuffer,
     pub sel: DeviceBuffer,
@@ -1117,9 +1141,9 @@ pub struct CompressedAttn {
     /// the compressor nor the key projection.
     xring: DeviceBuffer,
     ikey: DeviceBuffer,
-    wq_b: Linear,
+    wq_b: Option<Linear>,
     wk: Option<Linear>,
-    weights_proj: Linear,
+    weights_proj: Option<Linear>,
     k_norm: Option<DeviceBuffer>,
     /// The rotation of the index keys, at the compressed base.
     inv: DeviceBuffer,
@@ -1148,13 +1172,24 @@ impl CompressedAttn {
         };
         let mut up = Uploader::new()?;
         up.use_prefill = false;
-        let wq_b = up.linear(src, &p("attn.indexer.wq_b"), heads * dim, ql)?;
+        // Only an index source has an indexer; the layers of its group read the selection it publishes (the host
+        // graph's `shared.topk`).
+        let has_ix = d.index_source_layers.contains(&layer);
+        let wq_b = if has_ix {
+            Some(up.linear(src, &p("attn.indexer.wq_b"), heads * dim, ql)?)
+        } else {
+            None
+        };
         let wk = if owns_k {
             Some(up.linear(src, &p("attn.indexer.wk"), dim, hd)?)
         } else {
             None
         };
-        let weights_proj = up.linear(src, &p("attn.indexer.weights_proj"), heads, c.hidden)?;
+        let weights_proj = if has_ix {
+            Some(up.linear(src, &p("attn.indexer.weights_proj"), heads, c.hidden)?)
+        } else {
+            None
+        };
         let r = &d.rope_params;
         let inv = crate::deepseek_text::rope_inv(
             d.rope,
@@ -1174,6 +1209,7 @@ impl CompressedAttn {
             sel: DeviceBuffer::zeroed(m * 4)?,
             iq: DeviceBuffer::zeroed(heads * dim * 4)?,
             iw: DeviceBuffer::zeroed(heads * 4)?,
+            has_ix,
             xring: DeviceBuffer::zeroed((d.compress_ratios[layer] as usize) * c.hidden * 4)?,
             ikey: DeviceBuffer::zeroed(dim * 4)?,
             wq_b,
@@ -1209,21 +1245,14 @@ impl CompressedAttn {
         }
         self.attn.bytes()
             + self.comp.as_ref().map_or(0, Compressor::bytes)
-            + lin(&self.wq_b)
+            + self.wq_b.as_ref().map_or(0, lin)
             + self.wk.as_ref().map_or(0, lin)
-            + lin(&self.weights_proj)
+            + self.weights_proj.as_ref().map_or(0, lin)
     }
 
     /// Forgets the window. The latent belongs to the group's owner (`Latent::reset`).
     pub fn reset(&mut self) -> Result<()> {
         self.attn.reset()
-    }
-
-    fn grow(&mut self, n: usize) -> Result<()> {
-        if n * 4 > self.score.len() {
-            self.score = DeviceBuffer::zeroed(n * 2 * 4)?;
-        }
-        Ok(())
     }
 
     /// One position: the projections, the ring, a new latent row every `ratio` positions with its index key (only the
@@ -1236,7 +1265,8 @@ impl CompressedAttn {
         let (hd, hidden, ratio) = (self.attn.hd, self.attn.hidden, self.ratio);
         if let Some(comp) = self.comp.as_mut() {
             // The group the compressor pools: this position's input and the ones before it in the same group.
-            self.xring.copy_from((pos % ratio) * hidden * 4, &self.attn.xn, 0, hidden * 4, s)?;
+            self.xring
+                .copy_from((pos % ratio) * hidden * 4, &self.attn.xn, 0, hidden * 4, s)?;
             if pos % ratio == ratio - 1 {
                 let row = lat.n_ix;
                 lat.grow(row + 1)?;
@@ -1249,7 +1279,17 @@ impl CompressedAttn {
                     self.k_norm.as_ref().context("a KV owner without its key norm")?,
                 );
                 let key = &self.ikey;
-                m.gemm(s, &self.attn.xr, &self.attn.xh, &self.attn.xsc, key, Act::X(&comp.lat), wk, 1, false)?;
+                m.gemm(
+                    s,
+                    &self.attn.xr,
+                    &self.attn.xh,
+                    &self.attn.xsc,
+                    key,
+                    Act::X(&comp.lat),
+                    wk,
+                    1,
+                    false,
+                )?;
                 k.get("dsv_rmsnorm").launch(
                     (1, 1, 1),
                     (256, 1, 1),
@@ -1282,77 +1322,96 @@ impl CompressedAttn {
             }
         }
         // The indexer: its query on the low-rank query, its weights on the input, the scores over every latent row.
-        m.gemm(s, &self.attn.xr, &self.attn.xh, &self.attn.xsc, &self.iq, Act::X(&self.attn.qr), &self.wq_b, 1, false)?;
-        m.gemm(
-            s,
-            &self.attn.xr,
-            &self.attn.xh,
-            &self.attn.xsc,
-            &self.iw,
-            Act::X(&self.attn.xn),
-            &self.weights_proj,
-            1,
-            false,
-        )?;
-        let rotary = (((self.ix_heads * self.attn.rope) / 2).div_ceil(256)) as u32;
-        k.get("dsv_rope").launch(
-            (rotary.max(1), 1, 1),
-            (256, 1, 1),
-            0,
-            s,
-            &[
-                (&self.iq).into(),
-                (&self.iq).into(),
-                (&self.inv).into(),
-                1i32.into(),
-                self.ix_heads.into(),
-                self.dim.into(),
-                self.attn.rope.into(),
-                0i32.into(),
-                pos.into(),
-                1i32.into(),
-                1i32.into(),
-            ],
-        )?;
-        let scale = (self.dim as f32).powf(-0.5) * (self.ix_heads as f32).powf(-0.5);
+        // A layer without one of its own reads the list its source published for this position.
+        let window_slots = self.attn.window.min(pos + 1);
+        let m_slots = window_slots + self.topk;
         let n_ix = lat.n_ix;
-        if n_ix > 0 {
-            k.get("dsv_ix_score").launch(
-                ((n_ix as u32).div_ceil(128), 1, 1),
-                (128, 1, 1),
+        if self.has_ix {
+            let (wq_b, weights_proj) = (
+                self.wq_b.as_ref().context("an index source without its query")?,
+                self.weights_proj
+                    .as_ref()
+                    .context("an index source without its weights")?,
+            );
+            m.gemm(
+                s,
+                &self.attn.xr,
+                &self.attn.xh,
+                &self.attn.xsc,
+                &self.iq,
+                Act::X(&self.attn.qr),
+                wq_b,
+                1,
+                false,
+            )?;
+            m.gemm(
+                s,
+                &self.attn.xr,
+                &self.attn.xh,
+                &self.attn.xsc,
+                &self.iw,
+                Act::X(&self.attn.xn),
+                weights_proj,
+                1,
+                false,
+            )?;
+            let rotary = (((self.ix_heads * self.attn.rope) / 2).div_ceil(256)) as u32;
+            k.get("dsv_rope").launch(
+                (rotary.max(1), 1, 1),
+                (256, 1, 1),
                 0,
                 s,
                 &[
-                    (&self.score).into(),
                     (&self.iq).into(),
-                    (&lat.ik).into(),
-                    (&self.iw).into(),
+                    (&self.iq).into(),
+                    (&self.inv).into(),
                     1i32.into(),
                     self.ix_heads.into(),
                     self.dim.into(),
+                    self.attn.rope.into(),
+                    0i32.into(),
+                    pos.into(),
+                    1i32.into(),
+                    1i32.into(),
+                ],
+            )?;
+            let scale = (self.dim as f32).powf(-0.5) * (self.ix_heads as f32).powf(-0.5);
+            if n_ix > 0 {
+                k.get("dsv_ix_score").launch(
+                    ((n_ix as u32).div_ceil(128), 1, 1),
+                    (128, 1, 1),
+                    0,
+                    s,
+                    &[
+                        (&self.score).into(),
+                        (&self.iq).into(),
+                        (&lat.ik).into(),
+                        (&self.iw).into(),
+                        1i32.into(),
+                        self.ix_heads.into(),
+                        self.dim.into(),
+                        n_ix.into(),
+                        scale.into(),
+                    ],
+                )?;
+            }
+            k.get("dsv_ix_topk").launch(
+                (1, 1, 1),
+                (32, 1, 1),
+                (n_ix.max(1) * 4) as u32,
+                s,
+                &[
+                    (&self.sel).into(),
+                    (&self.score).into(),
+                    pos.into(),
                     n_ix.into(),
-                    scale.into(),
+                    self.topk.into(),
+                    (self.ratio as i32).into(),
+                    self.attn.window.into(),
+                    window_slots.into(),
                 ],
             )?;
         }
-        let window_slots = self.attn.window.min(pos + 1);
-        let m_slots = window_slots + self.topk;
-        k.get("dsv_ix_topk").launch(
-            (1, 1, 1),
-            (32, 1, 1),
-            (n_ix.max(1) * 4) as u32,
-            s,
-            &[
-                (&self.sel).into(),
-                (&self.score).into(),
-                pos.into(),
-                n_ix.into(),
-                self.topk.into(),
-                (self.ratio as i32).into(),
-                self.attn.window.into(),
-                window_slots.into(),
-            ],
-        )?;
         // The attention over the union: the window's ring, then the selected latent rows.
         let scale = 1.0 / (hd as f32).sqrt();
         k.get("dsv_attn_cached").launch(
@@ -1481,6 +1540,19 @@ impl DeepseekDevice {
     /// One position: the token's row becomes the streams, every block runs, and the head turns the last state into
     /// logits. `pos` is the position in the sequence (the caches and the rotations both need it).
     pub fn step(&mut self, m: &Model, src: &dyn TensorSource, id: u32, pos: usize) -> Result<()> {
+        self.step_with(m, src, id, pos, |_, _| Ok(()))
+    }
+
+    /// The same, telling the caller where it is after every block: `block{layer}` in the host graph's dump is the same
+    /// value, which is what turns a divergence into a layer number.
+    pub fn step_with(
+        &mut self,
+        m: &Model,
+        src: &dyn TensorSource,
+        id: u32,
+        pos: usize,
+        mut on_layer: impl FnMut(usize, &DeviceBuffer) -> Result<()>,
+    ) -> Result<()> {
         let (s, k) = (&m.stream, &m.k);
         let (hc, hidden) = (self.hc, self.hidden);
         k.get("dsv_embed").launch(
@@ -1506,11 +1578,7 @@ impl DeepseekDevice {
             self.layers[i].pre_mix_from(m, &self.pre_mix)?;
             let which = self.latent_of[i];
             // A window layer has no latent; an indexed one borrows its group's, the owner appends to it.
-            let lat = if which == usize::MAX {
-                None
-            } else {
-                Some(which)
-            };
+            let lat = if which == usize::MAX { None } else { Some(which) };
             match lat {
                 Some(k) => {
                     let mut shared = std::mem::replace(&mut self.latents[k], Latent::new(1, 1)?);
@@ -1525,6 +1593,8 @@ impl DeepseekDevice {
             // The block's streams and the collapse weights its FFN left for the next one.
             self.h.copy_from(0, &self.layers[i].h_out, 0, hc * hidden * 4, s)?;
             self.pre_mix.copy_from(0, self.layers[i].f_pre(), 0, hc * 4, s)?;
+            m.stream.synchronize()?;
+            on_layer(i, &self.h)?;
         }
         // The streams collapse with the last sub-layer's weights, then the final norm and the head.
         k.get("dsv_hc_pre").launch(
@@ -2266,6 +2336,10 @@ mod tests {
         let t = ids.len();
 
         // The host graph, streamed, on the same file: the reference. Dropped before the device model loads.
+        thread_local! {
+            static HOST_BLOCKS: std::cell::RefCell<std::collections::HashMap<String, Vec<f32>>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+        }
         let want = {
             let tables: crate::deepseek_text::Source =
                 Box::new(malleus_gguf::gguf::Gguf::open(std::path::Path::new(&engram)).unwrap());
@@ -2283,8 +2357,15 @@ mod tests {
                 .with_experts_held(8)
                 .with_blocks()
                 .unwrap();
-            let out = s.logits(&ids).unwrap();
+            let mut blocks: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+            let out = s
+                .run_with(&ids, |_, _| {}, &mut |name: &str, values: &[f32]| {
+                    blocks.insert(name.to_string(), values.to_vec());
+                    Ok(())
+                })
+                .unwrap();
             eprintln!("host: logits of {} positions in {:.0}s", t, t0.elapsed().as_secs_f64());
+            HOST_BLOCKS.with(|c| *c.borrow_mut() = blocks);
             out
         };
 
@@ -2303,11 +2384,29 @@ mod tests {
             t0.elapsed().as_secs_f64()
         );
         let mut row = vec![0f32; c.vocab];
+        let hc = dev.hc;
         for (pos, id) in ids.iter().enumerate() {
             let t0 = std::time::Instant::now();
-            dev.step(&m, &g, *id, pos).unwrap();
+            let mut first = None;
+            dev.step_with(&m, &g, *id, pos, |layer, h| {
+                let got = h.download::<f32>(hc * c.hidden)?;
+                let name = format!("block{layer}");
+                if let Some(want) = HOST_BLOCKS.with(|c| c.borrow().get(&name).cloned()) {
+                    let at = pos * hc * c.hidden;
+                    let want = &want[at..at + hc * c.hidden];
+                    let cos = cos(&got, want);
+                    if first.is_none() && cos < 0.999 {
+                        first = Some((layer, cos));
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+            eprintln!(
+                "  position {pos}: {:.2} s, first divergent block {first:?}",
+                t0.elapsed().as_secs_f64()
+            );
             row = dev.logits().unwrap();
-            eprintln!("  position {pos}: {:.2} s", t0.elapsed().as_secs_f64());
         }
         m.stream.synchronize().unwrap();
         let last = &want[(t - 1) * c.vocab..];
