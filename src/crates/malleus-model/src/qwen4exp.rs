@@ -12,6 +12,16 @@ use crate::session::{ATTN_WMMA_MIN, IdxStates, Scratch, Session, f32s};
 use crate::upload::Uploader;
 use crate::weights::{GEMV_MAX_T, Linear, Weights, mls8_of};
 
+/// Scratch of the multi-block selection of one layer (`Session::idx_sel_part`): `GMAX` slice histograms of `NBIN`
+/// ints, then one tie count and one tie offset per (slice, thread), then the (prefix, need) state of the radix.
+const IDX_SEL_GMAX: usize = 32;
+const IDX_SEL_NBIN: usize = 4096;
+const IDX_SEL_NT: usize = 256;
+const IDX_SEL_PART_INTS: usize = IDX_SEL_GMAX * IDX_SEL_NBIN + 2 * IDX_SEL_GMAX * IDX_SEL_NT + 2;
+/// Below this many complete blocks the row is short enough that one workgroup is the cheaper shape (and the
+/// single-block kernel is what prefill and verify keep using).
+const IDX_SEL_PAR_MIN: usize = 8192;
+
 /// Qwen3.8-Flash-Next spells `model_type: qwen4_exp_text` under `text_config`; the other families leave the
 /// three shapes below absent.
 fn qwen4(t: &Value) -> bool {
@@ -847,6 +857,9 @@ impl Model {
                 rows,
             ));
         }
+        if sess.idx_sel_part.is_none() {
+            sess.idx_sel_part = Some(DeviceBuffer::alloc(IDX_SEL_PART_INTS * 4)?);
+        }
         Ok(())
     }
 
@@ -880,6 +893,7 @@ impl Model {
             tp: &sess.idx_tp,
             sel: self.idx_sel_bufs(sess, sess.len, t)?,
             list: sess.idx_list.as_ref().map(|(b, r)| (b, *r)),
+            part: sess.idx_sel_part.as_ref(),
             cache: Some(&sess.idx_sel_cache),
             reuse,
         }))
@@ -1055,7 +1069,97 @@ impl Model {
                     // The 4096-bin radix pays 16 KB of LDS and three histogram sweeps; it wins from ~64K blocks
                     // (a 64K-token context) and loses below, where the 256-bin four-pass kernel is cheaper. At 98K
                     // it is 3.67 -> 2.51 s with the same bitset.
-                    if sel12 {
+                    // Decode is nq = 1: one workgroup walked the whole score row on one CU, which is 186 us of
+                    // every layer at 32K blocks and grows with the depth (~7 ms/token at 1M). Above
+                    // `IDX_SEL_PAR_MIN` blocks the same radix runs over the whole GPU, one slice a block, with the
+                    // same digits (12/12/8), the same threshold and the same tie order, so the bitset is
+                    // bit-identical (`MALLEUS_IDX_SEL_PAR=0` keeps the one-workgroup path for the A/B).
+                    let par = std::env::var("MALLEUS_IDX_SEL_PAR").map_or(self.k.arch == "gfx1151", |v| v != "0");
+                    let slices = if par && nq == 1 && maxb >= IDX_SEL_PAR_MIN {
+                        Some((maxb / 2048).clamp(2, IDX_SEL_GMAX))
+                    } else {
+                        None
+                    };
+                    if let (Some(g), Some(part)) = (slices, is.part) {
+                        let ints = |n: usize| Arg::U64(part.addr() + (n * 4) as u64);
+                        let hist = ints(0);
+                        let ties = ints(IDX_SEL_GMAX * IDX_SEL_NBIN);
+                        let off = ints(IDX_SEL_GMAX * IDX_SEL_NBIN + IDX_SEL_GMAX * IDX_SEL_NT);
+                        let state = ints(IDX_SEL_GMAX * IDX_SEL_NBIN + 2 * IDX_SEL_GMAX * IDX_SEL_NT);
+                        let row = Arg::U64(sel.addr() + (q0 * w * 4) as u64);
+                        for (pass, (shift, nbin)) in [(20usize, 4096usize), (8, 4096), (0, 256)].into_iter().enumerate()
+                        {
+                            self.k.get("idx_sel_hist").launch(
+                                (g as u32, 1, 1),
+                                (IDX_SEL_NT as u32, 1, 1),
+                                0,
+                                st,
+                                &[
+                                    hist,
+                                    state,
+                                    scores.into(),
+                                    (&sc.len_dev).into(),
+                                    q0.into(),
+                                    0usize.into(),
+                                    r.into(),
+                                    ld.into(),
+                                    shift.into(),
+                                    nbin.into(),
+                                    (if pass == 0 { ic.budget as i32 / r as i32 } else { -1 }).into(),
+                                    g.into(),
+                                ],
+                            )?;
+                            self.k.get("idx_sel_merge").launch(
+                                (1, 1, 1),
+                                (IDX_SEL_NT as u32, 1, 1),
+                                0,
+                                st,
+                                &[state, hist, shift.into(), nbin.into(), g.into()],
+                            )?;
+                        }
+                        self.k.get("idx_sel_ties").launch(
+                            (g as u32, 1, 1),
+                            (IDX_SEL_NT as u32, 1, 1),
+                            0,
+                            st,
+                            &[
+                                ties,
+                                state,
+                                scores.into(),
+                                (&sc.len_dev).into(),
+                                q0.into(),
+                                0usize.into(),
+                                r.into(),
+                                ld.into(),
+                                g.into(),
+                            ],
+                        )?;
+                        self.k.get("idx_sel_off").launch(
+                            (1, 1, 1),
+                            (IDX_SEL_NT as u32, 1, 1),
+                            0,
+                            st,
+                            &[off, ties, row, w.into(), (g * IDX_SEL_NT).into()],
+                        )?;
+                        self.k.get("idx_sel_apply").launch(
+                            (g as u32, 1, 1),
+                            (IDX_SEL_NT as u32, 1, 1),
+                            0,
+                            st,
+                            &[
+                                row,
+                                off,
+                                state,
+                                scores.into(),
+                                (&sc.len_dev).into(),
+                                q0.into(),
+                                0usize.into(),
+                                r.into(),
+                                ld.into(),
+                                g.into(),
+                            ],
+                        )?;
+                    } else if sel12 {
                         // One query (decode/verify) is one block on one CU: 1024 threads hide the row's latency;
                         // prefill keeps the 256-thread tile.
                         let (name, threads) = if nq == 1 {
