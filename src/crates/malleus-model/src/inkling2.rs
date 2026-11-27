@@ -1462,6 +1462,9 @@ pub struct Draft {
     rows: usize,
     len: usize,
     base_pos: usize,
+    /// The zeroed bias tile: allocated and kept with the head (the decode attention takes the pointer), but no
+    /// current kernel reads it, so the lint sees it as dead.
+    #[expect(dead_code, reason = "zero bias tile: kept for the transport, no kernel reads it yet")]
     bias: DeviceBuffer,
     /// `unembed @ hidden_out` as `[rank, vocab]` bf16 and `unembed @ hidden_out.bias` as `[vocab]` f32, built at the
     /// first draft (118 GFLOP once, 103 MB): the folded Markov bias, read once per draft row.

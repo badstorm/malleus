@@ -619,6 +619,9 @@ struct Worker {
     /// MTP drafts per decode step (0: plain decode).
     drafts: usize,
     draft_pmin: f32,
+    /// Greedy steps read back the argmax instead of the logits row (`MALLEUS_STEP_ARGMAX=0` keeps the host fold,
+    /// for the A/B).
+    step_argmax: bool,
     /// Prompt-lookup drafts from the context when they agree with the MTP head.
     lookup: bool,
     /// Prompt snapshots kept per slot.
@@ -1252,7 +1255,20 @@ impl Worker {
         let spec = drafts > 0
             && sess.len + 2 <= act.ctx
             && (model.has_block_draft() || model.mtp_pending(sess) == act.pend.len());
+        // Greedy without penalties and without `logprobs`: the token is the argmax, computed on the device, and
+        // the row never crosses the bus. Sampled or penalized requests keep the host fold.
+        let greedy = self.step_argmax
+            && !act.req.logprobs
+            && act.req.sampling.temperature <= 0.0
+            && !act.req.sampling.penalizes();
         if !spec {
+            if greedy {
+                let next = model.forward_argmax(sess, &[tok])?;
+                cached.push(tok);
+                act.pend = vec![next];
+                act.tok = next;
+                return Ok(Progress::More);
+            }
             let mut logits = model.forward(sess, &[tok], None, 1)?;
             mask_pad(&mut logits, real);
             cached.push(tok);
@@ -1281,6 +1297,30 @@ impl Worker {
         cached.pop();
         let nd = ds.len();
         let toks: Vec<u32> = std::iter::once(tok).chain(ds.iter().copied()).collect();
+        if greedy {
+            // The verify's rows stay on the device: row `i` predicts `toks[i + 1]`, so draft `i` is accepted when
+            // the argmax of row `i` is that draft, and the first row that disagrees gives the fallback token.
+            let a = model.forward_verify_argmax(sess, &toks)?;
+            let mut acc = 0;
+            while acc < nd && a[acc] == ds[acc] {
+                acc += 1;
+            }
+            let y = a[acc];
+            model.rollback(sess, nd - acc)?;
+            cached.push(tok);
+            cached.extend_from_slice(&ds[..acc]);
+            cached.push(y);
+            for &d in &ds[..acc] {
+                if !act.emit(d, None) {
+                    return Ok(Progress::Done);
+                }
+            }
+            act.pend = ds[..acc].to_vec();
+            act.pend.push(y);
+            act.tok = y;
+            act.top = None;
+            return Ok(Progress::More);
+        }
         let mut l = model.forward_verify(sess, &toks)?;
         for row in l.chunks_mut(vocab) {
             mask_pad(row, real);
@@ -1365,6 +1405,7 @@ fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Resu
             spec: spec.clone(),
             drafts: 0,
             draft_pmin: DEFAULT_DRAFT_PMIN,
+            step_argmax: false,
             lookup: false,
             max_snaps: 0,
             quantum: 1,
@@ -1432,6 +1473,7 @@ fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Resu
             0
         },
         draft_pmin: env_or("MALLEUS_DRAFT_PMIN", DEFAULT_DRAFT_PMIN),
+        step_argmax: std::env::var("MALLEUS_STEP_ARGMAX").map_or(true, |v| v != "0"),
         lookup: std::env::var("MALLEUS_LOOKUP").map_or(true, |v| v != "0"),
         max_snaps,
         quantum,

@@ -738,6 +738,53 @@ extern "C" __global__ void __launch_bounds__(IDX_SEL_NT) idx_sel_apply(uint32_t*
 
 // Greedy argmax of one logits row on the device: first maximum wins, ties keep the lower token id, like the host
 // fold it replaces. One block, 1024 threads; the host then reads four bytes instead of the whole row.
+/// Greedy argmax of `rows` logits rows in one launch: block `r` scans row `r` (with `n` the model's real
+/// vocabulary, so a padded token never wins) and writes `out[r]`. A speculative round used to send every row of the
+/// verify across the bus and decide on the host; the rows stay on the device now, and the host reads `rows` ids.
+extern "C" __global__ void __launch_bounds__(1024) logits_argmax_rows(int* out, const float* x, int n) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const float* row = x + (size_t)blockIdx.x * n;
+    float v = -INFINITY;
+    int idx = 0;
+    for (int i = threadIdx.x; i < n; i += 1024) {
+        const float xv = row[i];
+        if (xv > v || (xv == v && i < idx)) {
+            v = xv;
+            idx = i;
+        }
+    }
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+        const float ov = __shfl_down(v, d);
+        const int oi = __shfl_down(idx, d);
+        if (ov > v || (ov == v && oi < idx)) {
+            v = ov;
+            idx = oi;
+        }
+    }
+    if (lane == 0) {
+        bv[warp] = v;
+        bi[warp] = idx;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        v = lane < 32 ? bv[lane] : -INFINITY;
+        idx = lane < 32 ? bi[lane] : 0;
+#pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            const float ov = __shfl_down(v, d);
+            const int oi = __shfl_down(idx, d);
+            if (ov > v || (ov == v && oi < idx)) {
+                v = ov;
+                idx = oi;
+            }
+        }
+        if (lane == 0) out[blockIdx.x] = idx;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(1024) logits_argmax(int* out, const float* x, int n) {
     __shared__ float bv[32];
     __shared__ int bi[32];
