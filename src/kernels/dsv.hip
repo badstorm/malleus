@@ -420,3 +420,17 @@ extern "C" __global__ void __launch_bounds__(256) dsv_attn_cached(float* out, co
     int c = 0;
     for (int d = threadIdx.x; d < hd; d += 256, ++c) oh[d] = acc[c] * inv;
 }
+
+// The token table's row for one position, as f32: the embedding is a lookup, and the row is the input of the first
+// block's streams.
+extern "C" __global__ void dsv_embed(float* out, const uint16_t* table, int id, int h) {
+    const uint16_t* row = table + (size_t)id * h;
+    for (int i = threadIdx.x; i < h; i += blockDim.x) out[i] = __uint_as_float(((uint32_t)row[i]) << 16);
+}
+
+// The first block's streams: the embedded row in every copy of the residual.
+extern "C" __global__ void dsv_bcast(float* out, const float* x, int hc, int h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hc * h) return;
+    out[i] = x[i % h];
+}
