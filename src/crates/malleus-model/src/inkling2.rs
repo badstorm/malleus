@@ -1535,7 +1535,7 @@ pub fn session_bytes(cfg: &Config, ctx: usize) -> u64 {
         let (rows, _) = slot_shape(i, cfg.kind[slot_layer(i, cfg.n_layers, s)] == MixerKind::AttnFull, ctx);
         t += rows as u64 * kvd * 2 + rows as u64 * i.kv_heads as u64 * 8 + hist;
     }
-    t += (i.heads * ctx * 4) as u64;
+    t += (i.heads * i.rel_extent * 4) as u64;
     t += 4;
     let feat_rows = if draft_enabled() { FEAT_ROWS } else { DRAFT_ROWS };
     t += (4 * feat_rows * cfg.hidden * 4) as u64;
@@ -1607,7 +1607,8 @@ impl Cache {
             max: max_ctx,
             len: 0,
             slots: out,
-            bias: f32s(i.heads * max_ctx)?,
+            // The relative-bias tile is [heads, extent]: it does not grow with the context (issue #158).
+            bias: f32s(i.heads * i.rel_extent)?,
             tau: f32s(1)?,
             feats: f32s(4 * if draft.is_some() { FEAT_ROWS } else { DRAFT_ROWS } * c.hidden)?,
             feat_rows: 0,
@@ -2310,7 +2311,7 @@ impl Graph {
                 let nk = pos_j + 1 - k0;
                 let qd = (j * heads * hd * 4) as u64;
                 model.k.get("inkling2_rel_bias_dec").launch(
-                    ((heads * nk).div_ceil(256) as u32, 1, 1),
+                    ((heads * i.rel_extent).div_ceil(256) as u32, 1, 1),
                     (256, 1, 1),
                     0,
                     st,
@@ -2318,9 +2319,6 @@ impl Graph {
                         p.bias.into(),
                         Arg::U64(self.r.addr() + (j * heads * d_rel * 4) as u64),
                         (&layer.rel_logits).into(),
-                        pos_j.into(),
-                        k0.into(),
-                        nk.into(),
                         heads.into(),
                         d_rel.into(),
                         i.rel_extent.into(),
@@ -2351,6 +2349,8 @@ impl Graph {
                         kv.into(),
                         hd.into(),
                         ring.into(),
+                        pos_j.into(),
+                        i.rel_extent.into(),
                         scale.into(),
                     ],
                 )?;
@@ -4069,7 +4069,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                     (&d.ks[s]).into(),
                     (&d.v[s]).into(),
                     (&d.vs[s]).into(),
-                    (&d.bias).into(),
+                    Arg::Ptr(0),
                     Arg::Ptr(0),
                     Arg::Ptr(0),
                     k0.into(),
@@ -4077,6 +4077,7 @@ pub fn draft(model: &Model, cache: &mut Cache, anchor: u32, n: usize) -> Result<
                     heads.into(),
                     nkv.into(),
                     hd.into(),
+                    0i32.into(),
                     0i32.into(),
                     scale.into(),
                 ],

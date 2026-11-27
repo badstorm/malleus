@@ -429,18 +429,19 @@ IK_ATTN_WMMA(inkling2_attn_wmma_cached, true)
 // The relative bias of one query row against `nk` cached keys, for the decode path: bias is [heads, nk], `rel` is
 // [heads, d_rel] of the single query row. One thread per (head, key).
 extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias_dec(float* bias, const float* rel,
-                                                                      const float* proj, int pos, int k0, int nk,
-                                                                      int heads, int d_rel, int extent) {
+                                                                      const float* proj, int heads, int d_rel,
+                                                                      int extent) {
+    // The tile depends on the query row and on the relative distance alone: for every head and every distance the
+    // sixteen taps of `rel` against that column of `proj`. It is `[heads, extent]` — 98 KB for this model — where it
+    // used to be `[heads, nk]`, i.e. 24 MB a row a full layer at a 256K context, most of it zeros beyond `extent`
+    // (issue #158). Which distances a key has is `attn_dec`'s mask, not the tile's.
     const long long idx = (long long)blockIdx.x * 256 + threadIdx.x;
-    if (idx >= (long long)heads * nk) return;
-    const int h = (int)(idx / nk), s = (int)(idx % nk);
-    const int d = pos - (k0 + s);
+    if (idx >= (long long)heads * extent) return;
+    const int h = (int)(idx / extent), d = (int)(idx % extent);
+    const float* rp = rel + (size_t)h * d_rel;
     float acc = 0.f;
-    if (d >= 0 && d < extent) {
-        const float* rp = rel + (size_t)h * d_rel;
-        for (int i = 0; i < d_rel; ++i) acc += rp[i] * proj[(size_t)i * extent + d];
-    }
-    bias[idx] = acc;
+    for (int i = 0; i < d_rel; ++i) acc += rp[i] * proj[(size_t)i * extent + d];
+    bias[(size_t)h * extent + d] = acc;
 }
 
 // The attention residual (issue #62): a learned query attends over the running stack of block states plus the
@@ -721,7 +722,8 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, 
                                                                   const float* ksc, const signed char* v,
                                                                   const float* vsc, const float* bias,
                                                                   const float* sink, const float* gate, int k0, int nk,
-                                                                  int heads, int nkv, int dim, int ring, float scale) {
+                                                                  int heads, int nkv, int dim, int ring, int qpos,
+                                                                  int extent, float scale) {
     __shared__ float sm[8], sl[8], sa[8][128];
     const int h = blockIdx.x, kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -758,7 +760,9 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, 
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             const int at = i + u, row = ring > 0 ? (k0 + at >= ring ? k0 + at - ring : k0 + at) : k0 + at;
-            const float sc = d[u] * scale + bias[(size_t)h * nk + at];
+            // The relative bias is zero beyond `extent` positions; the tile is `[heads, extent]` (issue #158).
+            const int dpos = bias ? qpos - (k0 + at) : -1;
+            const float sc = d[u] * scale + (dpos >= 0 && dpos < extent ? bias[(size_t)h * extent + dpos] : 0.f);
             const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
             const float vs = vsc[(size_t)row * nkv + kh];
             const int vbits = *(const int*)(v + ((size_t)row * nkv + kh) * dim + 4 * lane);
@@ -782,7 +786,8 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_attn_dec(float* out, 
         float d = qv.x * ka + qv.y * kb + qv.z * kc + qv.w * kd;
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
-        const float sc = d * scale + bias[(size_t)h * nk + i];
+        const int dpos = bias ? qpos - (k0 + i) : -1;
+        const float sc = d * scale + (dpos >= 0 && dpos < extent ? bias[(size_t)h * extent + dpos] : 0.f);
         const float mn = fmaxf(m, sc), corr = __expf(m - mn), p = __expf(sc - mn);
         const float vscale = vsc[(size_t)row * nkv + kh];
         const int vbits = *(const int*)(v + ((size_t)row * nkv + kh) * dim + 4 * lane);
