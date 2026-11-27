@@ -28,7 +28,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::TensorSource;
-use malleus_hip::{DeviceBuffer, Stream};
+use malleus_hip::{Arg, DeviceBuffer, Stream};
 
 use crate::config::Config;
 use crate::engine::{Act, Model};
@@ -537,10 +537,18 @@ impl Attn {
 
     /// The projections, the attention and the output projection of one position; `att` keeps the raw attention
     /// output and `out` the layer's.
-    fn run(&mut self, m: &Model, x: &DeviceBuffer, pos: usize, lat: &mut Latent, sel: &mut Selection) -> Result<()> {
+    fn run(
+        &mut self,
+        m: &Model,
+        x: &DeviceBuffer,
+        pos: usize,
+        lat: &mut Latent,
+        sel: &mut Selection,
+        cand: Option<&mut Candidates>,
+    ) -> Result<()> {
         match self {
             Attn::Window(a) => a.step(m, x, pos),
-            Attn::Indexed(a) => a.step(m, x, pos, lat, sel),
+            Attn::Indexed(a) => a.step(m, x, pos, lat, sel, cand),
         }
     }
 
@@ -732,6 +740,7 @@ impl BlockDev {
         pos: usize,
         lat: &mut Latent,
         sel: &mut Selection,
+        cand: Option<&mut Candidates>,
     ) -> Result<()> {
         let (s, k) = (&m.stream, &m.k);
         let (hc, hidden) = (self.hc, self.hidden);
@@ -749,7 +758,7 @@ impl BlockDev {
                 hidden.into(),
             ],
         )?;
-        self.attn.run(m, &self.x, pos, lat, sel)?;
+        self.attn.run(m, &self.x, pos, lat, sel, cand)?;
         k.get("dsv_hc_post").launch(
             ((hc * hidden).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
@@ -778,8 +787,9 @@ impl BlockDev {
         pos: usize,
         lat: &mut Latent,
         sel: &mut Selection,
+        cand: Option<&mut Candidates>,
     ) -> Result<()> {
-        self.step_attention(m, h, pos, lat, sel)?;
+        self.step_attention(m, h, pos, lat, sel, cand)?;
         let (s, k) = (&m.stream, &m.k);
         let (hc, hidden, inter) = (self.hc, self.hidden, self.inter);
         let (xr, xh, xsc) = (&self.attn.window().xr, &self.attn.window().xh, &self.attn.window().xsc);
@@ -1145,6 +1155,36 @@ impl Selection {
     }
 }
 
+/// The per-block candidate mask written by the candidate source layer and consumed by every later index source.
+/// Sized from `Latent` capacity and reallocated when it grows.
+pub struct Candidates {
+    pub mask: DeviceBuffer,
+    pub block_size: usize,
+    pub topk_blocks: usize,
+    pub blocks: usize,
+}
+
+impl Candidates {
+    pub fn new(block_size: usize, topk_blocks: usize) -> Result<Self> {
+        Ok(Candidates {
+            mask: DeviceBuffer::zeroed(1)?,
+            block_size,
+            topk_blocks,
+            blocks: 0,
+        })
+    }
+
+    pub fn grow(&mut self, n_ix: usize) -> Result<()> {
+        let need = n_ix.div_ceil(self.block_size);
+        if need > self.blocks {
+            let cap = (need * 2).max(64);
+            self.mask = DeviceBuffer::zeroed(cap)?;
+            self.blocks = cap;
+        }
+        Ok(())
+    }
+}
+
 pub struct CompressedAttn {
     pub attn: WindowAttn,
     pub ratio: usize,
@@ -1153,6 +1193,8 @@ pub struct CompressedAttn {
     pub topk: usize,
     /// Whether this layer has an indexer of its own, or reads the one its source published.
     pub has_ix: bool,
+    /// Whether this layer is the candidate source that writes the first-level mask.
+    pub is_candidate: bool,
     /// This position's scores over the latent, and the list the attention reads (window slots, then `cap + row`).
     pub score: DeviceBuffer,
     /// The indexer's query and its per-head weight, for one position.
@@ -1197,6 +1239,7 @@ impl CompressedAttn {
         // Only an index source has an indexer; the layers of its group read the selection it publishes (the host
         // graph's `shared.topk`).
         let has_ix = d.index_source_layers.contains(&layer);
+        let is_candidate = d.candidate.as_ref().is_some_and(|cand| cand.source_layer == layer);
         let wq_b = if has_ix {
             Some(up.linear(src, &p("attn.indexer.wq_b"), heads * dim, ql)?)
         } else {
@@ -1230,6 +1273,7 @@ impl CompressedAttn {
             iq: DeviceBuffer::zeroed(heads * dim * 4)?,
             iw: DeviceBuffer::zeroed(heads * 4)?,
             has_ix,
+            is_candidate,
             xring: DeviceBuffer::zeroed((d.compress_ratios[layer] as usize) * c.hidden * 4)?,
             ikey: DeviceBuffer::zeroed(dim * 4)?,
             wq_b,
@@ -1285,6 +1329,7 @@ impl CompressedAttn {
         pos: usize,
         lat: &mut Latent,
         sel: &mut Selection,
+        cand: Option<&mut Candidates>,
     ) -> Result<()> {
         self.attn.project(m, x, pos)?;
         self.attn.ring_write(m, pos)?;
@@ -1422,6 +1467,35 @@ impl CompressedAttn {
                     ],
                 )?;
             }
+            let (mask_arg, bs_arg): (Arg, Arg) = match cand {
+                Some(c) => {
+                    if self.is_candidate {
+                        c.grow(n_ix)?;
+                        let blocks = n_ix.div_ceil(c.block_size);
+                        k.get("dsv_ix_cand").launch(
+                            (1, 1, 1),
+                            (1, 1, 1),
+                            (blocks * 5) as u32,
+                            s,
+                            &[
+                                (&c.mask).into(),
+                                (&self.score).into(),
+                                n_ix.into(),
+                                c.topk_blocks.into(),
+                                c.block_size.into(),
+                                (((pos + 1) / self.ratio) as i32).into(),
+                            ],
+                        )?;
+                    }
+                    ((&c.mask).into(), c.block_size.into())
+                }
+                None => {
+                    if self.is_candidate {
+                        bail!("candidate source layer needs a Candidates buffer");
+                    }
+                    (0usize.into(), 0i32.into())
+                }
+            };
             k.get("dsv_ix_topk").launch(
                 (1, 1, 1),
                 (32, 1, 1),
@@ -1436,6 +1510,8 @@ impl CompressedAttn {
                     (self.ratio as i32).into(),
                     self.attn.window.into(),
                     window_slots.into(),
+                    mask_arg,
+                    bs_arg,
                 ],
             )?;
         }
@@ -1586,6 +1662,8 @@ pub struct DeepseekDevice {
     latent_of: Vec<usize>,
     sel_of: Vec<usize>,
     sels: Vec<Selection>,
+    /// The candidate mask the candidate source writes and every later index source reads.
+    candidates: Option<Candidates>,
     /// One entry per layer: the Engram of the two layers that carry one.
     engram: Vec<Option<EngramDev>>,
     /// The companion table and the hash state the n-gram lookups need, and the text mask of the positions.
@@ -1655,6 +1733,11 @@ impl DeepseekDevice {
         let sels = (0..d.index_source_layers.len())
             .map(|_| Selection::new(d.window, d.index.topk))
             .collect::<Result<Vec<_>>>()?;
+        let candidates = d
+            .candidate
+            .as_ref()
+            .map(|cand| Candidates::new(cand.block_size, cand.topk_blocks))
+            .transpose()?;
         let mut engram = Vec::with_capacity(c.n_layers);
         for i in 0..c.n_layers {
             let has = d.engram.as_ref().is_some_and(|e| e.layers.contains(&i));
@@ -1668,6 +1751,7 @@ impl DeepseekDevice {
             latent_of,
             sel_of,
             sels,
+            candidates,
             engram,
             table,
             state,
@@ -1799,7 +1883,7 @@ impl DeepseekDevice {
             } else {
                 std::mem::replace(&mut self.sels[sel_which], Selection::new(0, 0)?)
             };
-            self.layers[i].step(m, &self.h, src, pos, &mut lat, &mut sel)?;
+            self.layers[i].step(m, &self.h, src, pos, &mut lat, &mut sel, self.candidates.as_mut())?;
             if which != usize::MAX {
                 self.latents[which] = lat;
             }
@@ -2099,7 +2183,7 @@ mod tests {
             let mut out = vec![0f32; t * hc * hidden];
             for (pos, row) in rows.iter().enumerate() {
                 dev.set_pre_mix(&pre_mix[pos * hc..(pos + 1) * hc]).unwrap();
-                dev.step_attention(&m, row, pos, lat, sel).unwrap();
+                dev.step_attention(&m, row, pos, lat, sel, None).unwrap();
                 if read_back {
                     out[pos * hc * hidden..(pos + 1) * hc * hidden]
                         .copy_from_slice(&dev.h1.download::<f32>(hc * hidden).unwrap());
@@ -2222,7 +2306,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for (pos, row) in rows.iter().enumerate() {
             dev.set_pre_mix(&pre_mix[pos * hc..(pos + 1) * hc]).unwrap();
-            dev.step(&m, row, &g, pos, &mut lat, &mut sel).unwrap();
+            dev.step(&m, row, &g, pos, &mut lat, &mut sel, None).unwrap();
             dev_out[pos * hc * hidden..(pos + 1) * hc * hidden]
                 .copy_from_slice(&dev.h_out.download::<f32>(hc * hidden).unwrap());
             dev_ffn[pos * hidden..(pos + 1) * hidden].copy_from_slice(&dev.ffn.download::<f32>(hidden).unwrap());
@@ -2414,6 +2498,15 @@ mod tests {
         let mut dev = CompressedAttn::load(&g, &c, layer).unwrap();
         let mut lat = Latent::new(d.head_dim, d.index.dim).unwrap();
         let mut selbuf = Selection::new(d.window, d.index.topk).unwrap();
+        // The candidate source writes the first-level mask; a layer that is not it takes a dummy buffer that the
+        // step ignores (its `is_candidate` is false).
+        let cand_geom = d.candidate.as_ref().filter(|cand| cand.source_layer == layer);
+        let mut candbuf = Candidates::new(
+            cand_geom.map_or(1, |c| c.block_size),
+            cand_geom.map_or(1, |c| c.topk_blocks),
+        )
+        .unwrap();
+        let mut cand = cand_geom.map(|_| &mut candbuf);
         let rows: Vec<DeviceBuffer> = (0..t)
             .map(|i| DeviceBuffer::from_slice(&x[i * c.hidden..(i + 1) * c.hidden]).unwrap())
             .collect();
@@ -2425,7 +2518,8 @@ mod tests {
         let mut att_rms = 0.0f64;
         let mut att_worst = 0.0f64;
         for (pos, row) in rows.iter().enumerate() {
-            dev.step(&m, row, pos, &mut lat, &mut selbuf).unwrap();
+            dev.step(&m, row, pos, &mut lat, &mut selbuf, cand.as_deref_mut())
+                .unwrap();
             m.stream.synchronize().unwrap();
             // The attention output, before the grouped projection, and the layer's own output after it.
             let got = dev.attn.att.download::<f32>(dev.attn.heads * hd).unwrap();
@@ -2671,5 +2765,141 @@ mod tests {
             1.0 / each,
             dev.bytes() as f64 / 1e9
         );
+    }
+
+    /// `dsv_ix_cand` and `dsv_ix_topk` on the device, directly.  The case that matters is fewer reachable
+    /// candidates than `topk`: the mask is a ranking, not a cut, and the kernel must still fill the `topk` slots.
+    #[test]
+    #[ignore = "needs GPU"]
+    fn ix_cand_and_topk_kernel() {
+        let arch = select_device().unwrap();
+        let kernels = Kernels::load(&arch).unwrap();
+        let s = Stream::new().unwrap();
+        let n_ix: usize = 8;
+        let topk: usize = 3;
+        let block_size: usize = 4;
+        let topk_blocks: usize = 1;
+        let reach: usize = 2;
+        let pos = 3;
+        let ratio = 2;
+        let cap = 128;
+        let window_slots = 0;
+        // Scores: highest in the masked-out block, lowest in the kept one.  Reach=2 means rows 0 and 1 are
+        // reachable.  The pinned partial block is block 0 (reach-1=1 -> block 0), so it is kept by dsv_ix_cand.
+        // Block 1 is masked out, so rows 4..7 are at -INF.
+        let scores: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0];
+        let score_dev = DeviceBuffer::from_slice(&scores).unwrap();
+        let sel_dev = DeviceBuffer::zeroed(topk * 4).unwrap();
+        let cand_dev = DeviceBuffer::zeroed(n_ix.div_ceil(block_size)).unwrap();
+
+        // First level: one block selected (the pinned one).
+        kernels
+            .get("dsv_ix_cand")
+            .launch(
+                (1, 1, 1),
+                (1, 1, 1),
+                (n_ix.div_ceil(block_size) * 5) as u32,
+                &s,
+                &[
+                    (&cand_dev).into(),
+                    (&score_dev).into(),
+                    n_ix.into(),
+                    topk_blocks.into(),
+                    block_size.into(),
+                    reach.into(),
+                ],
+            )
+            .unwrap();
+        let cand: Vec<u8> = cand_dev.download::<u8>(n_ix.div_ceil(block_size)).unwrap();
+        assert_eq!(cand, vec![1, 0], "cand mask");
+
+        // Second level: topk rows with the mask applied.  The reachable candidates are rows 0 and 1; row 2 is a
+        // candidate but not reachable.  The kernel must pick three rows, sort them ascending, and then filter by
+        // reach: [0, 1, 2] -> [cap+0, cap+1, -1].
+        kernels
+            .get("dsv_ix_topk")
+            .launch(
+                (1, 1, 1),
+                (32, 1, 1),
+                (n_ix.max(1) * 4) as u32,
+                &s,
+                &[
+                    (&sel_dev).into(),
+                    (&score_dev).into(),
+                    pos.into(),
+                    n_ix.into(),
+                    topk.into(),
+                    ratio.into(),
+                    cap.into(),
+                    window_slots.into(),
+                    (&cand_dev).into(),
+                    block_size.into(),
+                ],
+            )
+            .unwrap();
+        let sel: Vec<i32> = sel_dev.download::<i32>(topk).unwrap();
+        assert_eq!(sel, vec![cap as i32 + 0, cap as i32 + 1, -1], "sel with cand");
+
+        // Without a mask the same scores pick the three highest-scoring rows: 7 (2.0), 0 (1.0), 1 (0.0).
+        // Sorted ascending and filtered: [cap+0, cap+1, cap+7].
+        let sel2_dev = DeviceBuffer::zeroed(topk * 4).unwrap();
+        kernels
+            .get("dsv_ix_topk")
+            .launch(
+                (1, 1, 1),
+                (32, 1, 1),
+                (n_ix.max(1) * 4) as u32,
+                &s,
+                &[
+                    (&sel2_dev).into(),
+                    (&score_dev).into(),
+                    pos.into(),
+                    n_ix.into(),
+                    topk.into(),
+                    ratio.into(),
+                    cap.into(),
+                    window_slots.into(),
+                    0usize.into(),
+                    0i32.into(),
+                ],
+            )
+            .unwrap();
+        let sel2: Vec<i32> = sel2_dev.download::<i32>(topk).unwrap();
+        // Without a mask the three best rows are 7 (2.0), 0 (1.0), 1 (ties at 0.0, ascending).  Sorted and
+        // filtered by reach=2: rows 0 and 1 are reachable, row 7 is not, so it keeps its slot as -1.
+        assert_eq!(sel2, vec![cap as i32 + 0, cap as i32 + 1, -1], "sel without cand");
+
+        // The case that matters at long context: a block whose rows are all unreachable has a higher max than
+        // the reachable ones, and must stay at -INF in level one.  n_ix=12, block_size=4: block 0 holds rows
+        // 0..3 (reach=4, pinned), block 1 holds rows 4..7 (row 6 scores 5.0 but is unreachable), block 2 holds
+        // rows 8..11 (row 8 scores 3.0, unreachable too).  Level one must keep only block 0.
+        let n2: usize = 12;
+        let reach2: usize = 4;
+        let bs2: usize = 4;
+        let tb2: usize = 2;
+        let scores2: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, -5.0, -5.0, 5.0, -5.0, 3.0, -5.0, -5.0, -5.0];
+        let sc2 = DeviceBuffer::from_slice(&scores2).unwrap();
+        let cand2 = DeviceBuffer::zeroed(n2.div_ceil(bs2)).unwrap();
+        kernels
+            .get("dsv_ix_cand")
+            .launch(
+                (1, 1, 1),
+                (1, 1, 1),
+                (n2.div_ceil(bs2) * 5) as u32,
+                &s,
+                &[
+                    (&cand2).into(),
+                    (&sc2).into(),
+                    n2.into(),
+                    tb2.into(),
+                    bs2.into(),
+                    reach2.into(),
+                ],
+            )
+            .unwrap();
+        s.synchronize().unwrap();
+        let cand2: Vec<u8> = cand2.download::<u8>(3).unwrap();
+        assert_eq!(cand2, vec![1, 0, 0], "unreachable blocks must stay masked");
+        s.synchronize().unwrap();
     }
 }

@@ -309,20 +309,57 @@ extern "C" __global__ void dsv_ix_score(float* score, const float* q, const floa
     score[(size_t)pos * n_ix + j] = acc;
 }
 
+// Level one of the two-level top-k: keep the best blocks, pinning the partial one the query just reached.
+// Replicates `select_candidate_blocks` with t=1 on the device. `cand[b]` is set to 1 for selected blocks.
+extern "C" __global__ void dsv_ix_cand(unsigned char* cand, const float* score, int n_ix, int topk_blocks,
+                                         int block_size, int reach) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= 1) return;
+    int blocks = (n_ix + block_size - 1) / block_size;
+    extern __shared__ float smem[];
+    float* block_max = smem;
+    for (int b = 0; b < blocks; ++b) block_max[b] = -INFINITY;
+    // Reachable rows only, as the host graph's forward does when it sets the unreachable ones to -INF before
+    // level one: a block whose rows are all unreachable must stay at -INF and can never be selected.
+    for (int j = 0; j < n_ix; ++j) {
+        int b = j / block_size;
+        float v = j < reach ? score[j] : -INFINITY;
+        block_max[b] = fmaxf(block_max[b], v);
+    }
+    int last = (reach > 0 ? reach : 1) - 1;
+    int last_block = last / block_size;
+    if (last_block < blocks) block_max[last_block] = INFINITY;
+    for (int b = 0; b < blocks; ++b) cand[b] = 0;
+    for (int slot = 0; slot < topk_blocks; ++slot) {
+        int best = -1;
+        float bestv = -INFINITY;
+        for (int b = 0; b < blocks; ++b) {
+            if (cand[b]) continue;
+            float v = block_max[b];
+            if (v > bestv || (v == bestv && (best < 0 || b < best))) {
+                bestv = v;
+                best = b;
+            }
+        }
+        if (best < 0 || bestv == -INFINITY) break;
+        cand[best] = 1;
+    }
+}
+
 // The selection of one position: the `topk` compressed rows that score highest, ties by ascending row, and then the
 // ones the position can actually reach (`compress_lens = (pos + 1) / ratio`) — the reference takes exactly `topk`
 // and keeps the reachable ones, so an unreachable row still occupies a slot. The list written is the one the
 // attention reads: the window slots first (as ring slots, `at % cap`), then the compressed rows as `cap + j`, and
-// `-1` where nothing is left to read.
+// `-1` where nothing is left to read.  If `cand` is non-null, rows in a zeroed block are scored as -INF: the mask
+// ranks rather than cuts, so the kernel still picks exactly `topk` rows and the reach filter later turns the
+// unreachable ones into `-1`.
 extern "C" __global__ void dsv_ix_topk(int* sel, const float* score, int pos, int n_ix, int topk, int ratio, int cap,
-                                       int window_slots) {
+                                       int window_slots, const unsigned char* cand, int block_size) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= 1) return;
     extern __shared__ int used_s[];
     int* used = used_s;
     for (int j = 0; j < n_ix; ++j) used[j] = 0;
-    // One position a step: the scores and the list are this position's own, at offset zero. The layout the
-    // attention reads is `[window_slots window slots][topk compressed rows]`.
     const int reach = (pos + 1) / ratio;
     const float* sc = score;
     int* out = sel;
@@ -330,34 +367,41 @@ extern "C" __global__ void dsv_ix_topk(int* sel, const float* score, int pos, in
         const int at = pos - window_slots + 1 + j;
         out[j] = at >= 0 ? at % cap : -1;
     }
-    // The `topk` rows the scores prefer, then the reachable ones in ascending order: the reference sorts what it
-    // picked, and the order of the sum the attention runs is the order of this list.
-    int taken = 0;
+    // Replicate the host graph: exactly `topk` rows ordered by score (with masked rows at -INF) and then by
+    // ascending index, sorted ascending, and finally filtered by reach.
+    int picked[64];
+    int n_picked = 0;
     for (int slot = 0; slot < topk; ++slot) {
         int best = -1;
         float bestv = -INFINITY;
         for (int j = 0; j < n_ix; ++j) {
             if (used[j]) continue;
-            const float v = j < reach ? sc[j] : -INFINITY;
-            if (v > bestv) {
+            float v = sc[j];
+            if (cand) {
+                int b = j / block_size;
+                if (!cand[b]) v = -INFINITY;
+            }
+            if (v > bestv || (v == bestv && (best < 0 || j < best))) {
                 bestv = v;
                 best = j;
             }
         }
         if (best < 0) break;
         used[best] = 1;
-        if (best < reach) out[window_slots + taken++] = cap + best;
+        picked[n_picked++] = best;
     }
-    for (int i = 1; i < taken; ++i) {
-        const int v = out[window_slots + i];
-        int j = i - 1;
-        while (j >= 0 && out[window_slots + j] > v) {
-            out[window_slots + j + 1] = out[window_slots + j];
-            --j;
+    for (int a = 0; a < n_picked; ++a) {
+        for (int b = a + 1; b < n_picked; ++b) {
+            if (picked[b] < picked[a]) {
+                int t = picked[a]; picked[a] = picked[b]; picked[b] = t;
+            }
         }
-        out[window_slots + j + 1] = v;
     }
-    for (int i = taken; i < topk; ++i) out[window_slots + i] = -1;
+    for (int i = 0; i < n_picked; ++i) {
+        int j = picked[i];
+        out[window_slots + i] = (j < reach) ? (cap + j) : -1;
+    }
+    for (int i = n_picked; i < topk; ++i) out[window_slots + i] = -1;
 }
 
 // The sparse attention of one position over two buffers: the window's ring (`cap` rows, `at % cap`) and the
