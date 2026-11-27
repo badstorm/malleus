@@ -8,7 +8,6 @@ use crate::config::*;
 use crate::kernels::Kernels;
 use crate::layer::*;
 use crate::qwen4exp::{Hc, NgramTable, load_hc};
-use crate::qwen35::rope_invf;
 use crate::session::*;
 use crate::upload::Uploader;
 use crate::weights::*;
@@ -36,7 +35,6 @@ pub struct Model {
     /// Inverse RoPE frequencies blended by YaRN (`MALLEUS_ROPE_YARN` > 1): `rot_dim / 2` fp32, or None for the plain
     /// `1 / theta^(2j/rot)` the kernels compute inline. The blend depends on the wavelength of every index, so it is
     /// a table rather than a closed form.
-    pub(crate) rope_invf: Option<DeviceBuffer>,
     pub(crate) scratch_cache: std::sync::Mutex<Option<Scratch>>,
     /// The stream every `forward` runs on.
     pub(crate) stream: Stream,
@@ -197,7 +195,6 @@ impl Model {
         up.use_prefill = opts.prefill_int8;
         up.prefill_families = opts.prefill_families.clone();
         let signs = DeviceBuffer::from_slice(&malleus_gguf::quant::hadamard_signs(opts.hadamard_seed))?;
-        let rope_invf = rope_invf(c)?.map(|t| DeviceBuffer::from_slice(&t)).transpose()?;
         let p = |s: &str| format!("{prefix}{s}");
         let embed = up.tensor(
             src,
@@ -439,7 +436,6 @@ impl Model {
             draft_head,
             draft_map,
             signs,
-            rope_invf,
             scratch_cache: std::sync::Mutex::new(None),
             stream: Stream::new()?,
             quant_mode: std::sync::atomic::AtomicU8::new(0),
@@ -495,7 +491,6 @@ impl Model {
             draft_head: None,
             draft_map: None,
             signs: DeviceBuffer::from_slice(&malleus_gguf::quant::hadamard_signs(hadamard_seed))?,
-            rope_invf: None,
             scratch_cache: std::sync::Mutex::new(None),
             stream: Stream::new()?,
             quant_mode: std::sync::atomic::AtomicU8::new(0),
@@ -627,7 +622,6 @@ impl Model {
             draft_head: None,
             draft_map: None,
             signs: DeviceBuffer::from_slice(&malleus_gguf::quant::hadamard_signs(opts.hadamard_seed))?,
-            rope_invf: None,
             scratch_cache: std::sync::Mutex::new(None),
             stream: Stream::new()?,
             quant_mode: std::sync::atomic::AtomicU8::new(0),
@@ -644,6 +638,51 @@ impl Model {
         })
     }
 
+    /// The YaRN factor a request of `positions` positions (prompt + the tokens asked for) needs: the smallest of the
+    /// ladder 1 / 2 / 4 whose window covers it, unless `MALLEUS_ROPE_YARN` forces one for the whole process (the
+    /// gates and the A/B). Past x4 the request is refused: the model's own window times four is the last step.
+    pub fn rope_factor_for(&self, positions: usize) -> Result<f32> {
+        if let Some(f) = crate::qwen35::forced_factor() {
+            return Ok(f);
+        }
+        let orig = self.cfg.max_positions as f32;
+        for f in [1.0f32, 2.0, 4.0] {
+            if (orig * f) as usize >= positions {
+                return Ok(f);
+            }
+        }
+        bail!(
+            "a request of {positions} positions exceeds the x4 window ({}): raise the ladder in rope_factor_for",
+            (orig * 4.0) as usize
+        )
+    }
+
+    /// Installs this session's rope extension and returns whether the factor changed. `factor` 1 leaves the native
+    /// rotation (no table, scale 1) — the path of every session before this existed. A session whose factor changes
+    /// must be reset by the caller: its cached rows were rotated with the old table.
+    pub fn set_session_rope(&self, sess: &mut Session, factor: f32) -> Result<bool> {
+        if (sess.rope_factor - factor).abs() < 1e-6 {
+            return Ok(false);
+        }
+        let old = sess.rope_factor;
+        sess.rope_factor = factor;
+        match crate::qwen35::rope_table(&self.cfg, factor)? {
+            Some((t, mscale)) => {
+                sess.rope = Some(DeviceBuffer::from_slice(&t)?);
+                sess.mscale = mscale;
+            }
+            None => {
+                sess.rope = None;
+                sess.mscale = 1.0;
+            }
+        }
+        eprintln!(
+            "rope: session factor x{factor} (was x{old}){}",
+            if factor > 1.0 { ", the cache restarts" } else { "" }
+        );
+        Ok(true)
+    }
+
     pub fn new_session(&self, max_ctx: usize) -> Result<Session> {
         if self.hy4.is_some() {
             return crate::hy4::new_session(self, max_ctx);
@@ -658,11 +697,15 @@ impl Model {
         if self.inkling2.is_some() {
             return crate::inkling2::new_session(self, max_ctx);
         }
+        let forced = crate::qwen35::forced_factor();
         let c = &self.cfg;
         let mut s = Session {
             max_ctx,
             len: 0,
             next_pos: 0,
+            rope: None,
+            rope_factor: 1.0,
+            mscale: 1.0,
             kv: vec![],
             conv: vec![],
             rec: vec![],
@@ -768,6 +811,10 @@ impl Model {
                 .push((DeviceBuffer::zeroed(kv_bytes)?, DeviceBuffer::zeroed(v_bytes)?));
             s.mtp_h = Some(f32s(GEMV_MAX_T * c.stream_dim())?);
             s.mtp_out = Some(f32s(c.stream_dim())?);
+        }
+        // A process that forces a factor (`MALLEUS_ROPE_YARN`) gets it on every session, gates included.
+        if let Some(f) = forced {
+            self.set_session_rope(&mut s, f)?;
         }
         Ok(s)
     }
@@ -1829,6 +1876,8 @@ impl Model {
                 rec: &s.rec,
                 len: s.len,
                 max_ctx: s.max_ctx,
+                rope: s.rope.as_ref(),
+                mscale: s.mscale,
                 attn_part: &s.attn_part,
                 mla_part: None,
                 conv_snaps: None,
@@ -2129,6 +2178,8 @@ impl Model {
                 rec: &[],
                 len: sess.mtp_len,
                 max_ctx: sess.max_ctx,
+                rope: sess.rope.as_ref(),
+                mscale: sess.mscale,
                 attn_part: &sess.attn_part,
                 mla_part: sess.mla_part.as_ref(),
                 conv_snaps: None,
@@ -2143,6 +2194,7 @@ impl Model {
                         sel: self.idx_sel_bufs(sess, sess.mtp_len, r)?,
                         list: sess.idx_list.as_ref().map(|(b, r)| (b, *r)),
                         part: sess.idx_sel_part.as_ref(),
+                        rope: sess.rope.as_ref(),
                         cache: None,
                         reuse: false,
                     }),
@@ -2200,6 +2252,8 @@ impl Model {
                 rec: &[],
                 len: sess.mtp_len,
                 max_ctx: sess.max_ctx,
+                rope: sess.rope.as_ref(),
+                mscale: sess.mscale,
                 attn_part: &sess.attn_part,
                 mla_part: sess.mla_part.as_ref(),
                 conv_snaps: None,
@@ -2351,6 +2405,8 @@ impl Model {
             rec: &sess.rec,
             len: sess.len,
             max_ctx: sess.max_ctx,
+            rope: sess.rope.as_ref(),
+            mscale: sess.mscale,
             attn_part: &sess.attn_part,
             mla_part: sess.mla_part.as_ref(),
             conv_snaps: verify.then_some(&sess.conv_snap[..]),

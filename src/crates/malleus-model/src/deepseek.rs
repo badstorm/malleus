@@ -219,6 +219,7 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         // The compressed latent rotates at the longer base; the window layers use `rope_theta`.
         rope_theta: deepseek.rope_params.compress_theta,
         rot_dim: rope,
+        max_positions: 262144,
         mrope_section: [0, 0, 0],
         full_attn: deepseek.compress_ratios.iter().map(|r| *r > 0).collect(),
         eos,

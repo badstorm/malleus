@@ -25,6 +25,10 @@ pub struct Config {
     pub eps: f32,
     pub rope_theta: f32,
     pub rot_dim: usize,
+    /// The checkpoint's native window (`max_position_embeddings`): the length its rotation was trained for. Past it
+    /// the native rope extrapolates; a session may ask for a YaRN factor that covers more, and this is the threshold
+    /// each factor starts from.
+    pub max_positions: usize,
     pub mrope_section: [usize; 3],
     pub full_attn: Vec<bool>,
     pub eos: Vec<u32>,
@@ -544,6 +548,7 @@ impl Config {
         };
         let rope = &t["rope_parameters"];
         let head_dim = u("head_dim")?;
+        let max_positions = t["max_position_embeddings"].as_u64().unwrap_or(262144) as usize;
         // Ling spells the rope settings as plain keys, Qwen inside rope_parameters.
         let prf = rope["partial_rotary_factor"]
             .as_f64()
@@ -641,6 +646,7 @@ impl Config {
             eps: t["rms_norm_eps"].as_f64().context("rms_norm_eps")? as f32,
             rope_theta: theta,
             rot_dim: (head_dim as f64 * prf) as usize,
+            max_positions,
             mrope_section,
             full_attn,
             eos,
