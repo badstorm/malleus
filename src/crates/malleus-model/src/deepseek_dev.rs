@@ -26,9 +26,9 @@
 //! a time) and the loops around the block. The gate is the host graph itself: the same quantized weights, the same
 //! input, a cosine per stage.
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::TensorSource;
-use malleus_hip::{DeviceBuffer, KernelArg, Stream};
+use malleus_hip::{Arg, DeviceBuffer, Stream};
 
 use crate::config::Config;
 use crate::engine::{Act, Model};
@@ -1467,28 +1467,34 @@ impl CompressedAttn {
                     ],
                 )?;
             }
-            if self.is_candidate {
-                let c = cand.context("candidate source layer needs a Candidates buffer")?;
-                c.grow(n_ix)?;
-                let blocks = n_ix.div_ceil(c.block_size);
-                k.get("dsv_ix_cand").launch(
-                    (1, 1, 1),
-                    (1, 1, 1),
-                    (blocks * 5) as u32,
-                    s,
-                    &[
-                        (&c.mask).into(),
-                        (&self.score).into(),
-                        n_ix.into(),
-                        c.topk_blocks.into(),
-                        c.block_size.into(),
-                        (((pos + 1) / self.ratio) as i32).into(),
-                    ],
-                )?;
-            }
-            let (mask_arg, bs_arg): (KernelArg, KernelArg) = match cand {
-                Some(c) => ((&c.mask).into(), c.block_size.into()),
-                None => (0usize.into(), 0i32.into()),
+            let (mask_arg, bs_arg): (Arg, Arg) = match cand {
+                Some(c) => {
+                    if self.is_candidate {
+                        c.grow(n_ix)?;
+                        let blocks = n_ix.div_ceil(c.block_size);
+                        k.get("dsv_ix_cand").launch(
+                            (1, 1, 1),
+                            (1, 1, 1),
+                            (blocks * 5) as u32,
+                            s,
+                            &[
+                                (&c.mask).into(),
+                                (&self.score).into(),
+                                n_ix.into(),
+                                c.topk_blocks.into(),
+                                c.block_size.into(),
+                                (((pos + 1) / self.ratio) as i32).into(),
+                            ],
+                        )?;
+                    }
+                    ((&c.mask).into(), c.block_size.into())
+                }
+                None => {
+                    if self.is_candidate {
+                        bail!("candidate source layer needs a Candidates buffer");
+                    }
+                    (0usize.into(), 0i32.into())
+                }
             };
             k.get("dsv_ix_topk").launch(
                 (1, 1, 1),
@@ -1937,7 +1943,7 @@ impl DeepseekDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::{select_device, Kernels};
+    use crate::kernels::{Kernels, select_device};
 
     /// Cosine similarity of two vectors.
     fn cos(a: &[f32], b: &[f32]) -> f64 {
@@ -2177,7 +2183,7 @@ mod tests {
             let mut out = vec![0f32; t * hc * hidden];
             for (pos, row) in rows.iter().enumerate() {
                 dev.set_pre_mix(&pre_mix[pos * hc..(pos + 1) * hc]).unwrap();
-                dev.step_attention(&m, row, pos, lat, sel).unwrap();
+                dev.step_attention(&m, row, pos, lat, sel, None).unwrap();
                 if read_back {
                     out[pos * hc * hidden..(pos + 1) * hc * hidden]
                         .copy_from_slice(&dev.h1.download::<f32>(hc * hidden).unwrap());
@@ -2300,7 +2306,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for (pos, row) in rows.iter().enumerate() {
             dev.set_pre_mix(&pre_mix[pos * hc..(pos + 1) * hc]).unwrap();
-            dev.step(&m, row, &g, pos, &mut lat, &mut sel).unwrap();
+            dev.step(&m, row, &g, pos, &mut lat, &mut sel, None).unwrap();
             dev_out[pos * hc * hidden..(pos + 1) * hc * hidden]
                 .copy_from_slice(&dev.h_out.download::<f32>(hc * hidden).unwrap());
             dev_ffn[pos * hidden..(pos + 1) * hidden].copy_from_slice(&dev.ffn.download::<f32>(hidden).unwrap());
@@ -2503,7 +2509,7 @@ mod tests {
         let mut att_rms = 0.0f64;
         let mut att_worst = 0.0f64;
         for (pos, row) in rows.iter().enumerate() {
-            dev.step(&m, row, pos, &mut lat, &mut selbuf).unwrap();
+            dev.step(&m, row, pos, &mut lat, &mut selbuf, None).unwrap();
             m.stream.synchronize().unwrap();
             // The attention output, before the grouped projection, and the layer's own output after it.
             let got = dev.attn.att.download::<f32>(dev.attn.heads * hd).unwrap();
@@ -2749,5 +2755,109 @@ mod tests {
             1.0 / each,
             dev.bytes() as f64 / 1e9
         );
+    }
+
+    /// `dsv_ix_cand` and `dsv_ix_topk` on the device, directly.  The case that matters is fewer reachable
+    /// candidates than `topk`: the mask is a ranking, not a cut, and the kernel must still fill the `topk` slots.
+    #[test]
+    #[ignore = "needs GPU"]
+    fn ix_cand_and_topk_kernel() {
+        let arch = select_device().unwrap();
+        let kernels = Kernels::load(&arch).unwrap();
+        let s = Stream::new().unwrap();
+        let n_ix: usize = 8;
+        let topk: usize = 3;
+        let block_size: usize = 4;
+        let topk_blocks: usize = 1;
+        let reach: usize = 2;
+        let pos = 3;
+        let ratio = 2;
+        let cap = 128;
+        let window_slots = 0;
+        // Scores: highest in the masked-out block, lowest in the kept one.  Reach=2 means rows 0 and 1 are
+        // reachable.  The pinned partial block is block 0 (reach-1=1 -> block 0), so it is kept by dsv_ix_cand.
+        // Block 1 is masked out, so rows 4..7 are at -INF.
+        let scores: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0];
+        let score_dev = DeviceBuffer::from_slice(&scores).unwrap();
+        let sel_dev = DeviceBuffer::zeroed(topk * 4).unwrap();
+        let cand_dev = DeviceBuffer::zeroed(n_ix.div_ceil(block_size)).unwrap();
+
+        // First level: one block selected (the pinned one).
+        kernels
+            .get("dsv_ix_cand")
+            .launch(
+                (1, 1, 1),
+                (1, 1, 1),
+                (n_ix.div_ceil(block_size) * 5) as u32,
+                &s,
+                &[
+                    (&cand_dev).into(),
+                    (&score_dev).into(),
+                    n_ix.into(),
+                    topk_blocks.into(),
+                    block_size.into(),
+                    reach.into(),
+                ],
+            )
+            .unwrap();
+        let cand: Vec<u8> = cand_dev.download::<u8>(n_ix.div_ceil(block_size)).unwrap();
+        assert_eq!(cand, vec![1, 0], "cand mask");
+
+        // Second level: topk rows with the mask applied.  The reachable candidates are rows 0 and 1; row 2 is a
+        // candidate but not reachable.  The kernel must pick three rows, sort them ascending, and then filter by
+        // reach: [0, 1, 2] -> [cap+0, cap+1, -1].
+        kernels
+            .get("dsv_ix_topk")
+            .launch(
+                (1, 1, 1),
+                (32, 1, 1),
+                (n_ix.max(1) * 4) as u32,
+                &s,
+                &[
+                    (&sel_dev).into(),
+                    (&score_dev).into(),
+                    pos.into(),
+                    n_ix.into(),
+                    topk.into(),
+                    ratio.into(),
+                    cap.into(),
+                    window_slots.into(),
+                    (&cand_dev).into(),
+                    block_size.into(),
+                ],
+            )
+            .unwrap();
+        let sel: Vec<i32> = sel_dev.download::<i32>(topk).unwrap();
+        assert_eq!(sel, vec![cap as i32 + 0, cap as i32 + 1, -1], "sel with cand");
+
+        // Without a mask the same scores pick the three highest-scoring rows: 7 (2.0), 0 (1.0), 1 (0.0).
+        // Sorted ascending and filtered: [cap+0, cap+1, cap+7].
+        let sel2_dev = DeviceBuffer::zeroed(topk * 4).unwrap();
+        kernels
+            .get("dsv_ix_topk")
+            .launch(
+                (1, 1, 1),
+                (32, 1, 1),
+                (n_ix.max(1) * 4) as u32,
+                &s,
+                &[
+                    (&sel2_dev).into(),
+                    (&score_dev).into(),
+                    pos.into(),
+                    n_ix.into(),
+                    topk.into(),
+                    ratio.into(),
+                    cap.into(),
+                    window_slots.into(),
+                    0usize.into(),
+                    0i32.into(),
+                ],
+            )
+            .unwrap();
+        let sel2: Vec<i32> = sel2_dev.download::<i32>(topk).unwrap();
+        // Without a mask the three best rows are 7 (2.0), 0 (1.0), 1 (ties at 0.0, ascending).  Sorted and
+        // filtered by reach=2: rows 0 and 1 are reachable, row 7 is not, so it keeps its slot as -1.
+        assert_eq!(sel2, vec![cap as i32 + 0, cap as i32 + 1, -1], "sel without cand");
+        s.synchronize().unwrap();
     }
 }
