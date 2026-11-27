@@ -26,9 +26,9 @@
 //! a time) and the loops around the block. The gate is the host graph itself: the same quantized weights, the same
 //! input, a cosine per stage.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{bail, ensure, Context, Result};
 use malleus_gguf::TensorSource;
-use malleus_hip::{DeviceBuffer, Stream};
+use malleus_hip::{DeviceBuffer, KernelArg, Stream};
 
 use crate::config::Config;
 use crate::engine::{Act, Model};
@@ -537,10 +537,18 @@ impl Attn {
 
     /// The projections, the attention and the output projection of one position; `att` keeps the raw attention
     /// output and `out` the layer's.
-    fn run(&mut self, m: &Model, x: &DeviceBuffer, pos: usize, lat: &mut Latent, sel: &mut Selection) -> Result<()> {
+    fn run(
+        &mut self,
+        m: &Model,
+        x: &DeviceBuffer,
+        pos: usize,
+        lat: &mut Latent,
+        sel: &mut Selection,
+        cand: Option<&mut Candidates>,
+    ) -> Result<()> {
         match self {
             Attn::Window(a) => a.step(m, x, pos),
-            Attn::Indexed(a) => a.step(m, x, pos, lat, sel),
+            Attn::Indexed(a) => a.step(m, x, pos, lat, sel, cand),
         }
     }
 
@@ -732,6 +740,7 @@ impl BlockDev {
         pos: usize,
         lat: &mut Latent,
         sel: &mut Selection,
+        cand: Option<&mut Candidates>,
     ) -> Result<()> {
         let (s, k) = (&m.stream, &m.k);
         let (hc, hidden) = (self.hc, self.hidden);
@@ -749,7 +758,7 @@ impl BlockDev {
                 hidden.into(),
             ],
         )?;
-        self.attn.run(m, &self.x, pos, lat, sel)?;
+        self.attn.run(m, &self.x, pos, lat, sel, cand)?;
         k.get("dsv_hc_post").launch(
             ((hc * hidden).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
@@ -778,8 +787,9 @@ impl BlockDev {
         pos: usize,
         lat: &mut Latent,
         sel: &mut Selection,
+        cand: Option<&mut Candidates>,
     ) -> Result<()> {
-        self.step_attention(m, h, pos, lat, sel)?;
+        self.step_attention(m, h, pos, lat, sel, cand)?;
         let (s, k) = (&m.stream, &m.k);
         let (hc, hidden, inter) = (self.hc, self.hidden, self.inter);
         let (xr, xh, xsc) = (&self.attn.window().xr, &self.attn.window().xh, &self.attn.window().xsc);
@@ -1145,6 +1155,36 @@ impl Selection {
     }
 }
 
+/// The per-block candidate mask written by the candidate source layer and consumed by every later index source.
+/// Sized from `Latent` capacity and reallocated when it grows.
+pub struct Candidates {
+    pub mask: DeviceBuffer,
+    pub block_size: usize,
+    pub topk_blocks: usize,
+    pub blocks: usize,
+}
+
+impl Candidates {
+    pub fn new(block_size: usize, topk_blocks: usize) -> Result<Self> {
+        Ok(Candidates {
+            mask: DeviceBuffer::zeroed(1)?,
+            block_size,
+            topk_blocks,
+            blocks: 0,
+        })
+    }
+
+    pub fn grow(&mut self, n_ix: usize) -> Result<()> {
+        let need = n_ix.div_ceil(self.block_size);
+        if need > self.blocks {
+            let cap = (need * 2).max(64);
+            self.mask = DeviceBuffer::zeroed(cap)?;
+            self.blocks = cap;
+        }
+        Ok(())
+    }
+}
+
 pub struct CompressedAttn {
     pub attn: WindowAttn,
     pub ratio: usize,
@@ -1153,6 +1193,8 @@ pub struct CompressedAttn {
     pub topk: usize,
     /// Whether this layer has an indexer of its own, or reads the one its source published.
     pub has_ix: bool,
+    /// Whether this layer is the candidate source that writes the first-level mask.
+    pub is_candidate: bool,
     /// This position's scores over the latent, and the list the attention reads (window slots, then `cap + row`).
     pub score: DeviceBuffer,
     /// The indexer's query and its per-head weight, for one position.
@@ -1197,6 +1239,7 @@ impl CompressedAttn {
         // Only an index source has an indexer; the layers of its group read the selection it publishes (the host
         // graph's `shared.topk`).
         let has_ix = d.index_source_layers.contains(&layer);
+        let is_candidate = d.candidate.as_ref().is_some_and(|cand| cand.source_layer == layer);
         let wq_b = if has_ix {
             Some(up.linear(src, &p("attn.indexer.wq_b"), heads * dim, ql)?)
         } else {
@@ -1230,6 +1273,7 @@ impl CompressedAttn {
             iq: DeviceBuffer::zeroed(heads * dim * 4)?,
             iw: DeviceBuffer::zeroed(heads * 4)?,
             has_ix,
+            is_candidate,
             xring: DeviceBuffer::zeroed((d.compress_ratios[layer] as usize) * c.hidden * 4)?,
             ikey: DeviceBuffer::zeroed(dim * 4)?,
             wq_b,
@@ -1285,6 +1329,7 @@ impl CompressedAttn {
         pos: usize,
         lat: &mut Latent,
         sel: &mut Selection,
+        cand: Option<&mut Candidates>,
     ) -> Result<()> {
         self.attn.project(m, x, pos)?;
         self.attn.ring_write(m, pos)?;
@@ -1422,6 +1467,29 @@ impl CompressedAttn {
                     ],
                 )?;
             }
+            if self.is_candidate {
+                let c = cand.context("candidate source layer needs a Candidates buffer")?;
+                c.grow(n_ix)?;
+                let blocks = n_ix.div_ceil(c.block_size);
+                k.get("dsv_ix_cand").launch(
+                    (1, 1, 1),
+                    (1, 1, 1),
+                    (blocks * 5) as u32,
+                    s,
+                    &[
+                        (&c.mask).into(),
+                        (&self.score).into(),
+                        n_ix.into(),
+                        c.topk_blocks.into(),
+                        c.block_size.into(),
+                        (((pos + 1) / self.ratio) as i32).into(),
+                    ],
+                )?;
+            }
+            let (mask_arg, bs_arg): (KernelArg, KernelArg) = match cand {
+                Some(c) => ((&c.mask).into(), c.block_size.into()),
+                None => (0usize.into(), 0i32.into()),
+            };
             k.get("dsv_ix_topk").launch(
                 (1, 1, 1),
                 (32, 1, 1),
@@ -1436,6 +1504,8 @@ impl CompressedAttn {
                     (self.ratio as i32).into(),
                     self.attn.window.into(),
                     window_slots.into(),
+                    mask_arg,
+                    bs_arg,
                 ],
             )?;
         }
@@ -1586,6 +1656,8 @@ pub struct DeepseekDevice {
     latent_of: Vec<usize>,
     sel_of: Vec<usize>,
     sels: Vec<Selection>,
+    /// The candidate mask the candidate source writes and every later index source reads.
+    candidates: Option<Candidates>,
     /// One entry per layer: the Engram of the two layers that carry one.
     engram: Vec<Option<EngramDev>>,
     /// The companion table and the hash state the n-gram lookups need, and the text mask of the positions.
@@ -1655,6 +1727,11 @@ impl DeepseekDevice {
         let sels = (0..d.index_source_layers.len())
             .map(|_| Selection::new(d.window, d.index.topk))
             .collect::<Result<Vec<_>>>()?;
+        let candidates = d
+            .candidate
+            .as_ref()
+            .map(|cand| Candidates::new(cand.block_size, cand.topk_blocks))
+            .transpose()?;
         let mut engram = Vec::with_capacity(c.n_layers);
         for i in 0..c.n_layers {
             let has = d.engram.as_ref().is_some_and(|e| e.layers.contains(&i));
@@ -1668,6 +1745,7 @@ impl DeepseekDevice {
             latent_of,
             sel_of,
             sels,
+            candidates,
             engram,
             table,
             state,
@@ -1799,7 +1877,7 @@ impl DeepseekDevice {
             } else {
                 std::mem::replace(&mut self.sels[sel_which], Selection::new(0, 0)?)
             };
-            self.layers[i].step(m, &self.h, src, pos, &mut lat, &mut sel)?;
+            self.layers[i].step(m, &self.h, src, pos, &mut lat, &mut sel, self.candidates.as_mut())?;
             if which != usize::MAX {
                 self.latents[which] = lat;
             }
@@ -1859,7 +1937,7 @@ impl DeepseekDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::{Kernels, select_device};
+    use crate::kernels::{select_device, Kernels};
 
     /// Cosine similarity of two vectors.
     fn cos(a: &[f32], b: &[f32]) -> f64 {
