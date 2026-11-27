@@ -894,6 +894,7 @@ impl Model {
             sel: self.idx_sel_bufs(sess, sess.len, t)?,
             list: sess.idx_list.as_ref().map(|(b, r)| (b, *r)),
             part: sess.idx_sel_part.as_ref(),
+            rope: sess.rope.as_ref(),
             cache: Some(&sess.idx_sel_cache),
             reuse,
         }))
@@ -938,7 +939,7 @@ impl Model {
                 c.rot_dim.into(),
                 sh.into(),
                 sw.into(),
-                self.rope_invf.as_ref().map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
+                is.rope.map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
             ],
         )?;
         // Pooling the keys of every block that completes this step. The kernel reads len from the device buffer so the
@@ -965,7 +966,7 @@ impl Model {
                     c.rot_dim.into(),
                     sh.into(),
                     sw.into(),
-                    self.rope_invf.as_ref().map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
+                    is.rope.map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
                 ],
             )?;
         }

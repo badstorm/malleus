@@ -215,6 +215,7 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         eps: f("rms_norm_eps")?,
         rope_theta: hy4.theta_indexed,
         rot_dim: hy4.rope,
+        max_positions: 262144,
         mrope_section,
         full_attn: kind.iter().map(|k| *k == MixerKind::Hy4Indexed).collect(),
         eos,
@@ -2270,6 +2271,9 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
     let h = c.hy4.as_ref().context("no hy4 config")?;
     let mut s = crate::session::Session {
         max_ctx,
+        rope: None,
+        rope_factor: 1.0,
+        mscale: 1.0,
         len: 0,
         next_pos: 0,
         kv: Vec::with_capacity(c.n_layers),

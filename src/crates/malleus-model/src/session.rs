@@ -9,6 +9,13 @@ pub struct Session {
     pub max_ctx: usize,
     pub len: usize,
     pub next_pos: i64,
+    /// This session's rope extension: the YaRN inverse-frequency table of `rope_factor` (`None` = the checkpoint's
+    /// native rotation, the path every request takes unless it declares a longer bound), the attention scale that
+    /// goes with it, and the factor itself. Fixed while the cache holds rows rotated with it: changing it is a new
+    /// session.
+    pub(crate) rope: Option<DeviceBuffer>,
+    pub(crate) rope_factor: f32,
+    pub(crate) mscale: f32,
     pub(crate) kv: Vec<(DeviceBuffer, DeviceBuffer)>,
     pub(crate) conv: Vec<DeviceBuffer>,
     pub(crate) rec: Vec<DeviceBuffer>,
@@ -164,6 +171,9 @@ pub(crate) struct LayerStates<'a> {
     pub(crate) rec: &'a [DeviceBuffer],
     pub(crate) len: usize,
     pub(crate) max_ctx: usize,
+    /// The session's rope table and attention scale (`Session::rope`, `Session::mscale`).
+    pub(crate) rope: Option<&'a DeviceBuffer>,
+    pub(crate) mscale: f32,
     pub(crate) attn_part: &'a DeviceBuffer,
     pub(crate) mla_part: Option<&'a DeviceBuffer>,
     pub(crate) conv_snaps: Option<&'a [DeviceBuffer]>,
@@ -186,6 +196,8 @@ pub(crate) struct IdxStates<'a> {
     pub(crate) list: Option<(&'a DeviceBuffer, usize)>,
     /// Scratch of the multi-block selection (`Session::idx_sel_part`), for the decode shape.
     pub(crate) part: Option<&'a DeviceBuffer>,
+    /// The session's rope table: the indexer's own queries and pooled keys are rotated with it.
+    pub(crate) rope: Option<&'a DeviceBuffer>,
     /// Decode reuse: last selection bitset per indexer layer, and whether this forward may use it.
     pub(crate) cache: Option<&'a [DeviceBuffer]>,
     pub(crate) reuse: bool,

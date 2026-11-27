@@ -1786,6 +1786,8 @@ fn run(
             .map(|x| x.parse::<u32>())
             .collect::<std::result::Result<_, _>>()?;
         let mut sess = m.new_session(ctx)?;
+        // The rope extension the request needs (prompt + the tokens asked for): factor 1 is the native rotation.
+        m.set_session_rope(&mut sess, m.rope_factor_for(ids.len() + max_tokens)?)?;
         let chunk = std::env::var("MALLEUS_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -1855,6 +1857,9 @@ fn run(
             ..Default::default()
         };
         let ids = chat.encode(&chat.render(&msgs, &opts)?)?;
+        if m.set_session_rope(&mut sess, m.rope_factor_for(ids.len() + max_tokens)?)? {
+            m.reset_session(&mut sess)?;
+        }
         let t0 = Instant::now();
         let l = m.forward(&mut sess, &ids, None, 1)?;
         let ttft = t0.elapsed().as_secs_f64();

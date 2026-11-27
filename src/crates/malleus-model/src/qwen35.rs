@@ -70,20 +70,28 @@ pub(crate) fn yarn_factor() -> f32 {
 }
 
 /// The attention scale multiplier YaRN asks for, 1 when the rotation is native.
-pub(crate) fn yarn_mscale() -> f32 {
-    let f = yarn_factor();
-    if f > 1.0 { 0.1 * f.ln() + 1.0 } else { 1.0 }
+/// The attention scale YaRN asks for at `factor`: 1 when the rotation is native.
+pub(crate) fn mscale_for(factor: f32) -> f32 {
+    if factor > 1.0 { 0.1 * factor.ln() + 1.0 } else { 1.0 }
 }
 
-pub(crate) fn rope_invf(c: &Config) -> Result<Option<Vec<f32>>> {
-    let factor = yarn_factor();
+/// The factor the process is forced to (`MALLEUS_ROPE_YARN`), if any: it wins over the per-session choice, for the
+/// gates and the A/B.
+pub(crate) fn forced_factor() -> Option<f32> {
+    let f = yarn_factor();
+    (f > 1.0).then_some(f)
+}
+
+/// The YaRN inverse-frequency table for `factor` (and the scale that goes with it), or `None` for the native
+/// rotation. `factor` 1 is the checkpoint's own rotation, bit for bit.
+pub(crate) fn rope_table(c: &Config, factor: f32) -> Result<Option<(Vec<f32>, f32)>> {
     if factor <= 1.0 {
         return Ok(None);
     }
     let orig: f32 = std::env::var("MALLEUS_ROPE_ORIG")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(262144.0);
+        .unwrap_or(c.max_positions as f32);
     // The ends of the ramp: wavelengths below orig/beta_fast are native, above orig/beta_slow they are scaled.
     let (beta_fast, beta_slow) = (32.0f32, 1.0f32);
     let (lo, hi) = (orig / beta_fast, orig / beta_slow);
@@ -95,11 +103,9 @@ pub(crate) fn rope_invf(c: &Config) -> Result<Option<Vec<f32>>> {
         let ramp = ((wl - lo) / (hi - lo)).clamp(0.0, 1.0);
         t.push(f0 * (1.0 - ramp) + f0 / factor * ramp);
     }
-    eprintln!(
-        "rope: YaRN x{factor} over {orig} positions, attention scale {:.6}, {half} frequencies",
-        yarn_mscale()
-    );
-    Ok(Some(t))
+    let mscale = mscale_for(factor);
+    eprintln!("rope: YaRN x{factor} over {orig} positions, attention scale {mscale:.6}, {half} frequencies");
+    Ok(Some((t, mscale)))
 }
 
 /// Largest union of the four block lists `attention_gather_u` keeps in LDS; must match UMAX in kernels/attn.hip.
@@ -188,7 +194,7 @@ impl Model {
                 sw.into(),
                 ctx.into(),
                 vr_arg,
-                self.rope_invf.as_ref().map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
+                ls.rope.map_or(Arg::U64(0), |b| Arg::U64(b.addr())),
             ],
         )?;
         // Diagnostics `MALLEUS_HIDDEN_DUMP=<dir>` (#10): for every layer, the layer input (`sc.hn`) and the
@@ -221,7 +227,7 @@ impl Model {
             }
             ratio = c.indexer.as_ref().map_or(1, |ic| ic.ratio);
         }
-        let scale = 1.0 / (c.head_dim as f32).sqrt() * yarn_mscale();
+        let scale = 1.0 / (c.head_dim as f32).sqrt() * ls.mscale;
         let gather = match (ls.idx.as_ref(), &c.indexer) {
             (Some(is), Some(ic))
                 if t >= ATTN_WMMA_MIN

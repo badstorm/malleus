@@ -175,6 +175,7 @@ pub(crate) fn config(cfg: &Value, generation_config: Option<&str>) -> Result<Con
         // The sliding and full layers rotate nothing: the relative bias replaces RoPE inside the attention.
         rope_theta: 0.0,
         rot_dim: 0,
+        max_positions: 262144,
         mrope_section: [0, 0, 0],
         full_attn: kind.iter().map(|k| *k == MixerKind::AttnFull).collect(),
         eos,
@@ -1692,6 +1693,9 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
     }
     Ok(crate::session::Session {
         max_ctx,
+        rope: None,
+        rope_factor: 1.0,
+        mscale: 1.0,
         len: 0,
         next_pos: 0,
         kv: Vec::new(),

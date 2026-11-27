@@ -993,6 +993,15 @@ impl Worker {
             req.prompt.len()
         );
         let max_tokens = req.max_tokens.min(ctx - req.prompt.len());
+        // The session's rope extension follows the request: the factor that covers the prompt plus the tokens asked
+        // for, from the ladder 1 (the checkpoint's own window) / 2 / 4. A different factor is a cache miss — the rows
+        // already in the session were rotated with the old table — so the session restarts and its snapshots go.
+        let factor = model.rope_factor_for(req.prompt.len() + max_tokens)?;
+        if model.set_session_rope(sess, factor)? {
+            model.reset_session(sess)?;
+            cached.clear();
+            snaps.clear();
+        }
         // A prompt with images cannot reuse a token-prefix snapshot: two different images of the same grid have
         // the same tokens but different embeddings. Image requests restart from an empty session and drop the
         // snapshots, so a later text request cannot restore a state that contains an image either.
