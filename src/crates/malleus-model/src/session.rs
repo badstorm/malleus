@@ -46,6 +46,9 @@ pub struct Session {
     pub(crate) idx_tp: Vec<DeviceBuffer>,
     pub(crate) idx_scores: Option<DeviceBuffer>,
     pub(crate) idx_sel: Option<(DeviceBuffer, DeviceBuffer, usize)>,
+    /// Scratch of the multi-block selection: per-slice histograms, tie counts, tie offsets and the (prefix, need)
+    /// state of the radix passes, in one allocation laid out by `IDX_SEL_PART_*` in `qwen4exp`.
+    pub(crate) idx_sel_part: Option<DeviceBuffer>,
     /// Last selection bitset of each indexer layer, kept for the decode reuse (one row per layer).
     pub(crate) idx_sel_cache: Vec<DeviceBuffer>,
     /// Host-side validity: the context length at which `idx_sel_cache` was written (0 = invalid).
@@ -181,6 +184,8 @@ pub(crate) struct IdxStates<'a> {
     pub(crate) sel: Option<(&'a DeviceBuffer, &'a DeviceBuffer, &'a DeviceBuffer, usize)>,
     /// Block lists of the selections (rows, then the counts after `rows` rows).
     pub(crate) list: Option<(&'a DeviceBuffer, usize)>,
+    /// Scratch of the multi-block selection (`Session::idx_sel_part`), for the decode shape.
+    pub(crate) part: Option<&'a DeviceBuffer>,
     /// Decode reuse: last selection bitset per indexer layer, and whether this forward may use it.
     pub(crate) cache: Option<&'a [DeviceBuffer]>,
     pub(crate) reuse: bool,

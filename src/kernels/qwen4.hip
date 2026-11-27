@@ -558,6 +558,184 @@ __device__ __forceinline__ void idx_select12_impl(uint32_t* sel, const float* sc
 IDX_SELECT12(idx_select12, 256)
 IDX_SELECT12(idx_select12_1024, 1024)
 
+// The same selection spread over the whole GPU: the score row is cut into `G` slices, one block each, and the three
+// radix digits of `idx_select12` are walked as hist/merge pairs (12/12/8 bits, the same digits, so the threshold and
+// the tie rule are identical). `idx_select12_1024` is one workgroup on one CU, which is what a decode step pays on
+// every layer: with nq = 1 it walked the whole row serially, 186 us at 131K blocks and eight times that at 1M.
+// The histogram of a pass lives in LDS of one block per slice, the merge sums them and picks the digit, and the
+// state (`st`: prefix, need) carries the result of a pass to the next one. Selection keys are >= 0 and their bit
+// patterns order like the values, so this is a radix over the float bits.
+#define IDX_SEL_NBIN 4096
+#define IDX_SEL_NT 256
+#define IDX_SEL_GMAX 32
+
+/// Slice bounds of block `g` of `G` over `ncb` blocks: contiguous slices, and the ties of a slice come after those of
+/// every earlier slice, which is the block order the tie rule of `idx_select12` uses.
+__device__ __forceinline__ void idx_sel_slice(int g, int ncb, int G, int* b0, int* b1) {
+    const int per = (ncb + G - 1) / G;
+    *b0 = min(ncb, g * per);
+    *b1 = min(ncb, (g + 1) * per);
+}
+
+/// One radix digit: the histogram of this block's slice over the values that match the prefix of the previous pass.
+/// `init_need` >= 0 also starts the state (pass 1), so the host never has to upload into `st`.
+extern "C" __global__ void __launch_bounds__(IDX_SEL_NT) idx_sel_hist(int* part, uint32_t* st, const float* scores,
+                                                                   const int* lenp, int q0, int i, int R, int ld,
+                                                                   int shift, int nbin, int init_need, int G) {
+    __shared__ int hist[IDX_SEL_NBIN];
+    const int g = blockIdx.x, tid = threadIdx.x;
+    const int ncb = (*lenp + q0 + i + 1) / R;
+    if (init_need >= 0 && g == 0 && tid == 0) {
+        st[0] = 0u;
+        st[1] = (uint32_t)init_need;
+    }
+    // The first pass matches every value and so must not read the state: only block 0 writes it, and the other
+    // slices would read whatever the previous selection left there.
+    const uint32_t mask = (shift + (nbin == 256 ? 8 : 12)) >= 32 ? 0u : ~((1u << (shift + (nbin == 256 ? 8 : 12))) - 1u);
+    const uint32_t prefix = mask == 0 ? 0u : st[0];
+    const uint32_t* x = (const uint32_t*)(scores + (size_t)i * ld);
+    int b0, b1;
+    idx_sel_slice(g, ncb, G, &b0, &b1);
+    for (int b = tid; b < nbin; b += IDX_SEL_NT) hist[b] = 0;
+    __syncthreads();
+    for (int b = b0 + tid; b < b1; b += IDX_SEL_NT) {
+        const uint32_t v = x[b];
+        if ((v & mask) == prefix) atomicAdd(&hist[(v >> shift) & (nbin - 1)], 1);
+    }
+    __syncthreads();
+    for (int b = tid; b < nbin; b += IDX_SEL_NT) part[(size_t)g * nbin + b] = hist[b];
+}
+
+/// Merges the `G` slice histograms and takes the digit of the threshold: everything above the chosen bin is taken,
+/// and `need` becomes what is still missing inside it (the same walk, from the highest bin down, as the one-block
+/// kernel). One block: the walk is split over the threads so that no thread loops over 4096 bins, which was 78 us
+/// of every selection — more than the kernel it replaced.
+extern "C" __global__ void __launch_bounds__(IDX_SEL_NT) idx_sel_merge(uint32_t* st, const int* part, int shift,
+                                                                    int nbin, int G) {
+    __shared__ int hist[IDX_SEL_NBIN];
+    __shared__ int sums[IDX_SEL_NT];
+    __shared__ int pick_bin, pick_need;
+    const int tid = threadIdx.x;
+    // Coalesced over the slices (one read of each slice histogram at a time) and unrolled by four, so the loads of
+    // the slices are in flight together instead of one dependent chain (G is a runtime value, the compiler cannot
+    // unroll it).
+    const int g4 = G & ~3;
+    for (int b = tid; b < nbin; b += IDX_SEL_NT) {
+        int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        int g = 0;
+        for (; g < g4; g += 4) {
+            a0 += part[(size_t)(g + 0) * nbin + b];
+            a1 += part[(size_t)(g + 1) * nbin + b];
+            a2 += part[(size_t)(g + 2) * nbin + b];
+            a3 += part[(size_t)(g + 3) * nbin + b];
+        }
+        for (; g < G; ++g) a0 += part[(size_t)g * nbin + b];
+        hist[b] = a0 + a1 + a2 + a3;
+    }
+    __syncthreads();
+    const int per = nbin / IDX_SEL_NT, b0 = tid * per, b1 = b0 + per;
+    int own = 0;
+    for (int b = b0; b < b1; ++b) own += hist[b];
+    sums[tid] = own;
+    __syncthreads();
+    if (tid == 0) {
+        // Suffix of the runs: the count above each run, which is what the walk starts from.
+        int run = 0;
+        for (int j = IDX_SEL_NT - 1; j >= 0; --j) {
+            const int c = sums[j];
+            sums[j] = run;
+            run += c;
+        }
+        pick_bin = -1;
+    }
+    __syncthreads();
+    const int need = (int)st[1];
+    int acc = sums[tid];
+    for (int b = b1 - 1; b >= b0; --b) {
+        if (acc + hist[b] >= need) {
+            pick_bin = b;
+            pick_need = need - acc;
+            break;
+        }
+        acc += hist[b];
+    }
+    __syncthreads();
+    if (tid == 0 && pick_bin >= 0) {
+        st[0] = st[0] | ((uint32_t)pick_bin << shift);
+        st[1] = (uint32_t)pick_need;
+    }
+}
+
+/// How many blocks equal to the final threshold each thread's contiguous chunk holds: the tie order is the block
+/// order, so a chunk's ties follow every earlier chunk's (thread order inside a slice, slice order across blocks).
+extern "C" __global__ void __launch_bounds__(IDX_SEL_NT) idx_sel_ties(int* ties, const uint32_t* st,
+                                                                     const float* scores, const int* lenp, int q0,
+                                                                     int i, int R, int ld, int G) {
+    const int g = blockIdx.x, tid = threadIdx.x;
+    const int ncb = (*lenp + q0 + i + 1) / R;
+    const uint32_t prefix = st[0];
+    const uint32_t* x = (const uint32_t*)(scores + (size_t)i * ld);
+    int b0, b1;
+    idx_sel_slice(g, ncb, G, &b0, &b1);
+    const int per = ((b1 - b0) + IDX_SEL_NT - 1) / IDX_SEL_NT;
+    const int t0 = b0 + tid * per, t1 = min(b1, t0 + per);
+    int c = 0;
+    for (int b = t0; b < t1; ++b) c += x[b] == prefix;
+    ties[(size_t)g * IDX_SEL_NT + tid] = c;
+}
+
+/// Exclusive prefix sum of the tie counts, in chunk order, and the bitset row cleared for `idx_sel_apply`.
+extern "C" __global__ void __launch_bounds__(IDX_SEL_NT) idx_sel_off(int* off, const int* ties, uint32_t* selq, int W,
+                                                                   int n) {
+    __shared__ int sums[IDX_SEL_NT];
+    const int tid = threadIdx.x;
+    const int per = (n + IDX_SEL_NT - 1) / IDX_SEL_NT;
+    const int t0 = tid * per, t1 = min(n, t0 + per);
+    int acc = 0;
+    for (int j = t0; j < t1; ++j) acc += ties[j];
+    sums[tid] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        int run = 0;
+        for (int j = 0; j < IDX_SEL_NT; ++j) {
+            const int c = sums[j];
+            sums[j] = run;
+            run += c;
+        }
+    }
+    __syncthreads();
+    int run = sums[tid];
+    for (int j = t0; j < t1; ++j) {
+        const int c = ties[j];
+        off[j] = run;
+        run += c;
+    }
+    for (int w = tid; w < W; w += IDX_SEL_NT) selq[w] = 0u;
+}
+
+/// Writes the bitset: every block above the threshold, plus the first `need` blocks equal to it in block order.
+extern "C" __global__ void __launch_bounds__(IDX_SEL_NT) idx_sel_apply(uint32_t* selq, const int* off,
+                                                                     const uint32_t* st, const float* scores,
+                                                                     const int* lenp, int q0, int i, int R, int ld,
+                                                                     int G) {
+    const int g = blockIdx.x, tid = threadIdx.x;
+    const int ncb = (*lenp + q0 + i + 1) / R;
+    const uint32_t prefix = st[0];
+    const int need = (int)st[1];
+    const uint32_t* x = (const uint32_t*)(scores + (size_t)i * ld);
+    int b0, b1;
+    idx_sel_slice(g, ncb, G, &b0, &b1);
+    const int per = ((b1 - b0) + IDX_SEL_NT - 1) / IDX_SEL_NT;
+    const int t0 = b0 + tid * per, t1 = min(b1, t0 + per);
+    int tb = off[(size_t)g * IDX_SEL_NT + tid];
+    for (int b = t0; b < t1; ++b) {
+        const uint32_t v = x[b];
+        bool take = v > prefix;
+        if (v == prefix) take = tb++ < need;
+        if (take) atomicOr(&selq[b / 32], 1u << (b % 32));
+    }
+}
+
 // Greedy argmax of one logits row on the device: first maximum wins, ties keep the lower token id, like the host
 // fold it replaces. One block, 1024 threads; the host then reads four bytes instead of the whole row.
 extern "C" __global__ void __launch_bounds__(1024) logits_argmax(int* out, const float* x, int n) {

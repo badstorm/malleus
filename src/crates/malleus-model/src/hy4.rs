@@ -2296,6 +2296,7 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
         idx_tp: Vec::new(),
         idx_scores: None,
         idx_sel: None,
+        idx_sel_part: None,
         idx_sel_cache: Vec::new(),
         idx_cache_len: 0,
         mtp_idx: None,
