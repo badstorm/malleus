@@ -77,6 +77,9 @@ pub struct Model {
     /// CPU and both owned here, so a served model outlives the loader that opened the files. Behind a mutex
     /// because a step borrows the streamer mutably and the engine holds the model behind `&self`.
     pub(crate) deepseek: Option<std::sync::Mutex<Deepseek>>,
+    /// DeepSeek-V4.1's device graph (`crate::deepseek_dev`), the alternate backend the engine serves when
+    /// `MALLEUS_DEEPSEEK_DEVICE=1`: the whole backbone resident on the GPU. Mutex for the same reason.
+    pub(crate) deepseek_dev: Option<std::sync::Mutex<DeepseekDev>>,
 }
 
 /// DeepSeek-V4.1's host graph, as a served model holds it: the streamer (the backbone, the Engram tables, their
@@ -84,6 +87,13 @@ pub struct Model {
 pub struct Deepseek {
     pub text: crate::deepseek_text::Streamer,
     pub cache: crate::deepseek_text::Cache,
+}
+
+/// DeepSeek-V4.1's device graph as a served model holds it: the resident stack and the backbone file it reads its
+/// tensors from (the routed experts when a layer is not resident, and the tables the Engram gathers).
+pub struct DeepseekDev {
+    pub dev: crate::deepseek_dev::DeepseekDevice,
+    pub src: crate::deepseek_text::Source,
 }
 
 /// The DeepSeek-V4.1 files the host graph reads: the backbone, the companion file with the two Engram tables, and
@@ -457,6 +467,7 @@ impl Model {
             hy4_vision: None,
             inkling2: None,
             deepseek: None,
+            deepseek_dev: None,
         })
     }
 
@@ -501,6 +512,7 @@ impl Model {
             hy4_vision: None,
             inkling2: None,
             deepseek: None,
+            deepseek_dev: None,
         })
     }
 
@@ -524,6 +536,32 @@ impl Model {
             &std::fs::read(format!("{}-token-map.i32", files.state.display()))
                 .with_context(|| format!("{}-token-map.i32", files.state.display()))?,
         )?;
+        // The device graph (issue #128): the whole backbone resident on the GPU, one position a step, serving the
+        // same OpenAI surface through the same `serve_deepseek` events. 93.7 GB on this machine, so it is opt-in.
+        if std::env::var("MALLEUS_DEEPSEEK_DEVICE").is_ok_and(|v| v == "1") {
+            let dev = crate::deepseek_dev::DeepseekDevice::load_with_engram(
+                backbone.as_ref(),
+                &cfg,
+                Some(engram),
+                Some(state),
+                &|i, n| {
+                    if i % 8 == 0 || i == n {
+                        eprintln!(
+                            "deepseek_v41: device graph, loaded {i}/{n} blocks, {:.0}s",
+                            t0.elapsed().as_secs_f64()
+                        );
+                    }
+                },
+            )?;
+            let gb = dev.bytes() as f64 / 1e9;
+            eprintln!(
+                "deepseek_v41: device graph, {gb:.1} GB resident, ready in {:.0}s",
+                t0.elapsed().as_secs_f64()
+            );
+            let mut m = Self::host_only(cfg, kernels, dev.bytes(), opts.hadamard_seed)?;
+            m.deepseek_dev = Some(std::sync::Mutex::new(DeepseekDev { dev, src: backbone }));
+            return Ok(m);
+        }
         let hold = std::env::var("MALLEUS_DEEPSEEK_EXPERTS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -602,6 +640,7 @@ impl Model {
             hy4_vision: vision,
             inkling2: None,
             deepseek: None,
+            deepseek_dev: None,
         })
     }
 
@@ -609,9 +648,10 @@ impl Model {
         if self.hy4.is_some() {
             return crate::hy4::new_session(self, max_ctx);
         }
-        // The DeepSeek-V4.1 host graph keeps its own cache and serves one request at a time: there is no session.
-        if self.deepseek.is_some() {
-            bail!("deepseek_v41: the host graph serves without sessions");
+        // The DeepSeek-V4.1 graph (host or device) keeps its own state and serves one request at a time: there is
+        // no session.
+        if self.deepseek.is_some() || self.deepseek_dev.is_some() {
+            bail!("deepseek_v41: the graph serves without sessions");
         }
         // Inkling-2 keeps its keys in its own cache, so the generic per-layer state below is not allocated for it:
         // 20 sliding layers of `kv` that the looped graph never read, at 80 KiB a position (issue #110).
@@ -1587,21 +1627,24 @@ impl Model {
         crate::inkling2::generate(self, tokens, n)
     }
 
-    /// Whether the file is the DeepSeek-V4.1 host graph, which serves without a `Session`.
+    /// Whether the file is the DeepSeek-V4.1 graph (host or device), which serves without a `Session`.
     pub fn is_deepseek(&self) -> bool {
-        self.deepseek.is_some()
+        self.deepseek.is_some() || self.deepseek_dev.is_some()
     }
 
-    /// Greedy generation on the DeepSeek-V4.1 host graph: the prompt in one prefill into the cache, then one
-    /// position per token. `on_token(step, out, row)` gets each token with the logits row it was chosen from and
-    /// returns false to stop (a stop token, a cancel). The cache is reset first and dropped with the request: a
-    /// host prefill is minutes long, so no prompt is ever reused.
+    /// Greedy generation on the DeepSeek-V4.1 graph: the prompt in one prefill into the cache (host) or one step a
+    /// position (device), then one position per token. `on_token(step, out, row)` gets each token with the logits
+    /// row it was chosen from and returns false to stop (a stop token, a cancel). The state is reset first and
+    /// dropped with the request: a prefill is minutes long, so no prompt is ever reused.
     pub fn deepseek_generate(
         &self,
         ids: &[u32],
         tokens: usize,
         mut on_token: impl FnMut(usize, &[u32], &[f32]) -> bool,
     ) -> Result<Vec<u32>> {
+        if let Some(lock) = self.deepseek_dev.as_ref() {
+            return self.deepseek_dev_generate(lock, ids, tokens, &mut on_token);
+        }
         let lock = self.deepseek.as_ref().context("not a deepseek model")?;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let d = &mut *guard;
@@ -1629,6 +1672,48 @@ impl Model {
             row = text.step(cache, &seq)?;
         }
         cache.reset();
+        Ok(out)
+    }
+
+    /// Greedy generation on the DeepSeek-V4.1 device graph: the prompt one step a position (there is no chunked
+    /// prefill yet, issue #128), then a position a token. The sequence is kept whole because the Engram's n-grams
+    /// reach back into it. Everything else — the events, the stop tokens, the cancel check — is the host path's.
+    fn deepseek_dev_generate(
+        &self,
+        lock: &std::sync::Mutex<DeepseekDev>,
+        ids: &[u32],
+        tokens: usize,
+        on_token: &mut impl FnMut(usize, &[u32], &[f32]) -> bool,
+    ) -> Result<Vec<u32>> {
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let d = &mut *guard;
+        let (dev, src) = (&mut d.dev, &d.src);
+        let quiet = |_: usize, _: &DeviceBuffer| Ok(());
+        dev.reset()?;
+        let mut seq = ids.to_vec();
+        for (pos, &id) in ids.iter().enumerate() {
+            dev.step_ids(self, src.as_ref(), id, pos, &seq[..pos], quiet)?;
+        }
+        let mut row = dev.logits()?;
+        let mut out: Vec<u32> = Vec::with_capacity(tokens);
+        for step in 0..tokens {
+            let mut best = 0;
+            for (i, v) in row.iter().enumerate() {
+                if *v > row[best] {
+                    best = i;
+                }
+            }
+            let next = best as u32;
+            out.push(next);
+            if !on_token(step, &out, &row) || step + 1 == tokens {
+                break;
+            }
+            seq.push(next);
+            let pos = seq.len() - 1;
+            dev.step_ids(self, src.as_ref(), next, pos, &seq[..pos], quiet)?;
+            row = dev.logits()?;
+        }
+        dev.reset()?;
         Ok(out)
     }
 

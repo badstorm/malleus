@@ -1358,7 +1358,7 @@ const DEFAULT_PREFILL_QUANTUM: usize = 256;
 fn build_worker(spec: &Arc<ModelSpec>, load: &mut impl FnMut(&ModelSpec) -> Result<Model>) -> Result<Worker> {
     let ctx = spec.ctx;
     let model = load(spec)?;
-    // A host graph (DeepSeek-V4.1) runs its own cache on the CPU, one request at a time: no session, no warm-up
+    // A DeepSeek-V4.1 graph (host or device) runs its own state, one request at a time: no session, no warm-up
     // and no device memory to plan, so every session below is skipped.
     if model.is_deepseek() {
         return Ok(Worker {
@@ -1577,9 +1577,9 @@ impl Engine {
                     }
                     let req = pending.pop_front().expect("a queued request");
                     let events = req.events.clone();
-                    // A host graph has no session and no interleaving: the one request runs to completion on this
-                    // thread and the queue waits behind it. No watchdog either: 12.6 s a token is the graph's
-                    // speed, not a hang.
+                    // A DeepSeek-V4.1 graph has no session and no interleaving: the one request runs to completion
+                    // on this thread and the queue waits behind it. No watchdog either: a token is the graph's
+                    // speed (12.6 s on the host, ~0.1 s on the device), not a hang.
                     if worker
                         .as_ref()
                         .expect("a worker is loaded before serving")
