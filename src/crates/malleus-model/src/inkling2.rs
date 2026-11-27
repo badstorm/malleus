@@ -2935,8 +2935,12 @@ fn run_mm(
         let tau = 1.0 + i.log_alpha * (((pos + 1) as f32) / i.log_floor as f32).max(1.0).ln();
         k.tau.upload(&[tau])?;
     }
+    // The per-row history snapshot exists for one thing: rolling back the tail of a verify that the draft proposed.
+    // Without the head there is no rollback, and a prefill chunk of 512 rows would pay for a snapshot nobody reads
+    // (`rocprofv3` at a 16K fill: 1.5 % of the prefill and a 27 MB allocation, 6 335 launches).
     if let Some(k) = cache.as_deref_mut()
         && t > 1
+        && k.draft.is_some()
     {
         k.snapshot(t)?;
     }
