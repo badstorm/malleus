@@ -434,3 +434,47 @@ extern "C" __global__ void dsv_bcast(float* out, const float* x, int hc, int h) 
     if (i >= hc * h) return;
     out[i] = x[i % h];
 }
+
+// The Engram's gate, on one position: each copy of the residual gets `stream + gate * value`, where the value is the
+// shared half of the projection of the rows the position's n-grams looked up, and the gate is a sigmoid of the signed
+// square root of a normalised dot of the stream against its key. All four copies share the value; each has its own
+// key, the same two per-stream weights and its own gate. `deepseek_text::Engram::forward` is the reference.
+extern "C" __global__ void __launch_bounds__(256) dsv_engram(float* h, const float* kv, const float* q_w,
+                                                            const float* k_w, int hidden, int hc, float eps,
+                                                            float clamp) {
+    const int c = blockIdx.x;
+    __shared__ float a[8], b[8], d[8];
+    float* stream = h + (size_t)c * hidden;
+    const float* key = kv + (size_t)c * hidden;
+    const float* value = kv + (size_t)hc * hidden;
+    float sa = 0.f, sb = 0.f, sd = 0.f;
+    for (int j = threadIdx.x; j < hidden; j += 256) {
+        const float s = stream[j], k = key[j];
+        sa += s * s;
+        sb += k * k;
+        sd += s * q_w[(size_t)c * hidden + j] * k_w[(size_t)c * hidden + j] * k;
+    }
+    sa = dsv_warp_sum(sa);
+    sb = dsv_warp_sum(sb);
+    sd = dsv_warp_sum(sd);
+    __syncthreads();
+    if (threadIdx.x % 32 == 0) {
+        const int w = threadIdx.x / 32;
+        a[w] = sa;
+        b[w] = sb;
+        d[w] = sd;
+    }
+    __syncthreads();
+    float ta = 0.f, tb = 0.f, td = 0.f;
+    for (int i = 0; i < 8; ++i) {
+        ta += a[i];
+        tb += b[i];
+        td += d[i];
+    }
+    // One rstd per copy over `hidden`, as the reference computes it, and the signed root keeps the sign of the dot.
+    const float rstd = rsqrtf(ta / hidden + eps) * rsqrtf(tb / hidden + eps);
+    const float dot = td * rstd / sqrtf((float)hidden);
+    const float rooted = copysignf(sqrtf(fmaxf(fabsf(dot), clamp)), dot);
+    const float gate = 1.f / (1.f + expf(-rooted));
+    for (int j = threadIdx.x; j < hidden; j += 256) stream[j] += gate * value[j];
+}

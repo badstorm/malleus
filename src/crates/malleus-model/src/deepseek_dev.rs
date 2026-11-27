@@ -26,7 +26,7 @@
 //! a time) and the loops around the block. The gate is the host graph itself: the same quantized weights, the same
 //! input, a cosine per stage.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use malleus_gguf::TensorSource;
 use malleus_hip::{DeviceBuffer, Stream};
 
@@ -537,10 +537,10 @@ impl Attn {
 
     /// The projections, the attention and the output projection of one position; `att` keeps the raw attention
     /// output and `out` the layer's.
-    fn run(&mut self, m: &Model, x: &DeviceBuffer, pos: usize, lat: &mut Latent) -> Result<()> {
+    fn run(&mut self, m: &Model, x: &DeviceBuffer, pos: usize, lat: &mut Latent, sel: &mut Selection) -> Result<()> {
         match self {
             Attn::Window(a) => a.step(m, x, pos),
-            Attn::Indexed(a) => a.step(m, x, pos, lat),
+            Attn::Indexed(a) => a.step(m, x, pos, lat, sel),
         }
     }
 
@@ -725,7 +725,14 @@ impl BlockDev {
 
     /// The attention half of the block: `h` are the `hc_mult * hidden` streams of the input, `pos` the position.
     /// Leaves the streams after the attention sub-layer in `h1`.
-    pub fn step_attention(&mut self, m: &Model, h: &DeviceBuffer, pos: usize, lat: &mut Latent) -> Result<()> {
+    pub fn step_attention(
+        &mut self,
+        m: &Model,
+        h: &DeviceBuffer,
+        pos: usize,
+        lat: &mut Latent,
+        sel: &mut Selection,
+    ) -> Result<()> {
         let (s, k) = (&m.stream, &m.k);
         let (hc, hidden) = (self.hc, self.hidden);
         self.a_hc.mixes(m, h)?;
@@ -742,7 +749,7 @@ impl BlockDev {
                 hidden.into(),
             ],
         )?;
-        self.attn.run(m, &self.x, pos, lat)?;
+        self.attn.run(m, &self.x, pos, lat, sel)?;
         k.get("dsv_hc_post").launch(
             ((hc * hidden).div_ceil(256) as u32, 1, 1),
             (256, 1, 1),
@@ -770,8 +777,9 @@ impl BlockDev {
         src: &dyn TensorSource,
         pos: usize,
         lat: &mut Latent,
+        sel: &mut Selection,
     ) -> Result<()> {
-        self.step_attention(m, h, pos, lat)?;
+        self.step_attention(m, h, pos, lat, sel)?;
         let (s, k) = (&m.stream, &m.k);
         let (hc, hidden, inter) = (self.hc, self.hidden, self.inter);
         let (xr, xh, xsc) = (&self.attn.window().xr, &self.attn.window().xh, &self.attn.window().xsc);
@@ -1122,6 +1130,21 @@ impl Latent {
     }
 }
 
+/// The selection an index source publishes for a position: the window slots and the latent rows the attention reads.
+/// The layers of the group have no indexer of their own and read this list as it is, as the host graph's
+/// `shared.topk` does.
+pub struct Selection {
+    pub sel: DeviceBuffer,
+}
+
+impl Selection {
+    pub fn new(window: usize, topk: usize) -> Result<Self> {
+        Ok(Selection {
+            sel: DeviceBuffer::zeroed((window + topk) * 4)?,
+        })
+    }
+}
+
 pub struct CompressedAttn {
     pub attn: WindowAttn,
     pub ratio: usize,
@@ -1132,7 +1155,6 @@ pub struct CompressedAttn {
     pub has_ix: bool,
     /// This position's scores over the latent, and the list the attention reads (window slots, then `cap + row`).
     pub score: DeviceBuffer,
-    pub sel: DeviceBuffer,
     /// The indexer's query and its per-head weight, for one position.
     pub iq: DeviceBuffer,
     pub iw: DeviceBuffer,
@@ -1199,14 +1221,12 @@ impl CompressedAttn {
             r.beta_fast,
             r.beta_slow,
         );
-        let m = attn.window + topk;
         Ok(CompressedAttn {
             ratio: d.compress_ratios[layer] as usize,
             dim,
             ix_heads: heads,
             topk,
             score: DeviceBuffer::zeroed(topk * 4)?,
-            sel: DeviceBuffer::zeroed(m * 4)?,
             iq: DeviceBuffer::zeroed(heads * dim * 4)?,
             iw: DeviceBuffer::zeroed(heads * 4)?,
             has_ix,
@@ -1258,7 +1278,14 @@ impl CompressedAttn {
     /// One position: the projections, the ring, a new latent row every `ratio` positions with its index key (only the
     /// group's owner does that), the indexer's selection over the shared latent and the sparse attention over
     /// window ∪ latent, then the output projection.
-    pub fn step(&mut self, m: &Model, x: &DeviceBuffer, pos: usize, lat: &mut Latent) -> Result<()> {
+    pub fn step(
+        &mut self,
+        m: &Model,
+        x: &DeviceBuffer,
+        pos: usize,
+        lat: &mut Latent,
+        sel: &mut Selection,
+    ) -> Result<()> {
         self.attn.project(m, x, pos)?;
         self.attn.ring_write(m, pos)?;
         let (s, k) = (&m.stream, &m.k);
@@ -1401,7 +1428,7 @@ impl CompressedAttn {
                 (n_ix.max(1) * 4) as u32,
                 s,
                 &[
-                    (&self.sel).into(),
+                    (&sel.sel).into(),
                     (&self.score).into(),
                     pos.into(),
                     n_ix.into(),
@@ -1425,7 +1452,7 @@ impl CompressedAttn {
                 (&self.attn.ring).into(),
                 (&lat.ckv).into(),
                 (&self.attn.sink).into(),
-                (&self.sel).into(),
+                (&sel.sel).into(),
                 self.attn.window.into(),
                 self.attn.heads.into(),
                 hd.into(),
@@ -1434,6 +1461,114 @@ impl CompressedAttn {
             ],
         )?;
         self.attn.output(m, pos)
+    }
+}
+
+/// One Engram layer on the device: the rows a position's n-grams hash to are read on the host (they are a lookup in a
+/// 99 GB companion table), projected by `wkv` on the device, and the gate is a kernel. `deepseek_text::Engram` is the
+/// reference.
+pub struct EngramDev {
+    pub layer: usize,
+    /// Where this layer's table is: the table position among `engram.layers`, and the tensor's name.
+    pub position: usize,
+    pub table: String,
+    /// `[hidden * (hc + 1), cols]`, a release's blocked fp8 carried as bf16.
+    wkv: Linear,
+    q_weight: DeviceBuffer,
+    k_weight: DeviceBuffer,
+    /// The looked-up rows of the current position (`[cols, head_dim]`) and the projection's output.
+    rows: DeviceBuffer,
+    kv: DeviceBuffer,
+    /// GEMM scratch of the projection, which takes the looked-up rows as one input.
+    xr: DeviceBuffer,
+    xh: DeviceBuffer,
+    xsc: DeviceBuffer,
+    head_dim: usize,
+}
+
+impl EngramDev {
+    fn load(src: &dyn TensorSource, c: &Config, layer: usize) -> Result<Self> {
+        let d = c.deepseek.as_ref().context("no deepseek config")?;
+        let e = d.engram.as_ref().context("the config carries no Engram")?;
+        let position = e
+            .layers
+            .iter()
+            .position(|&l| l == layer)
+            .with_context(|| format!("layer {layer} carries no Engram table"))?;
+        let cols = (e.max_ngram - 1) * e.n_heads * e.head_dim;
+        let head_dim = e.head_dim;
+        let p = |s: &str| format!("layers.{layer}.engram.{s}");
+        let mut up = Uploader::new()?;
+        up.use_prefill = false;
+        Ok(EngramDev {
+            layer,
+            position,
+            table: p("embed.weight"),
+            wkv: up.linear(src, &p("wkv"), c.hidden * (d.hc_mult + 1), cols)?,
+            q_weight: DeviceBuffer::from_slice(&crate::deepseek_text::load_matrix(
+                src,
+                &p("q_weight"),
+                d.hc_mult,
+                c.hidden,
+            )?)?,
+            k_weight: DeviceBuffer::from_slice(&crate::deepseek_text::load_matrix(
+                src,
+                &p("k_weight"),
+                d.hc_mult,
+                c.hidden,
+            )?)?,
+            rows: DeviceBuffer::zeroed(cols * head_dim * 4)?,
+            kv: DeviceBuffer::zeroed(c.hidden * (d.hc_mult + 1) * 4)?,
+            xr: DeviceBuffer::alloc(cols * 4)?,
+            xh: DeviceBuffer::alloc(cols * 2)?,
+            xsc: DeviceBuffer::alloc(cols.div_ceil(128) * 4)?,
+            head_dim,
+        })
+    }
+
+    /// The lookup and the gate for one position, written into the streams `h` (`[hc, hidden]`).
+    fn step(
+        &mut self,
+        m: &Model,
+        table: &dyn TensorSource,
+        hash: &[u64],
+        h: &DeviceBuffer,
+        hidden: usize,
+        hc: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let (s, k) = (&m.stream, &m.k);
+        // The rows of the n-grams this position matched, read one by one from the companion file.
+        let rows = crate::deepseek_engram::read_rows(table, &self.table, hash, self.head_dim)?;
+        self.rows.upload(&rows)?;
+        m.gemm(
+            s,
+            &self.xr,
+            &self.xh,
+            &self.xsc,
+            &self.kv,
+            Act::X(&self.rows),
+            &self.wkv,
+            1,
+            false,
+        )?;
+        k.get("dsv_engram").launch(
+            (hc as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            s,
+            &[
+                h.into(),
+                (&self.kv).into(),
+                (&self.q_weight).into(),
+                (&self.k_weight).into(),
+                hidden.into(),
+                hc.into(),
+                eps.into(),
+                1e-6f32.into(),
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -1446,8 +1581,17 @@ pub struct DeepseekDevice {
     pub layers: Vec<BlockDev>,
     /// One latent per layer that owns a compressed KV; every indexed layer reads the one of its group.
     latents: Vec<Latent>,
-    /// For each layer, the index into `latents` (or `usize::MAX` for a window layer).
+    /// For each layer, the index into `latents` (or `usize::MAX` for a window layer), and into `sels` for the list
+    /// the group's index source publishes.
     latent_of: Vec<usize>,
+    sel_of: Vec<usize>,
+    sels: Vec<Selection>,
+    /// One entry per layer: the Engram of the two layers that carry one.
+    engram: Vec<Option<EngramDev>>,
+    /// The companion table and the hash state the n-gram lookups need, and the text mask of the positions.
+    table: Option<crate::deepseek_text::Source>,
+    state: Option<crate::deepseek_engram::EngramState>,
+    text: Vec<bool>,
     pub hidden: usize,
     pub hc: usize,
     pub vocab: usize,
@@ -1468,6 +1612,17 @@ impl DeepseekDevice {
     /// Loads the stack from a converted file. Every block holds its own weights: the attention, both hyper-connections,
     /// the router, the shared expert and the 384 routed experts (read once — the point of being resident).
     pub fn load(src: &dyn TensorSource, c: &Config, progress: &dyn Fn(usize, usize)) -> Result<Self> {
+        Self::load_with_engram(src, c, None, None, progress)
+    }
+
+    /// The same, with the Engram tables and the hash state the two Engram layers read.
+    pub fn load_with_engram(
+        src: &dyn TensorSource,
+        c: &Config,
+        table: Option<crate::deepseek_text::Source>,
+        state: Option<crate::deepseek_engram::EngramState>,
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<Self> {
         let d = c.deepseek.as_ref().context("no deepseek config")?;
         let mut up = Uploader::new()?;
         up.use_prefill = false;
@@ -1489,7 +1644,21 @@ impl DeepseekDevice {
         let latent_of: Vec<usize> = (0..c.n_layers)
             .map(|i| d.kv_source_layers.iter().rposition(|s| *s <= i).unwrap_or(usize::MAX))
             .collect();
+        let sel_of: Vec<usize> = (0..c.n_layers)
+            .map(|i| {
+                d.index_source_layers
+                    .iter()
+                    .rposition(|s| *s <= i)
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        let sels = (0..d.index_source_layers.len())
+            .map(|_| Selection::new(d.window, d.index.topk))
+            .collect::<Result<Vec<_>>>()?;
+        let mut engram = Vec::with_capacity(c.n_layers);
         for i in 0..c.n_layers {
+            let has = d.engram.as_ref().is_some_and(|e| e.layers.contains(&i));
+            engram.push(if has { Some(EngramDev::load(src, c, i)?) } else { None });
             layers.push(BlockDev::load(src, c, i, true)?);
             progress(i + 1, c.n_layers);
         }
@@ -1497,6 +1666,12 @@ impl DeepseekDevice {
             layers,
             latents,
             latent_of,
+            sel_of,
+            sels,
+            engram,
+            table,
+            state,
+            text: Vec::new(),
             hidden: c.hidden,
             hc: d.hc_mult,
             vocab: c.vocab,
@@ -1533,6 +1708,7 @@ impl DeepseekDevice {
         for lat in self.latents.iter_mut() {
             lat.n_ix = 0;
         }
+        self.text.clear();
         self.pre_mix.upload(&crate::deepseek_text::identity_mix(1, self.hc))?;
         Ok(())
     }
@@ -1551,6 +1727,19 @@ impl DeepseekDevice {
         src: &dyn TensorSource,
         id: u32,
         pos: usize,
+        mut on_layer: impl FnMut(usize, &DeviceBuffer) -> Result<()>,
+    ) -> Result<()> {
+        self.step_ids(m, src, id, pos, &[], &mut on_layer)
+    }
+
+    /// The same, with the sequence so far: the Engram's n-grams reach back into it.
+    pub fn step_ids(
+        &mut self,
+        m: &Model,
+        src: &dyn TensorSource,
+        id: u32,
+        pos: usize,
+        prefix: &[u32],
         mut on_layer: impl FnMut(usize, &DeviceBuffer) -> Result<()>,
     ) -> Result<()> {
         let (s, k) = (&m.stream, &m.k);
@@ -1574,22 +1763,50 @@ impl DeepseekDevice {
             s,
             &[(&self.h).into(), (&self.x).into(), hc.into(), hidden.into()],
         )?;
+        // The Engram writes into the streams before the block's own sub-layers, exactly as the stack runs it.
+        self.text.truncate(pos);
+        self.text.push(true);
+        let ids: Vec<u32> = {
+            let mut v = prefix.to_vec();
+            v.truncate(pos);
+            v.push(id);
+            v
+        };
         for i in 0..self.layers.len() {
-            self.layers[i].pre_mix_from(m, &self.pre_mix)?;
-            let which = self.latent_of[i];
-            // A window layer has no latent; an indexed one borrows its group's, the owner appends to it.
-            let lat = if which == usize::MAX { None } else { Some(which) };
-            match lat {
-                Some(k) => {
-                    let mut shared = std::mem::replace(&mut self.latents[k], Latent::new(1, 1)?);
-                    self.layers[i].step(m, &self.h, src, pos, &mut shared)?;
-                    self.latents[k] = shared;
-                }
-                None => {
-                    let mut unused = Latent::new(1, 1)?;
-                    self.layers[i].step(m, &self.h, src, pos, &mut unused)?;
-                }
+            if let Some(e) = self.engram[i].as_mut() {
+                let (table, state) = match (&self.table, &self.state) {
+                    (Some(t), Some(st)) => (t, st),
+                    _ => bail!("layer {i} carries an Engram table: the device graph needs it (with_engram)"),
+                };
+                let cols = (state.max_ngram - 1) * state.heads;
+                let all = state.hash_ids_masked(&ids, e.position, &self.text);
+                let hash = &all[all.len() - cols..];
+                let e = self.engram[i].as_mut().expect("checked");
+                e.step(m, table.as_ref(), hash, &self.h, hidden, hc, self.eps)?;
             }
+            self.layers[i].pre_mix_from(m, &self.pre_mix)?;
+            // A window layer has neither a latent nor a selection; an indexed one borrows its group's, and the
+            // group's owner is the one that appends to the latent and writes the list.
+            let which = self.latent_of[i];
+            let sel_which = self.sel_of[i];
+            let mut lat = if which == usize::MAX {
+                Latent::new(1, 1)?
+            } else {
+                std::mem::replace(&mut self.latents[which], Latent::new(1, 1)?)
+            };
+            let mut sel = if sel_which == usize::MAX {
+                Selection::new(0, 0)?
+            } else {
+                std::mem::replace(&mut self.sels[sel_which], Selection::new(0, 0)?)
+            };
+            self.layers[i].step(m, &self.h, src, pos, &mut lat, &mut sel)?;
+            if which != usize::MAX {
+                self.latents[which] = lat;
+            }
+            if sel_which != usize::MAX {
+                self.sels[sel_which] = sel;
+            }
+
             // The block's streams and the collapse weights its FFN left for the next one.
             self.h.copy_from(0, &self.layers[i].h_out, 0, hc * hidden * 4, s)?;
             self.pre_mix.copy_from(0, self.layers[i].f_pre(), 0, hc * 4, s)?;
@@ -1877,11 +2094,12 @@ mod tests {
             .collect();
         m.stream.synchronize().unwrap();
         let mut lat = Latent::new(d.head_dim, d.index.dim).unwrap();
-        let steps = |dev: &mut BlockDev, lat: &mut Latent, read_back: bool| -> Vec<f32> {
+        let mut sel = Selection::new(0, 0).unwrap();
+        let steps = |dev: &mut BlockDev, lat: &mut Latent, sel: &mut Selection, read_back: bool| -> Vec<f32> {
             let mut out = vec![0f32; t * hc * hidden];
             for (pos, row) in rows.iter().enumerate() {
                 dev.set_pre_mix(&pre_mix[pos * hc..(pos + 1) * hc]).unwrap();
-                dev.step_attention(&m, row, pos, lat).unwrap();
+                dev.step_attention(&m, row, pos, lat, sel).unwrap();
                 if read_back {
                     out[pos * hc * hidden..(pos + 1) * hc * hidden]
                         .copy_from_slice(&dev.h1.download::<f32>(hc * hidden).unwrap());
@@ -1891,14 +2109,14 @@ mod tests {
         };
         // The steps alone, as a served decode runs them, then the same with the readback of the streams.
         let t0 = std::time::Instant::now();
-        steps(&mut dev, &mut lat, false);
+        steps(&mut dev, &mut lat, &mut sel, false);
         m.stream.synchronize().unwrap();
         eprintln!(
             "device: {:.2} ms a position for the whole attention half",
             t0.elapsed().as_secs_f64() / t as f64 * 1e3
         );
         dev.attn.reset().unwrap();
-        let dev_out = steps(&mut dev, &mut lat, true);
+        let dev_out = steps(&mut dev, &mut lat, &mut sel, true);
         m.stream.synchronize().unwrap();
 
         let at = t - 1;
@@ -1995,6 +2213,7 @@ mod tests {
             .map(|i| DeviceBuffer::from_slice(&h[i * hc * hidden..(i + 1) * hc * hidden]).unwrap())
             .collect();
         let mut lat = Latent::new(d.head_dim, d.index.dim).unwrap();
+        let mut sel = Selection::new(0, 0).unwrap();
         m.stream.synchronize().unwrap();
         let mut dev_out = vec![0f32; t * hc * hidden];
         let mut dev_ffn = vec![0f32; t * hidden];
@@ -2003,7 +2222,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for (pos, row) in rows.iter().enumerate() {
             dev.set_pre_mix(&pre_mix[pos * hc..(pos + 1) * hc]).unwrap();
-            dev.step(&m, row, &g, pos, &mut lat).unwrap();
+            dev.step(&m, row, &g, pos, &mut lat, &mut sel).unwrap();
             dev_out[pos * hc * hidden..(pos + 1) * hc * hidden]
                 .copy_from_slice(&dev.h_out.download::<f32>(hc * hidden).unwrap());
             dev_ffn[pos * hidden..(pos + 1) * hidden].copy_from_slice(&dev.ffn.download::<f32>(hidden).unwrap());
@@ -2194,6 +2413,7 @@ mod tests {
         let m = Model::host_only(c.clone(), kernels, 0, malleus_gguf::quant::HADAMARD_SEED).unwrap();
         let mut dev = CompressedAttn::load(&g, &c, layer).unwrap();
         let mut lat = Latent::new(d.head_dim, d.index.dim).unwrap();
+        let mut selbuf = Selection::new(d.window, d.index.topk).unwrap();
         let rows: Vec<DeviceBuffer> = (0..t)
             .map(|i| DeviceBuffer::from_slice(&x[i * c.hidden..(i + 1) * c.hidden]).unwrap())
             .collect();
@@ -2205,7 +2425,7 @@ mod tests {
         let mut att_rms = 0.0f64;
         let mut att_worst = 0.0f64;
         for (pos, row) in rows.iter().enumerate() {
-            dev.step(&m, row, pos, &mut lat).unwrap();
+            dev.step(&m, row, pos, &mut lat, &mut selbuf).unwrap();
             m.stream.synchronize().unwrap();
             // The attention output, before the grouped projection, and the layer's own output after it.
             let got = dev.attn.att.download::<f32>(dev.attn.heads * hd).unwrap();
@@ -2219,7 +2439,7 @@ mod tests {
             // as `chunk + row`; what they have to agree on is which latent rows, and how many.
             // The kernel writes the window slots first (as many as the position has), then the `topk` compressed ones.
             let slots = dev.attn.window.min(pos + 1);
-            let sel = dev.sel.download::<i32>(slots + topk).unwrap();
+            let sel = selbuf.sel.download::<i32>(slots + topk).unwrap();
             let ours: Vec<i32> = sel[slots..]
                 .iter()
                 .filter(|v| **v >= dev.attn.window as i32)
@@ -2372,7 +2592,14 @@ mod tests {
         let kernels = Kernels::load(&select_device().unwrap()).unwrap();
         let m = Model::host_only(c.clone(), kernels, 0, malleus_gguf::quant::HADAMARD_SEED).unwrap();
         let t0 = std::time::Instant::now();
-        let mut dev = DeepseekDevice::load(&g, &c, &|i, n| {
+        let tables: crate::deepseek_text::Source =
+            Box::new(malleus_gguf::gguf::Gguf::open(std::path::Path::new(&engram)).unwrap());
+        let st = crate::deepseek_engram::EngramState::from_json(
+            &std::fs::read_to_string(format!("{state}-state.json")).unwrap(),
+            &std::fs::read(format!("{state}-token-map.i32")).unwrap(),
+        )
+        .unwrap();
+        let mut dev = DeepseekDevice::load_with_engram(&g, &c, Some(tables), Some(st), &|i, n| {
             if i % 8 == 0 || i == n {
                 eprintln!("  loaded {i}/{n} blocks, {:.0}s", t0.elapsed().as_secs_f64());
             }
@@ -2388,7 +2615,7 @@ mod tests {
         for (pos, id) in ids.iter().enumerate() {
             let t0 = std::time::Instant::now();
             let mut first = None;
-            dev.step_with(&m, &g, *id, pos, |layer, h| {
+            dev.step_ids(&m, &g, *id, pos, &ids[..pos], |layer, h| {
                 let got = h.download::<f32>(hc * c.hidden)?;
                 let name = format!("block{layer}");
                 if let Some(want) = HOST_BLOCKS.with(|c| c.borrow().get(&name).cloned()) {
@@ -2426,5 +2653,23 @@ mod tests {
         );
         assert_eq!(argmax(&row), argmax(last), "a different first token");
         assert!(cos > 0.999, "the stack diverges: {cos}");
+        // The gate is green: what a position costs without the harness's synchronise-and-download per block.
+        dev.reset().unwrap();
+        m.stream.synchronize().unwrap();
+        let n = 4;
+        let seq: Vec<u32> = (0..n).map(|i| ids[i % t]).collect();
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            let quiet = |_: usize, _: &DeviceBuffer| Ok(());
+            dev.step_ids(&m, &g, seq[i], i, &seq[..i], quiet).unwrap();
+        }
+        m.stream.synchronize().unwrap();
+        let each = t0.elapsed().as_secs_f64() / n as f64;
+        eprintln!(
+            "step: {:.1} ms a position, {:.1} tok/s (unfused, {:.1} GB resident)",
+            each * 1e3,
+            1.0 / each,
+            dev.bytes() as f64 / 1e9
+        );
     }
 }
