@@ -229,8 +229,9 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
                                                const float* rel, const float* proj, const float* sink,
                                                const float* gate, int T, int heads, int nkv, int dim, int d_rel,
                                                int extent, int window, float scale) {
-    __shared__ __attribute__((aligned(16))) _Float16 qs[IKA_TQ][128];
-    __shared__ __attribute__((aligned(16))) _Float16 ks[IKA_KB][128];
+    // K rows are padded: 136 halves (272 B, still 16-byte aligned) makes the row stride 68 words, so the sixteen
+    // keys a warp stages land on sixteen banks instead of one (issue #144).
+    __shared__ __attribute__((aligned(16))) _Float16 ks[IKA_KB][136];
     __shared__ __attribute__((aligned(16))) _Float16 vt[128][IKA_KB];
     __shared__ __attribute__((aligned(16))) _Float16 ps[IKA_TQ][IKA_KB];
     __shared__ float rs[IKA_TQ][16];
@@ -247,10 +248,20 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
     const int kend = base + T;
     // The row of the score tile this lane's element `i` belongs to, and the key it holds.
     const int half = lane / 16, col = lane % 16;
-    // Q, scaled once: the fragment is read straight out of shared, so the scale has to be in it.
-    for (int e = threadIdx.x; e < IKA_TQ * dim; e += 128) {
-        const int t = q0 + e / dim, d = e % dim;
-        qs[e / dim][d] = t < T ? (_Float16)(q[((size_t)t * heads + h) * dim + d] * scale) : (_Float16)0.f;
+    // This warp's two 16-dim chunks of Q, in registers: they never change inside the loop, and keeping them out of
+    // shared is 4 KB of the 18.5 the block holds — the difference between three and four blocks per CU, which is what
+    // the attention of this kernel is short of (issue #144). A lane reads the row its fragment names, `lane % 16`,
+    // and the sixteen dims of its chunk, scaled once.
+    ik_h16 qa[2];
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        const int t = q0 + lane % 16, d0 = (wave * 2 + c) * 16;
+        _Float16 qh[16];
+        const bool live = t < T && d0 + 16 <= dim;
+        const float* qp = q + ((size_t)t * heads + h) * dim + d0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) qh[i] = live ? (_Float16)(qp[i] * scale) : (_Float16)0.f;
+        qa[c] = *(const ik_h16*)qh;
     }
     // The rel row is a row of this call, so it is bounded by `T` and not by `qlast` (which is a session position).
     for (int e = threadIdx.x; e < IKA_TQ * d_rel; e += 128) {
@@ -280,7 +291,10 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
         // kernel's time in it (issue #110, item 5).
         const int units = IKA_KB * (dim / 16);
         for (int e = threadIdx.x; e < units; e += 128) {
-            const int j = e / (dim / 16), d0 = (e % (dim / 16)) * 16, s = kc + j;
+            // `j` on consecutive lanes: the transposed write below goes to `vt[d0 + i][j]`, whose address is
+            // `(d0 + i) * IKA_KB + j` halves, so with `j` fixed across the warp every lane hits the same bank. Sixteen
+            // keys across the warp instead of four spreads them over eight banks (issue #144).
+            const int j = e % IKA_KB, d0 = (e / IKA_KB) * 16, s = kc + j;
             _Float16 kv16[16], vv16[16];
             if (s <= qlast) {
                 if (CACHED) {
@@ -340,9 +354,8 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
             const int chunk = wave * 2 + c;
-            const ik_h16 a = *(const ik_h16*)&qs[lane % 16][chunk * 16];
             const ik_h16 b = *(const ik_h16*)&ks[lane % 16][chunk * 16];
-            s8 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s8);
+            s8 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qa[c], b, s8);
         }
 #pragma unroll
         for (int i = 0; i < 8; ++i) sp[wave][2 * i + half][col] = s8[i];
