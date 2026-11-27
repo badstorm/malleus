@@ -8,8 +8,10 @@
 #   bench/deepseek_task_run.sh /models/deepseek-v41-flash-mls2.malleus answers-deepseek-2bit.json
 #   bench/deepseek_task_run.sh /models/deepseek-1bit.malleus         answers-deepseek-1bit.json
 #
-# The Engram state is the one `scripts/deepseek_engram_state.py` wrote once (`/golden/deepseek-engram`); the tables
-# are the model's `-engram.malleus` sibling unless MALLEUS_DEEPSEEK_ENGRAM says otherwise.
+# The default is the host graph; `MALLEUS_DEEPSEEK_DEVICE=1` serves the device graph instead — the whole backbone
+# resident (93.7 GB on the 1-bit file), a position a step (prefill included). The Engram state is the one
+# `scripts/deepseek_engram_state.py` wrote once (`/golden/deepseek-engram`); the tables are the model's
+# `-engram.malleus` sibling unless MALLEUS_DEEPSEEK_ENGRAM says otherwise.
 #
 # The container is the *dev* one with the binary this tree built (`MALLEUS_BIN`, extracted from the build volume and
 # mounted: the ROCm libraries live in the image, the binary does not): the release image is older than the file
@@ -40,6 +42,7 @@ podman run --rm --name malleus-task \
   -e MALLEUS_MODELS_DIR=/models -e MALLEUS_DEFAULT_MODEL="$NAME" \
   ${MALLEUS_DEEPSEEK_ENGRAM:+-e MALLEUS_DEEPSEEK_ENGRAM=$MALLEUS_DEEPSEEK_ENGRAM} \
   -e MALLEUS_DEEPSEEK_ENGRAM_STATE=/golden/deepseek-engram \
+  ${MALLEUS_DEEPSEEK_DEVICE:+-e MALLEUS_DEEPSEEK_DEVICE=$MALLEUS_DEEPSEEK_DEVICE} \
   -w /src "${MALLEUS_DEV_IMAGE:-malleus-dev:latest}" sh -c "
     /malleus serve --models-dir /models --host 127.0.0.1 --port 8092 --ctx 4096 > /tmp/serve.log 2>&1 &
     for i in \$(seq 240); do
