@@ -237,6 +237,11 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
     __shared__ float rs[IKA_TQ][16];
     __shared__ float bt[IKA_TQ][IKA_KB];
     __shared__ float sp[4][IKA_TQ][IKA_KB];
+    // Per row: the rescale factor of this chunk and the running sum. Four warps used to compute the softmax of all
+    // sixteen rows and keep a quarter of it; each warp owns the four rows of its own O tiles now, and these two rows of
+    // shared are how the others read what they need (issue #144).
+    __shared__ float alpha_s[IKA_TQ];
+    __shared__ float l_s[IKA_TQ];
     const int h = blockIdx.x % heads, q0 = (blockIdx.x / heads) * IKA_TQ;
     const int kh = h / (heads / nkv);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -269,11 +274,12 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
                                        ? rel[((size_t)(q0 + e / d_rel) * heads + h) * d_rel + e % d_rel]
                                        : 0.f;
     }
-    // The running max and sum of this lane's eight rows, and the sink as the score of a virtual key with no value.
-    float m[8], l[8];
+    // The running max and sum of the four rows this warp owns (`4w + 2i + half`), and the sink as the score of a
+    // virtual key with no value.
+    float m[2], l[2];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int t = q0 + 2 * i + half;
+    for (int i = 0; i < 2; ++i) {
+        const int t = q0 + wave * 4 + 2 * i + half;
         m[i] = sink && t < T ? sink[(size_t)t * heads + h] : -INFINITY;
         l[i] = sink && t < T ? 1.f : 0.f;
     }
@@ -360,11 +366,13 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
 #pragma unroll
         for (int i = 0; i < 8; ++i) sp[wave][2 * i + half][col] = s8[i];
         __syncthreads();
-        // The softmax of the 16 keys of each row: the four partials, the bias, the mask, then four shuffles.
-        float p[8], alpha[8];
+        // The softmax of the 16 keys of each of this warp's four rows: the four partials, the bias, the mask, then four
+        // shuffles. The shuffle tree runs inside the sixteen lanes of one row, so the result is the same as when every
+        // warp computed every row.
+        float p[2], alpha[2];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int row = 2 * i + half, t = base + q0 + row, s = kc + col;
+        for (int i = 0; i < 2; ++i) {
+            const int row = wave * 4 + 2 * i + half, t = base + q0 + row, s = kc + col;
             float sc = sp[0][row][col] + sp[1][row][col] + sp[2][row][col] + sp[3][row][col] + bt[row][col];
             const int w0 = window > 0 ? max(0, t - window + 1) : 0;
             if (s > t || s < w0 || t >= kend) sc = -INFINITY;
@@ -372,7 +380,9 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
 #pragma unroll
             for (int o2 = 1; o2 < 16; o2 <<= 1) mx = fmaxf(mx, __shfl_xor(mx, o2, 32));
             const float mn = fmaxf(m[i], mx);
-            alpha[i] = mn == -INFINITY ? 1.f : expf(m[i] - mn);
+            // `expf(0)` is exactly 1, and at depth the running max is rarely raised: the branch is free and it saves
+            // about half the exponentials that are left.
+            alpha[i] = mn == m[i] ? 1.f : (mn == -INFINITY ? 1.f : expf(m[i] - mn));
             p[i] = sc == -INFINITY ? 0.f : expf(sc - mn);
             float sum = p[i];
 #pragma unroll
@@ -380,14 +390,24 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
             l[i] = l[i] * alpha[i] + sum;
             m[i] = mn;
         }
+        // P and this chunk's rescale factors: the barrier that already stood between them and the product serves both.
 #pragma unroll
-        for (int f = 0; f < 2; ++f)
-#pragma unroll
-            for (int i = 0; i < 8; ++i) o[f][i] *= alpha[i];
-        // P as an A fragment: the accumulator layout is the transpose of it, so it goes through shared.
-#pragma unroll
-        for (int i = 0; i < 8; ++i) ps[2 * i + half][col] = (_Float16)p[i];
+        for (int i = 0; i < 2; ++i) {
+            ps[wave * 4 + 2 * i + half][col] = (_Float16)p[i];
+            alpha_s[wave * 4 + 2 * i + half] = alpha[i];
+        }
         __syncthreads();
+        // `x * 1.0f` is exactly `x`: at depth the max usually does not move and the rescale is a no-op. The eight rows
+        // this lane rescales are not the four it computed, so the test reads the sixteen published factors.
+        float moved = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) moved = fmaxf(moved, fabsf(alpha_s[2 * i + half] - 1.f));
+        if (__any(moved != 0.f)) {
+#pragma unroll
+            for (int f = 0; f < 2; ++f)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) o[f][i] *= alpha_s[2 * i + half];
+        }
         const ik_h16 pa = *(const ik_h16*)&ps[lane % 16][0];
 #pragma unroll
         for (int f = 0; f < 2; ++f) {
@@ -397,7 +417,11 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
         }
         __syncthreads();
     }
-    // The output: element `i` of tile `f` is (row 2i + half, dim tile*16 + col), and `l[i]` is that row's sum.
+    // The output: element `i` of tile `f` is (row 2i + half, dim tile*16 + col), and the sum is that row's. Every lane
+    // writes rows it does not own, so the sixteen sums go through shared once.
+#pragma unroll
+    for (int i = 0; i < 2; ++i) l_s[wave * 4 + 2 * i + half] = l[i];
+    __syncthreads();
 #pragma unroll
     for (int f = 0; f < 2; ++f) {
         const int tile = wave * 2 + f;
@@ -405,7 +429,7 @@ __device__ __forceinline__ void attn_wmma_core(float* out, const float* q, const
         for (int i = 0; i < 8; ++i) {
             const int row = 2 * i + half, t = q0 + row;
             if (t >= T) continue;
-            const float inv = l[i] > 0.f ? 1.f / l[i] : 0.f;
+            const float inv = l_s[row] > 0.f ? 1.f / l_s[row] : 0.f;
             const size_t at = ((size_t)t * heads + h) * dim + tile * 16 + col;
             float val = o[f][i] * inv;
             if (gate) val /= 1.f + expf(-gate[at]);
