@@ -130,6 +130,7 @@ const KERNEL_NAMES: &[(&str, &[&str])] = &[
             "idx_sel_off",
             "idx_sel_apply",
             "logits_argmax",
+            "logits_argmax_rows",
             "idx_union",
             "hc_bcast_add",
             "copy_f32",

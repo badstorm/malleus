@@ -233,6 +233,9 @@ pub(crate) struct Scratch {
     /// Attention kernels read the write/read offset from here instead of a launch immediate, so the
     /// kernel node parameters stay constant across decode steps and the forward can be graph-captured.
     pub(crate) len_dev: DeviceBuffer,
+    /// Greedy argmax of the step's logits rows, on the device (`logits_argmax` / `logits_argmax_rows`): the ids
+    /// the host reads back, one int per row, so a verify never sends its logits across the bus.
+    pub(crate) step_ids: DeviceBuffer,
     /// MTP inputs: hidden rows and the [embedding; hidden] concatenation.
     pub(crate) mh: DeviceBuffer,
     pub(crate) cat: DeviceBuffer,

@@ -1005,6 +1005,7 @@ impl Model {
             ids,
             pos,
             len_dev,
+            step_ids: f32s(crate::weights::GEMV_MAX_T.max(8))?,
             mh: f32s(cap * c.stream_dim())?,
             cat: f32s(cap * 2 * c.hidden)?,
             dn: {
@@ -1772,6 +1773,17 @@ impl Model {
         Ok(v[0] as u32)
     }
 
+    /// Greedy verify: the argmax of every row comes back, the logits stay on the device. Only the models whose
+    /// greedy acceptance is a plain argmax (no penalty) can use it; the caller decides.
+    pub fn forward_verify_argmax(&self, sess: &mut Session, tokens: &[u32]) -> Result<Vec<u32>> {
+        ensure!(
+            !tokens.is_empty() && tokens.len() <= crate::weights::GEMV_MAX_T,
+            "bad verify width"
+        );
+        let v = self.forward_impl(sess, tokens, None, tokens.len(), &[], true, true)?;
+        Ok(v.iter().map(|&x| x as u32).collect())
+    }
+
     /// Whether this model can run one token for several sessions in one pass over the weights: a flat model (no
     /// MoE, hyper-connections, PLE, indexer, KDA or MLA) and no MTP head, whose chain is per session.
     pub fn can_batch(&self) -> bool {
@@ -2424,21 +2436,39 @@ impl Model {
         } else {
             sess.dn_np = 0;
         }
-        *self.scratch_cache.lock().unwrap() = Some(sc);
         if argmax_only {
-            ensure!(n_logits == 1, "forward_argmax needs one logits row");
-            let out = DeviceBuffer::alloc(4)?;
-            self.k.get("logits_argmax").launch(
-                (1, 1, 1),
-                (1024, 1, 1),
-                0,
-                st,
-                &[(&out).into(), (&logits).into(), c.vocab.into()],
-            )?;
+            // Greedy: the argmax of every row stays on the device and only `n_logits` ids come back. A verify used
+            // to download `n_logits * vocab` floats (6 MB a round for a 6-row verify) and fold them on the host,
+            // which left the GPU idle for most of that round's launch gap.
+            let ids = &sc.step_ids;
+            if n_logits == 1 {
+                self.k.get("logits_argmax").launch(
+                    (1, 1, 1),
+                    (1024, 1, 1),
+                    0,
+                    st,
+                    &[ids.into(), (&logits).into(), c.real_vocab().into()],
+                )?;
+            } else {
+                ensure!(
+                    n_logits <= ids.len() / 4,
+                    "forward_verify_argmax: {n_logits} rows do not fit the step buffer"
+                );
+                self.k.get("logits_argmax_rows").launch(
+                    (n_logits as u32, 1, 1),
+                    (1024, 1, 1),
+                    0,
+                    st,
+                    &[ids.into(), (&logits).into(), c.real_vocab().into()],
+                )?;
+            }
             st.synchronize()?;
-            let id: Vec<i32> = out.download(1)?;
-            return Ok(vec![id[0] as f32]);
+            let id: Vec<i32> = ids.download(n_logits)?;
+            let out: Vec<f32> = id.iter().map(|&i| i as f32).collect();
+            *self.scratch_cache.lock().unwrap() = Some(sc);
+            return Ok(out);
         }
+        *self.scratch_cache.lock().unwrap() = Some(sc);
         Ok(logits.download(n_logits * c.vocab)?)
     }
 
