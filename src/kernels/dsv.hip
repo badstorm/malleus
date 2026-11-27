@@ -319,9 +319,12 @@ extern "C" __global__ void dsv_ix_cand(unsigned char* cand, const float* score, 
     extern __shared__ float smem[];
     float* block_max = smem;
     for (int b = 0; b < blocks; ++b) block_max[b] = -INFINITY;
+    // Reachable rows only, as the host graph's forward does when it sets the unreachable ones to -INF before
+    // level one: a block whose rows are all unreachable must stay at -INF and can never be selected.
     for (int j = 0; j < n_ix; ++j) {
         int b = j / block_size;
-        block_max[b] = fmaxf(block_max[b], score[j]);
+        float v = j < reach ? score[j] : -INFINITY;
+        block_max[b] = fmaxf(block_max[b], v);
     }
     int last = (reach > 0 ? reach : 1) - 1;
     int last_block = last / block_size;

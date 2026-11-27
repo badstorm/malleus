@@ -2498,6 +2498,15 @@ mod tests {
         let mut dev = CompressedAttn::load(&g, &c, layer).unwrap();
         let mut lat = Latent::new(d.head_dim, d.index.dim).unwrap();
         let mut selbuf = Selection::new(d.window, d.index.topk).unwrap();
+        // The candidate source writes the first-level mask; a layer that is not it takes a dummy buffer that the
+        // step ignores (its `is_candidate` is false).
+        let cand_geom = d.candidate.as_ref().filter(|cand| cand.source_layer == layer);
+        let mut candbuf = Candidates::new(
+            cand_geom.map_or(1, |c| c.block_size),
+            cand_geom.map_or(1, |c| c.topk_blocks),
+        )
+        .unwrap();
+        let mut cand = cand_geom.map(|_| &mut candbuf);
         let rows: Vec<DeviceBuffer> = (0..t)
             .map(|i| DeviceBuffer::from_slice(&x[i * c.hidden..(i + 1) * c.hidden]).unwrap())
             .collect();
@@ -2509,7 +2518,8 @@ mod tests {
         let mut att_rms = 0.0f64;
         let mut att_worst = 0.0f64;
         for (pos, row) in rows.iter().enumerate() {
-            dev.step(&m, row, pos, &mut lat, &mut selbuf, None).unwrap();
+            dev.step(&m, row, pos, &mut lat, &mut selbuf, cand.as_deref_mut())
+                .unwrap();
             m.stream.synchronize().unwrap();
             // The attention output, before the grouped projection, and the layer's own output after it.
             let got = dev.attn.att.download::<f32>(dev.attn.heads * hd).unwrap();
@@ -2858,6 +2868,38 @@ mod tests {
         // Without a mask the three best rows are 7 (2.0), 0 (1.0), 1 (ties at 0.0, ascending).  Sorted and
         // filtered by reach=2: rows 0 and 1 are reachable, row 7 is not, so it keeps its slot as -1.
         assert_eq!(sel2, vec![cap as i32 + 0, cap as i32 + 1, -1], "sel without cand");
+
+        // The case that matters at long context: a block whose rows are all unreachable has a higher max than
+        // the reachable ones, and must stay at -INF in level one.  n_ix=12, block_size=4: block 0 holds rows
+        // 0..3 (reach=4, pinned), block 1 holds rows 4..7 (row 6 scores 5.0 but is unreachable), block 2 holds
+        // rows 8..11 (row 8 scores 3.0, unreachable too).  Level one must keep only block 0.
+        let n2: usize = 12;
+        let reach2: usize = 4;
+        let bs2: usize = 4;
+        let tb2: usize = 2;
+        let scores2: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, -5.0, -5.0, 5.0, -5.0, 3.0, -5.0, -5.0, -5.0];
+        let sc2 = DeviceBuffer::from_slice(&scores2).unwrap();
+        let cand2 = DeviceBuffer::zeroed(n2.div_ceil(bs2)).unwrap();
+        kernels
+            .get("dsv_ix_cand")
+            .launch(
+                (1, 1, 1),
+                (1, 1, 1),
+                (n2.div_ceil(bs2) * 5) as u32,
+                &s,
+                &[
+                    (&cand2).into(),
+                    (&sc2).into(),
+                    n2.into(),
+                    tb2.into(),
+                    bs2.into(),
+                    reach2.into(),
+                ],
+            )
+            .unwrap();
+        s.synchronize().unwrap();
+        let cand2: Vec<u8> = cand2.download::<u8>(3).unwrap();
+        assert_eq!(cand2, vec![1, 0, 0], "unreachable blocks must stay masked");
         s.synchronize().unwrap();
     }
 }
